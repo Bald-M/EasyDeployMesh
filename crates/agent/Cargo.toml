@@ -1,0 +1,40 @@
+[package]
+name = "easydeploymesh-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap.workspace = true
+easydeploymesh-core = { path = "../core" }
+easydeploymesh-gho = { path = "../gho" }
+hostname = "0.4.2"
+mac_address = "1.1.8"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+sysinfo = "0.39.6"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_Ioctl",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Registry",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+chrono.workspace = true
+uuid.workspace = true
+
+[build-dependencies]
+winresource = "0.1.31"

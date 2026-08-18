@@ -1,0 +1,36 @@
+{
+  "name": "@easydeploymesh/desktop",
+  "private": true,
+  "version": "0.2.4",
+  "type": "module",
+  "scripts": {
+    "dev": "nuxt dev --port 3000",
+    "build": "tauri build",
+    "generate": "nuxt generate",
+    "typecheck": "nuxt typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev"
+  },
+  "dependencies": {
+    "@nuxt/ui": "^4.10.0",
+    "@nuxtjs/i18n": "^10.5.0",
+    "@pinia/nuxt": "^1.0.1",
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-dialog": "^2.4.0",
+    "nuxt": "^4.5.0",
+    "pinia": "^4.0.2",
+    "vue": "^3.5.40"
+  },
+  "devDependencies": {
+    "@iconify-json/lucide": "^1.2.118",
+    "@nuxt/test-utils": "^4.0.3",
+    "@tauri-apps/cli": "^2.11.4",
+    "@vue/test-utils": "^2.4.11",
+    "happy-dom": "^20.0.11",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.10",
+    "vue-tsc": "^3.3.8"
+  }
+}

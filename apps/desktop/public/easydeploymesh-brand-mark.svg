@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="EasyDeployMesh">
+  <circle cx="256" cy="256" r="232" fill="#06B6D4"/>
+  <g
+    transform="translate(256 256) scale(.76) translate(-256 -256)"
+    fill="none"
+    stroke="#FFFFFF"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    stroke-width="24"
+  >
+    <rect width="112" height="104" x="200" y="88" rx="18"/>
+    <rect width="112" height="104" x="80" y="328" rx="18"/>
+    <rect width="112" height="104" x="320" y="328" rx="18"/>
+    <path d="M136 328v-52a24 24 0 0 1 24-24h192a24 24 0 0 1 24 24v52M256 252v-60"/>
+  </g>
+</svg>

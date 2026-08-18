@@ -1,0 +1,29 @@
+{
+  "name": "easydeploymesh",
+  "private": true,
+  "version": "0.2.4",
+  "packageManager": "pnpm@11.10.0",
+  "scripts": {
+    "dev": "pnpm --filter @easydeploymesh/desktop dev",
+    "build": "pnpm build:mac",
+    "build:mac": "pnpm build:mac:arm64 && pnpm build:mac:x64",
+    "build:mac:arm64": "node scripts/build-desktop.mjs macos-arm64",
+    "build:mac:x64": "node scripts/build-desktop.mjs macos-x64",
+    "build:windows": "pnpm build:windows:arm64 && pnpm build:windows:x86 && pnpm build:windows:x64",
+    "build:windows:arm64": "node scripts/build-desktop.mjs windows-arm64",
+    "build:windows:x86": "node scripts/build-desktop.mjs windows-x86",
+    "build:windows:x64": "node scripts/build-desktop.mjs windows-x64",
+    "build:linux": "pnpm build:linux:arm64 && pnpm build:linux:x64",
+    "build:linux:arm64": "node scripts/build-desktop.mjs linux-arm64",
+    "build:linux:x64": "node scripts/build-desktop.mjs linux-x64",
+    "desktop": "pnpm tauri",
+    "tauri": "pnpm --filter @easydeploymesh/desktop tauri",
+    "tauri:dev": "pnpm --filter @easydeploymesh/desktop tauri:dev",
+    "generate": "pnpm --filter @easydeploymesh/desktop generate",
+    "typecheck": "pnpm --filter @easydeploymesh/desktop typecheck",
+    "test": "pnpm test:diagnostics && pnpm --filter @easydeploymesh/desktop test && cargo test --workspace",
+    "test:diagnostics": "node --test scripts/analyze-winpe-runtime.test.mjs scripts/desktop-targets.test.mjs scripts/winpe-diagnostics.test.mjs",
+    "test:rust": "cargo test --workspace",
+    "check": "pnpm typecheck && pnpm test && pnpm generate"
+  }
+}
