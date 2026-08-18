@@ -1,0 +1,167 @@
+<style>
+  .easydeploymesh-loader {
+    position: fixed;
+    inset: 0;
+    isolation: isolate;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    color: #f8fafc;
+    background: #020617;
+    font-family: Inter, "SF Pro Display", "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .easydeploymesh-loader::before,
+  .easydeploymesh-loader::after {
+    position: absolute;
+    inset: 0;
+    content: "";
+    pointer-events: none;
+  }
+
+  .easydeploymesh-loader::before {
+    z-index: -2;
+    background:
+      linear-gradient(180deg, rgb(2 6 23 / 0.36), rgb(2 6 23 / 0.72)),
+      url('/images/easydeploymesh-splash-network.png') center / cover no-repeat;
+    animation: easydeploymesh-breathe 7s ease-in-out infinite alternate;
+  }
+
+  .easydeploymesh-loader::after {
+    z-index: -1;
+    background:
+      radial-gradient(circle at center, transparent 0 12rem, rgb(2 6 23 / 0.25) 28rem, rgb(2 6 23 / 0.82) 70%),
+      linear-gradient(90deg, rgb(2 6 23 / 0.42), transparent 30% 70%, rgb(2 6 23 / 0.42));
+  }
+
+  .easydeploymesh-splash {
+    display: flex;
+    width: min(88vw, 34rem);
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    animation: easydeploymesh-enter 700ms cubic-bezier(.2, .8, .2, 1) both;
+  }
+
+  .easydeploymesh-mark {
+    position: relative;
+    display: grid;
+    width: 6rem;
+    height: 6rem;
+    place-items: center;
+    border: 1px solid rgb(103 232 249 / 0.28);
+    border-radius: 1.65rem;
+    background: linear-gradient(145deg, rgb(15 23 42 / 0.86), rgb(2 6 23 / 0.72));
+    box-shadow:
+      0 0 0 1px rgb(255 255 255 / 0.035) inset,
+      0 1.5rem 4rem rgb(8 145 178 / 0.22),
+      0 0 5rem rgb(34 211 238 / 0.12);
+    backdrop-filter: blur(20px);
+  }
+
+  .easydeploymesh-mark img {
+    width: 4rem;
+    height: 4rem;
+    border-radius: 1rem;
+  }
+
+  .easydeploymesh-mark-ring {
+    position: absolute;
+    inset: -0.55rem;
+    border: 1px solid rgb(34 211 238 / 0.16);
+    border-radius: 2rem;
+    animation: easydeploymesh-pulse 2.4s ease-out infinite;
+  }
+
+  .easydeploymesh-title {
+    margin: 1.55rem 0 0;
+    font-size: 2rem;
+    font-weight: 650;
+    letter-spacing: -0.045em;
+  }
+
+  .easydeploymesh-tagline {
+    margin: 0.45rem 0 0;
+    color: #94a3b8;
+    font-size: 0.82rem;
+    font-weight: 500;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+  }
+
+  .easydeploymesh-progress {
+    position: relative;
+    width: 11rem;
+    height: 2px;
+    margin-top: 2.35rem;
+    overflow: hidden;
+    border-radius: 999px;
+    background: rgb(30 41 59 / 0.86);
+  }
+
+  .easydeploymesh-progress::after {
+    position: absolute;
+    inset: 0;
+    content: "";
+    border-radius: inherit;
+    background: linear-gradient(90deg, transparent, #22d3ee 42%, #a5f3fc 52%, transparent 100%);
+    transform: translateX(-100%);
+    animation: easydeploymesh-progress 1.55s ease-in-out infinite;
+  }
+
+  .easydeploymesh-status {
+    margin-top: 0.85rem;
+    color: #64748b;
+    font-size: 0.72rem;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+  }
+
+  @keyframes easydeploymesh-enter {
+    from { opacity: 0; transform: translateY(10px) scale(0.98); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+
+  @keyframes easydeploymesh-breathe {
+    from { transform: scale(1.01); filter: saturate(0.9) brightness(0.82); }
+    to { transform: scale(1.045); filter: saturate(1.05) brightness(0.96); }
+  }
+
+  @keyframes easydeploymesh-pulse {
+    0% { opacity: 0.72; transform: scale(0.94); }
+    70%, 100% { opacity: 0; transform: scale(1.15); }
+  }
+
+  @keyframes easydeploymesh-progress {
+    0% { transform: translateX(-100%); }
+    55%, 100% { transform: translateX(100%); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .easydeploymesh-loader::before,
+    .easydeploymesh-splash,
+    .easydeploymesh-mark-ring,
+    .easydeploymesh-progress::after {
+      animation: none;
+    }
+
+    .easydeploymesh-progress::after {
+      transform: translateX(0);
+      opacity: 0.7;
+    }
+  }
+</style>
+<div class="easydeploymesh-loader" role="status" aria-label="EasyDeployMesh is starting">
+  <main class="easydeploymesh-splash">
+    <div class="easydeploymesh-mark" aria-hidden="true">
+      <span class="easydeploymesh-mark-ring"></span>
+      <img src="/easydeploymesh-logo.svg" alt="">
+    </div>
+    <h1 class="easydeploymesh-title">EasyDeployMesh</h1>
+    <p class="easydeploymesh-tagline">Deployment orchestration</p>
+    <div class="easydeploymesh-progress" aria-hidden="true"></div>
+    <p class="easydeploymesh-status">Preparing your workspace…</p>
+  </main>
+</div>

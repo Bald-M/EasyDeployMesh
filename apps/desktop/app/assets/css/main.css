@@ -1,0 +1,49 @@
+@import "tailwindcss";
+@import "@nuxt/ui";
+
+@theme static {
+  --font-sans: "Inter", "SF Pro Display", "Segoe UI", "Noto Sans SC", system-ui, sans-serif;
+}
+
+:root {
+  --ui-radius: 0.75rem;
+  --ui-header-height: 4rem;
+}
+
+html,
+body,
+#__nuxt {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  min-width: 960px;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 12% -10%, rgb(6 182 212 / 0.10), transparent 28rem),
+    var(--ui-bg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button,
+a {
+  -webkit-tap-highlight-color: transparent;
+}
+
+::selection {
+  color: white;
+  background: rgb(8 145 178 / 0.85);
+}
+
+.app-drag-region {
+  -webkit-app-region: drag;
+}
+
+.app-no-drag {
+  -webkit-app-region: no-drag;
+}
+

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-36 -36 584 584" role="img" aria-label="EasyDeployMesh">
+  <circle cx="256" cy="256" r="248" fill="#06B6D4"/>
+  <g
+    fill="none"
+    stroke="#FFFFFF"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    stroke-width="24"
+  >
+    <rect width="120" height="112" x="196" y="72" rx="20"/>
+    <rect width="120" height="112" x="68" y="328" rx="20"/>
+    <rect width="120" height="112" x="324" y="328" rx="20"/>
+    <path d="M128 328v-52a24 24 0 0 1 24-24h208a24 24 0 0 1 24 24v52M256 252v-68"/>
+  </g>
+</svg>

@@ -1,0 +1,15 @@
+node_modules/
+.claude/
+.codex/
+.nuxt/
+.output/
+dist/
+apps/desktop/dist
+target/
+.DS_Store
+*.log
+coverage/
+release/
+.env
+.env.*
+!.env.example

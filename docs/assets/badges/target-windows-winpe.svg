@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="258" height="28" role="img" aria-label="Deployment target: Windows and WinPE">
+  <title>Deployment target: Windows and WinPE</title>
+  <clipPath id="r"><rect width="258" height="28" rx="3"/></clipPath>
+  <g clip-path="url(#r)">
+    <rect width="104" height="28" fill="#555"/>
+    <rect x="104" width="154" height="28" fill="#2563eb"/>
+  </g>
+  <g fill="#fff" font-family="Verdana,DejaVu Sans,sans-serif" font-size="10" font-weight="700" letter-spacing="1">
+    <text x="52" y="18" text-anchor="middle">TARGET</text>
+    <text x="181" y="18" text-anchor="middle">WINDOWS | WINPE</text>
+  </g>
+</svg>

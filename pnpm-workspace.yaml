@@ -1,0 +1,17 @@
+packages:
+  - apps/*
+  - packages/*
+
+allowBuilds:
+  esbuild: true
+  vue-demi: true
+
+minimumReleaseAgeExclude:
+  - '@vue/language-core@3.3.8'
+  - vue-tsc@3.3.8
+
+onlyBuiltDependencies:
+  - '@parcel/watcher'
+  - '@tailwindcss/oxide'
+  - esbuild
+  - vue-demi
