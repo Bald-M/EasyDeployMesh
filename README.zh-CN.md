@@ -40,7 +40,7 @@
 ## 功能演示
 
 <p align="center">
-  <img src="docs/assets/easydeploymesh-deployment-demo.gif" alt="EasyDeployMesh 选择目标设备和已验证的 Windows 镜像、创建部署任务、让目标机启动 WinPE 并显示部署进度" width="100%">
+  <img src="docs/assets/demo.gif" alt="EasyDeployMesh 选择目标设备和已验证的 Windows 镜像、创建部署任务、让目标机启动 WinPE 并显示部署进度" width="100%">
 </p>
 
 ## 为什么选择 EasyDeployMesh？

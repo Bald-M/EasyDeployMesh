@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Public project documentation and contribution guidelines.
 
+### Changed
+
+- Updated the deployment demonstration animation in the English and Simplified
+  Chinese README files.
+
 ## [0.2.4] - 2026-08-18
 
 ### Added
