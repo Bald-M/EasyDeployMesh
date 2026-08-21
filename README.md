@@ -41,7 +41,7 @@
 ## See it in action
 
 <p align="center">
-  <img src="docs/assets/easydeploymesh-deployment-demo.gif" alt="EasyDeployMesh selects target devices and a verified Windows image, creates deployment jobs, boots a target into WinPE, and reports deployment progress" width="100%">
+  <img src="docs/assets/demo.gif" alt="EasyDeployMesh selects target devices and a verified Windows image, creates deployment jobs, boots a target into WinPE, and reports deployment progress" width="100%">
 </p>
 
 ## Why EasyDeployMesh?
