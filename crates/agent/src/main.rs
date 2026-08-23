@@ -157,6 +157,7 @@ fn run_shell_launcher() -> Result<(), Box<dyn Error>> {
     use std::process::Stdio;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    hide_shell_console();
     let directory = std::env::current_exe()?
         .parent()
         .ok_or("EasyDeployMesh shell launcher has no parent directory")?
@@ -214,6 +215,21 @@ fn run_shell_launcher() -> Result<(), Box<dyn Error>> {
             Ok(())
         },
     )
+}
+
+#[cfg(target_os = "windows")]
+fn hide_shell_console() {
+    use windows::Win32::{
+        System::Console::GetConsoleWindow,
+        UI::WindowsAndMessaging::{SW_HIDE, ShowWindow},
+    };
+
+    let window = unsafe { GetConsoleWindow() };
+    if !window.is_invalid() {
+        unsafe {
+            let _ = ShowWindow(window, SW_HIDE);
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -716,8 +732,9 @@ fn collect_inventory() -> Result<AgentInventory, Box<dyn Error>> {
         .and_then(|value| value.into_string().ok())
         .filter(|value| !value.trim().is_empty());
     let mac_address = mac_address::get_mac_address()?
-        .ok_or("no usable MAC address was found")?
-        .to_string();
+        .map(|address| address.to_string())
+        .or_else(platform_mac_address)
+        .ok_or("no usable MAC address was found")?;
     let disks = collect_disks_or_empty(collect_disks);
     let hardware = collect_hardware_summary();
 
@@ -736,6 +753,16 @@ fn collect_inventory() -> Result<AgentInventory, Box<dyn Error>> {
         disks,
         agent_version: env!("CARGO_PKG_VERSION").to_owned(),
     })
+}
+
+#[cfg(target_os = "windows")]
+fn platform_mac_address() -> Option<String> {
+    windows_inventory::collect_mac_address().ok().flatten()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn platform_mac_address() -> Option<String> {
+    None
 }
 
 struct HardwareSummary {

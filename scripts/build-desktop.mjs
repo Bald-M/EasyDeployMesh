@@ -23,7 +23,10 @@ function run(command, args, extraEnvironment = {}) {
 }
 
 const windowsAgentTarget = "x86_64-pc-windows-msvc";
-const windowsEnvironment = { RUSTFLAGS: "-C target-feature=+crt-static" };
+const windowsEnvironment = {
+  RUSTFLAGS: "-C target-feature=+crt-static",
+  XWIN_ARCH: "x86_64",
+};
 if (process.platform === "win32") {
   await run("cargo", ["build", "-p", "easydeploymesh-agent", "--release", "--target", windowsAgentTarget], windowsEnvironment);
 } else {
@@ -45,5 +48,9 @@ const tauriArguments = [
 if (target.platform === "windows" && process.platform !== "win32") {
   tauriArguments.push("--runner", "cargo-xwin");
 }
-await run("pnpm", tauriArguments, { LC_ALL: "en_US.UTF-8", LANG: "en_US.UTF-8" });
+const tauriEnvironment = { LC_ALL: "en_US.UTF-8", LANG: "en_US.UTF-8" };
+if (target.platform === "windows" && process.platform !== "win32") {
+  tauriEnvironment.XWIN_ARCH = target.xwinArch;
+}
+await run("pnpm", tauriArguments, tauriEnvironment);
 await run("node", ["scripts/collect-installer.mjs", targetName]);

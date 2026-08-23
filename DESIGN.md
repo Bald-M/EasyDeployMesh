@@ -246,7 +246,45 @@ remaining-space partition is extended.
 
 Boot media import supports an existing directory or ISO/IMG media. Import occurs
 in a temporary directory and replaces the managed boot tree only after the new
-package is complete. Paths supplied to TFTP must be safe relative paths.
+package is complete. Standard media uses bundled iPXE chainloaders for both BIOS
+and UEFI x64; both paths then load the same `boot.ipxe`, wimboot, generated BCD,
+WIM, and SDI. Vendor EFI executables and vendor-specific BCD references are not
+retained in that normalized boot chain. The managed BCD is regenerated and
+validated before each PXE service start; the layout marker records the package
+revision but is not trusted as a substitute for validating current BCD content.
+The iPXE script supplies each flat initrd name through both
+the UEFI `--name` option and the Legacy BIOS positional argument, so wimboot
+receives a valid CPIO archive and cannot select a vendor BCD in place of the
+managed store. The managed store is served from the distinct source path
+`boot/easydeploymesh.bcd` and mapped to the flat virtual name `BCD`; this avoids
+reusing a stale or vendor-provided `boot/BCD` file while preserving the path
+expected by Windows Boot Manager.
+
+WEPE64 v2.2 is detected separately because its root `BOOTMGR` is the private
+`WEPE/WEPE64` loader and requires the nonstandard `WEPE/B64`, SDI, and WIM paths.
+For this layout the source ISO remains untouched. The importer validates and
+copies its BIOS and UEFI El Torito images, injects the Agent and bootstrap into
+the private WIM, and creates a managed ISO that preserves the private paths and
+both firmware boot entries. iPXE loads the managed ISO with `sanboot` over a
+short-lived HTTP server bound to the explicitly selected PXE interface. The HTTP
+route exposes only the fixed managed ISO file, supports bounded single-range
+requests, and stops with the PXE service. A bootstrap refresh atomically
+remasters the managed ISO; packages created before this layout revision must be
+reimported rather than silently booting an ISO without the Agent. When the WIM
+uses WePE's offline `SYSTEM\\Setup\\CmdLine` PECMD entry instead of standard
+`winpeshl.ini` or `startnet.cmd`, injection chains that command through the
+managed shell launcher. The launcher initializes networking and starts the
+Agent before continuing into the original PECMD desktop.
+
+This native-layout machinery establishes only boot compatibility. WEPE64 v2.2
+is not a supported Agent or automated-deployment runtime: the vendor image
+intentionally omits the Windows network module, including TCP/IP and DHCP
+payloads required after iPXE transfers control to Windows. Agent or NIC-driver
+injection cannot repair that missing platform capability. EasyU 3.6 is the
+currently validated third-party PE runtime; other network-enabled WinPE media
+must be validated before use. The Windows Agent uses `GetAdaptersAddresses` as
+a bounded fallback when a compatible reduced WinPE still provides networking.
+Paths supplied to TFTP must be safe relative paths.
 
 Standalone DHCP refuses to start if another DHCP server responds. ProxyDHCP
 uses the existing network DHCP service while providing boot information.

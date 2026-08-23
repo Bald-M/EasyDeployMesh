@@ -58,7 +58,8 @@ Rust Agent 负责实际部署。
 - 支持简体中文和英文运行时切换。
 - 局域网设备注册、硬件清单、认证心跳和在线状态跟踪。
 - 支持独立 DHCP 或 ProxyDHCP 的 PXE 服务、TFTP 和客户端发现。
-- 支持导入 ISO、IMG 和现有启动目录，并自动将 Agent 注入 `boot.wim`。
+- 支持导入 ISO、IMG 和现有启动目录；兼容且具备网络功能的标准 WinPE 布局会在
+  受管 `boot.wim` 中自动注入 Agent。
 - 持久化 GHO、WIM、ESD 和 SWM 镜像目录，并进行 SHA-256 校验。
 - 在 WinPE 中使用 DiskPart、DISM 和 BCDBoot 执行无人值守 WIM/ESD 部署。
 - 针对明确限定的 GHO 兼容范围提供原生流式验证和还原，不捆绑或执行 Ghost 软件。
@@ -81,6 +82,19 @@ flowchart LR
 模块布局、协议流程、持久化模型和安全不变量详见 [DESIGN.md](DESIGN.md)。
 
 ## 支持的镜像格式
+
+### PE 媒体兼容性
+
+| PE 媒体 | PXE 启动 | Agent 注册 | 自动部署 | 当前状态 |
+| --- | :---: | :---: | :---: | --- |
+| EasyU 3.6 | 是 | 是 | 是 | 当前已验证可用 |
+| 具备网络功能的标准 WinPE | 预期支持 | 预期支持 | 预期支持 | 取决于 Windows 版本和网卡驱动，使用前必须验证 |
+| WePE 2.2 | 仅能通过原生 ISO 启动 | 否 | 否 | 不支持：官方明确裁剪了 Windows 网络模块 |
+
+EasyU 3.6 是目前完成验证的 PE 运行环境。WePE 2.2 可以通过原生 ISO 路径进入桌面，
+但其官方版本不提供网络模块，因此 EasyDeployMesh Agent 无法注册或下载部署镜像。
+更换 VMware 网卡型号或只注入网卡驱动，无法恢复已经缺失的 TCP/IP 和 DHCP 网络栈。
+EasyDeployMesh 不会修改用户选择的源 ISO；不支持的离线 PE 不得用于自动部署。
 
 | 格式 | 可编目 | 可部署 | 说明 |
 | --- | :---: | :---: | --- |
@@ -149,6 +163,21 @@ pnpm check
 构建桌面应用：
 
 ```bash
+pnpm build
+```
+
+不带参数时，该命令会构建当前宿主系统的全部原生安装包，以及可通过
+`cargo-xwin` 交叉编译的 Windows 安装包。也可以选择整个平台、单个架构或多个目标：
+
+```bash
+pnpm build -- windows
+pnpm build -- windows-x64
+pnpm build -- macos-x64 windows-x64
+```
+
+原有的平台汇总命令仍然可用：
+
+```bash
 pnpm build:mac
 pnpm build:windows
 pnpm build:linux
@@ -157,8 +186,10 @@ pnpm build:linux
 构建脚本会编译并暂存 Agent、生成 Nuxt 前端、构建原生应用包，并将收集到的安装程序
 按架构命名后复制到 `release/`。汇总命令分别生成 macOS Intel 与 Apple Silicon DMG、
 Windows ARM64、x86 与 x64 NSIS 安装程序，以及 Linux ARM64 与 x64 AppImage。
-macOS 和 Linux 命令应在对应操作系统上运行；非 Windows 主机通过 `cargo-xwin`
-交叉构建 Windows 版本。
+macOS 和 Linux 安装包必须在对应操作系统上构建；非 Windows 主机通过
+`cargo-xwin` 交叉构建 Windows 版本。因此，macOS 上的 `pnpm build` 会生成 macOS
+和 Windows 安装包，Linux 上会生成 Linux 和 Windows 安装包，Windows 上会生成
+Windows 安装包。
 
 也可以单独构建某个架构，例如：
 

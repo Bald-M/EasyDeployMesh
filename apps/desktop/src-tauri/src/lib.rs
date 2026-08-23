@@ -225,11 +225,15 @@ fn load_pxe_config(state: State<'_, AppState>) -> Result<Option<PxeConfig>, Stri
 #[tauri::command]
 fn save_pxe_config(config: PxeConfig, state: State<'_, AppState>) -> Result<PxeConfig, String> {
     easydeploymesh_service::validate_pxe_config(&config).map_err(|error| error.to_string())?;
-    let bytes = serde_json::to_vec_pretty(&config).map_err(|error| error.to_string())?;
-    let temporary = state.pxe_config_path.with_extension("json.tmp");
-    fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
-    fs::rename(&temporary, &state.pxe_config_path).map_err(|error| error.to_string())?;
+    persist_pxe_config(&config, &state.pxe_config_path)?;
     Ok(config)
+}
+
+fn persist_pxe_config(config: &PxeConfig, path: &std::path::Path) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(&config).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+    fs::rename(&temporary, path).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -288,10 +292,18 @@ fn inject_saved_agent_bootstrap(pxe_boot_root: &std::path::Path) -> Result<bool,
 
 #[tauri::command]
 async fn start_pxe_service(
-    config: PxeConfig,
+    mut config: PxeConfig,
     control_port: Option<u16>,
     state: State<'_, AppState>,
 ) -> Result<PxeServiceStatus, String> {
+    if BootPackage::ensure_managed_network_boot(&config.tftp_root)
+        .map_err(|error| format!("could not refresh the managed PXE network loaders: {error}"))?
+    {
+        config.bios_boot_file = "undionly.kpxe".into();
+        config.uefi_x64_boot_file = "ipxe.efi".into();
+        easydeploymesh_service::validate_pxe_config(&config).map_err(|error| error.to_string())?;
+        persist_pxe_config(&config, &state.pxe_config_path)?;
+    }
     let control_status = state.control_plane.status().await;
     if control_status.state != "running" {
         start_control_plane_inner(&config.bind_address, control_port.unwrap_or(7760), &state)
