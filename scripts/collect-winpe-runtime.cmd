@@ -11,7 +11,7 @@ set "OUTPUT_ROOT=%~1"
 if not defined OUTPUT_ROOT set "OUTPUT_ROOT=%~dp0EasyDeployMesh-diagnostics"
 if exist "%OUTPUT_ROOT%" set "OUTPUT_ROOT=%OUTPUT_ROOT%-%RANDOM%"
 md "%OUTPUT_ROOT%" >nul 2>&1
-if not exist "%OUTPUT_ROOT%\NUL" (
+if not exist "%OUTPUT_ROOT%\" (
     echo Unable to create diagnostic directory: "%OUTPUT_ROOT%"
     exit /b 1
 )

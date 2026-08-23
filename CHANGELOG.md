@@ -10,11 +10,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Public project documentation and contribution guidelines.
+- A host-aware `pnpm build` entry point for building all supported native and
+  cross-compiled Windows installers, with optional platform and target selectors.
 
 ### Changed
 
 - Updated the deployment demonstration animation in the English and Simplified
   Chinese README files.
+- Documented the tested PE compatibility boundary: EasyU 3.6 is currently
+  supported for Agent-based deployment, while WePE 2.2 is unsupported because
+  its vendor intentionally omits the Windows network module. Source PE media is
+  never modified in place.
+
+### Fixed
+
+- Improved Agent startup diagnostics and native Windows MAC-address fallback
+  behavior for compatible reduced WinPE environments, fixed diagnostic-directory
+  detection on RAM disks, and hid the managed shell host console.
+- Added a native ISO boot path for WEPE64 v2.2 media whose private `BOOTMGR`
+  requires `\WEPE\B64` and the original ISO directory layout. The importer now
+  leaves the source unchanged and can recreate a managed ISO with the original
+  BIOS and UEFI El Torito boot images for HTTP `sanboot` with bounded Range
+  support. This does not make WePE Agent-capable: WePE 2.2 remains unsupported
+  for automated deployment because its Windows network stack is absent.
+- Selected the matching cargo-xwin SDK architecture for every Windows desktop
+  target so cross-building the x86 installer includes the required x86 libraries.
 
 ## [0.2.4] - 2026-08-18
 

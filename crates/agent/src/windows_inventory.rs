@@ -19,6 +19,10 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, HANDLE},
+        NetworkManagement::{
+            IpHelper::{GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH},
+            Ndis::IfOperStatusUp,
+        },
         Storage::FileSystem::{
             CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
             QueryDosDeviceW,
@@ -34,6 +38,59 @@ use windows::{
     },
     core::{Owned, PCWSTR},
 };
+
+#[cfg(target_os = "windows")]
+const MAX_ADAPTER_ADDRESS_BYTES: u32 = 1024 * 1024;
+
+#[cfg(target_os = "windows")]
+pub(crate) fn collect_mac_address() -> Result<Option<String>, Box<dyn Error>> {
+    let mut required = 0_u32;
+    let first = unsafe { GetAdaptersAddresses(0, Default::default(), None, None, &mut required) };
+    if first != 111 || required == 0 || required > MAX_ADAPTER_ADDRESS_BYTES {
+        return Err(format!("GetAdaptersAddresses sizing failed with status {first}").into());
+    }
+
+    let mut buffer = vec![0_u8; required as usize];
+    let head = buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+    let status =
+        unsafe { GetAdaptersAddresses(0, Default::default(), None, Some(head), &mut required) };
+    if status != 0 {
+        return Err(format!("GetAdaptersAddresses failed with status {status}").into());
+    }
+
+    let mut current = head;
+    let mut fallback = None;
+    for _ in 0..4096 {
+        let Some(adapter) = (unsafe { current.as_ref() }) else {
+            break;
+        };
+        if adapter.PhysicalAddressLength == 6 {
+            let mut bytes = [0_u8; 6];
+            bytes.copy_from_slice(&adapter.PhysicalAddress[..6]);
+            if usable_mac_address(bytes) {
+                let formatted = format_mac_address(bytes);
+                if adapter.OperStatus == IfOperStatusUp {
+                    return Ok(Some(formatted));
+                }
+                fallback.get_or_insert(formatted);
+            }
+        }
+        current = adapter.Next;
+    }
+    Ok(fallback)
+}
+
+fn usable_mac_address(bytes: [u8; 6]) -> bool {
+    bytes != [0; 6] && bytes != [0xff; 6] && bytes[0] & 1 == 0
+}
+
+fn format_mac_address(bytes: [u8; 6]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
 
 #[cfg(target_os = "windows")]
 const MAX_DOS_DEVICE_CHARS: usize = 1024 * 1024;
@@ -781,5 +838,21 @@ Microsoft DiskPart version 10.0.26100.1
 
         assert_eq!(model, "Physical Disk 7");
         assert_eq!(serial, None);
+    }
+
+    #[test]
+    fn native_mac_fallback_accepts_a_unicast_adapter_address() {
+        assert!(usable_mac_address([0x00, 0x0c, 0x29, 0xee, 0x3e, 0x8d]));
+        assert_eq!(
+            format_mac_address([0x00, 0x0c, 0x29, 0xee, 0x3e, 0x8d]),
+            "00:0C:29:EE:3E:8D"
+        );
+    }
+
+    #[test]
+    fn native_mac_fallback_rejects_placeholder_and_multicast_addresses() {
+        assert!(!usable_mac_address([0; 6]));
+        assert!(!usable_mac_address([0xff; 6]));
+        assert!(!usable_mac_address([0x01, 0, 0, 0, 0, 1]));
     }
 }

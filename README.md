@@ -63,8 +63,8 @@ partitioning.
 - Local-network device registration, hardware inventory, authenticated
   heartbeats, and online-presence tracking.
 - Standalone DHCP or ProxyDHCP PXE service with TFTP and client discovery.
-- ISO, IMG, and existing boot-directory import with automatic Agent injection
-  into `boot.wim`.
+- ISO, IMG, and existing boot-directory import; compatible network-enabled
+  WinPE layouts receive automatic Agent injection into a managed `boot.wim`.
 - Persistent GHO, WIM, ESD, and SWM image catalog with SHA-256 verification.
 - Unattended WIM/ESD deployment using DiskPart, DISM, and BCDBoot in WinPE.
 - Native streaming verification and restore for a deliberately limited GHO
@@ -90,6 +90,21 @@ For the module layout, protocol flow, persistence model, and safety invariants,
 see [DESIGN.md](DESIGN.md).
 
 ## Supported images
+
+### PE media compatibility
+
+| PE media | PXE boot | Agent registration | Automated deployment | Status |
+| --- | :---: | :---: | :---: | --- |
+| EasyU 3.6 | Yes | Yes | Yes | Currently verified |
+| Standard network-enabled WinPE | Expected | Expected | Expected | Depends on the Windows build and NIC drivers; validate before use |
+| WePE 2.2 | Native ISO boot only | No | No | Unsupported: the vendor intentionally omits the Windows network module |
+
+EasyU 3.6 is the currently verified PE runtime. WePE 2.2 can reach its desktop
+through the native ISO boot path, but it has no supported network module, so the
+EasyDeployMesh Agent cannot register or download deployment images. Changing
+the VMware adapter or injecting only a NIC driver does not restore the missing
+TCP/IP and DHCP stack. EasyDeployMesh does not modify the user-selected source
+ISO; unsupported offline PE media must not be used for automated deployment.
 
 | Format | Catalog | Deploy | Notes |
 | --- | :---: | :---: | --- |
@@ -164,6 +179,22 @@ pnpm check
 Build the desktop application:
 
 ```bash
+pnpm build
+```
+
+With no arguments, this builds every native installer for the current host plus
+the Windows installers that can be cross-compiled with `cargo-xwin`. You can
+also select a whole platform, one architecture, or several targets:
+
+```bash
+pnpm build -- windows
+pnpm build -- windows-x64
+pnpm build -- macos-x64 windows-x64
+```
+
+The existing platform aggregate commands remain available:
+
+```bash
 pnpm build:mac
 pnpm build:windows
 pnpm build:linux
@@ -172,9 +203,11 @@ pnpm build:linux
 The build scripts compile and stage the Agent, generate the Nuxt frontend, build
 the native bundle, and copy architecture-labelled installers into `release/`.
 The aggregate commands produce macOS Intel and Apple Silicon DMGs, Windows ARM64,
-x86, and x64 NSIS installers, and Linux ARM64 and x64 AppImages. Run the macOS
-and Linux commands on their respective operating systems; non-Windows hosts use
-`cargo-xwin` for Windows cross-builds.
+x86, and x64 NSIS installers, and Linux ARM64 and x64 AppImages. macOS and Linux
+installers must be built on their respective operating systems; non-Windows
+hosts use `cargo-xwin` for Windows cross-builds. Consequently, `pnpm build`
+produces macOS plus Windows installers on macOS, Linux plus Windows installers
+on Linux, and Windows installers on Windows.
 
 Before building the Windows installers on a non-Windows host, install the
 additional Rust targets:

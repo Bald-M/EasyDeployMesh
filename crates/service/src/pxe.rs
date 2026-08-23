@@ -159,6 +159,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normalized_wepe_uefi_boot_cannot_reenter_the_vendor_bcd_chain() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("wepe")).unwrap();
+        std::fs::create_dir_all(source.path().join("efi/microsoft/boot")).unwrap();
+        std::fs::write(source.path().join("wepe/WEPE64.WIM"), b"winpe").unwrap();
+        std::fs::write(source.path().join("wepe/WEPE.SDI"), b"sdi").unwrap();
+        let vendor_bcd = r"\WEPE\B64"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        std::fs::write(source.path().join("efi/microsoft/boot/BCD"), vendor_bcd).unwrap();
+        std::fs::write(source.path().join("bootmgr"), b"bootmgr").unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let package =
+            build_winpe_package(source.path(), &parent.path().join("managed"), None).unwrap();
+        let (_root, mut config) = valid_config();
+        config.tftp_root = package.root.clone();
+        config.bios_boot_file = package.bios_boot_file.clone();
+        config.uefi_x64_boot_file = package.uefi_x64_boot_file.clone();
+        let leases = Arc::new(RwLock::new(HashMap::new()));
+
+        let (uefi_reply, ..) = process_dhcp(
+            &discover(7),
+            "0.0.0.0:68".parse().unwrap(),
+            &config,
+            &leases,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dhcp_option(&uefi_reply, 67), Some(&b"ipxe.efi"[..]));
+
+        let mut ipxe_request = discover(7);
+        ipxe_request.pop();
+        push_option(&mut ipxe_request, 77, b"iPXE");
+        ipxe_request.push(255);
+        let (ipxe_reply, ..) = process_dhcp(
+            &ipxe_request,
+            "0.0.0.0:68".parse().unwrap(),
+            &config,
+            &leases,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dhcp_option(&ipxe_reply, 67), Some(&b"boot.ipxe"[..]));
+
+        let root = Path::new(&package.root);
+        assert_eq!(
+            std::fs::read(root.join("ipxe.efi")).unwrap(),
+            EMBEDDED_IPXE_EFI
+        );
+        assert!(!root.join("efi/microsoft/boot/BCD").exists());
+        assert!(!root.join("efi/boot/bootx64.efi").exists());
+        assert!(
+            !std::fs::read(root.join("boot/BCD"))
+                .unwrap()
+                .windows(r"\WEPE\B64".len())
+                .any(|window| window.eq_ignore_ascii_case(r"\WEPE\B64".as_bytes()))
+        );
+    }
+
+    #[tokio::test]
     async fn unsupported_architecture_does_not_receive_a_boot_file() {
         let (_root, config) = valid_config();
         let leases = Arc::new(RwLock::new(HashMap::new()));
@@ -310,6 +371,56 @@ mod tests {
             .unwrap();
         let (_, _) = client.recv_from(&mut response).await.unwrap();
         assert_eq!(&response[..4], &[0, 5, 0, 2]);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn tftp_transfers_the_complete_embedded_uefi_ipxe_loader() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("ipxe.efi"), EMBEDDED_IPXE_EFI).unwrap();
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let clients = Arc::new(RwLock::new(HashMap::new()));
+        let (_stop_tx, stop_rx) = oneshot::channel();
+        let task = tokio::spawn(run_tftp(
+            server,
+            root.path().to_path_buf(),
+            clients,
+            None,
+            stop_rx,
+        ));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(b"\0\x01ipxe.efi\0octet\0blksize\01468\0tsize\00\0", address)
+            .await
+            .unwrap();
+
+        let mut packet = [0u8; 1472];
+        let (size, transfer) = client.recv_from(&mut packet).await.unwrap();
+        assert_eq!(&packet[..2], &[0, 6]);
+        let options = String::from_utf8_lossy(&packet[2..size]);
+        assert!(options.contains("blksize\01468\0"));
+        assert!(options.contains(&format!("tsize\0{}\0", EMBEDDED_IPXE_EFI.len())));
+        client.send_to(&[0, 4, 0, 0], transfer).await.unwrap();
+
+        let mut downloaded = Vec::with_capacity(EMBEDDED_IPXE_EFI.len());
+        let mut expected_block = 1u16;
+        loop {
+            let size = client.recv(&mut packet).await.unwrap();
+            assert_eq!(&packet[..2], &[0, 3]);
+            assert_eq!(u16::from_be_bytes([packet[2], packet[3]]), expected_block);
+            downloaded.extend_from_slice(&packet[4..size]);
+            client
+                .send_to(&[0, 4, packet[2], packet[3]], transfer)
+                .await
+                .unwrap();
+            expected_block = expected_block.wrapping_add(1);
+            if size < packet.len() {
+                break;
+            }
+        }
+
+        assert_eq!(downloaded, EMBEDDED_IPXE_EFI);
         task.abort();
     }
 
@@ -490,8 +601,13 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let package =
             build_winpe_package(source.path(), &parent.path().join("managed"), None).unwrap();
-        assert_eq!(package.uefi_x64_boot_file, "efi/boot/bootx64.efi");
+        assert_eq!(package.uefi_x64_boot_file, "ipxe.efi");
         assert_eq!(package.bios_boot_file, "undionly.kpxe");
+        assert!(Path::new(&package.root).join("ipxe.efi").is_file());
+        assert_ne!(
+            std::fs::read(Path::new(&package.root).join("ipxe.efi")).unwrap(),
+            b"efi"
+        );
         assert_eq!(
             std::fs::read(Path::new(&package.root).join("boot/boot.wim")).unwrap(),
             b"wim"
@@ -522,6 +638,118 @@ mod tests {
             std::fs::read(Path::new(&package.root).join("boot/boot.wim")).unwrap(),
             b"winpe"
         );
+    }
+
+    #[test]
+    fn existing_normalized_package_receives_the_current_bios_and_uefi_ipxe_loaders() {
+        let package = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(package.path().join("boot")).unwrap();
+        for (path, bytes) in [
+            ("boot/BCD", br"\WEPE\B64".as_slice()),
+            ("boot/boot.sdi", b"sdi"),
+            ("boot/boot.wim", br"\Windows\System32\boot\winload.exe"),
+            ("boot/bootmgr", b"bootmgr"),
+            ("boot/wimboot", b"old-wimboot"),
+        ] {
+            std::fs::write(package.path().join(path), bytes).unwrap();
+        }
+        std::fs::write(
+            package.path().join("boot.ipxe"),
+            BROKEN_NAMED_MANAGED_IPXE_SCRIPT,
+        )
+        .unwrap();
+
+        assert!(BootPackage::ensure_managed_network_boot(package.path()).unwrap());
+        assert_eq!(
+            std::fs::read(package.path().join("undionly.kpxe")).unwrap(),
+            EMBEDDED_UNDIONLY
+        );
+        assert_eq!(
+            std::fs::read(package.path().join("ipxe.efi")).unwrap(),
+            EMBEDDED_IPXE_EFI
+        );
+        assert_eq!(
+            std::fs::read(package.path().join("boot/wimboot")).unwrap(),
+            EMBEDDED_WIMBOOT
+        );
+        let bcd = std::fs::read(package.path().join("boot/easydeploymesh.bcd")).unwrap();
+        assert!(!output_contains_ascii_case_insensitive(&bcd, r"\WEPE\B64"));
+        assert!(output_contains_ascii_case_insensitive(
+            &bcd,
+            r"\Boot\boot.wim"
+        ));
+        assert!(package.path().join(MANAGED_LAYOUT_MARKER).is_file());
+        assert_eq!(
+            std::fs::read(package.path().join("boot/BCD")).unwrap(),
+            br"\WEPE\B64"
+        );
+        assert_eq!(
+            std::fs::read_to_string(package.path().join("boot.ipxe")).unwrap(),
+            MANAGED_IPXE_SCRIPT
+        );
+    }
+
+    #[test]
+    fn arbitrary_boot_directory_is_not_rewritten_as_a_managed_ipxe_package() {
+        let package = tempfile::tempdir().unwrap();
+        std::fs::write(package.path().join("boot.ipxe"), b"#!ipxe\necho custom\n").unwrap();
+
+        assert!(!BootPackage::ensure_managed_network_boot(package.path()).unwrap());
+        assert!(!package.path().join("ipxe.efi").exists());
+    }
+
+    #[test]
+    fn managed_ipxe_script_names_each_initrd_for_bios_and_uefi() {
+        let initrds = MANAGED_IPXE_SCRIPT
+            .lines()
+            .filter(|line| line.starts_with("initrd "))
+            .collect::<Vec<_>>();
+        assert_eq!(initrds.len(), 5);
+        for line in initrds {
+            let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+            assert_eq!(fields.len(), 5, "invalid dual-mode initrd line: {line}");
+            assert_eq!(fields[0], "initrd");
+            assert_eq!(fields[1], "--name");
+            assert_eq!(fields[2], fields[4]);
+            assert!(!fields[2].contains('/'));
+        }
+        assert!(MANAGED_IPXE_SCRIPT.contains("initrd --name BCD boot/easydeploymesh.bcd BCD"));
+        assert!(!MANAGED_IPXE_SCRIPT.contains("--name BCD boot/BCD BCD"));
+    }
+
+    #[test]
+    fn package_from_the_broken_named_script_is_upgraded_even_with_a_layout_marker() {
+        let package = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(package.path().join("boot")).unwrap();
+        for (path, bytes) in [
+            ("boot/BCD", br"\WEPE\B64".as_slice()),
+            ("boot/boot.sdi", b"sdi"),
+            ("boot/boot.wim", b"wim"),
+            ("boot/bootmgr", b"bootmgr"),
+            ("boot/wimboot", b"wimboot"),
+        ] {
+            std::fs::write(package.path().join(path), bytes).unwrap();
+        }
+        std::fs::write(
+            package.path().join("boot.ipxe"),
+            BROKEN_NAMED_MANAGED_IPXE_SCRIPT,
+        )
+        .unwrap();
+        std::fs::write(package.path().join(LEGACY_MANAGED_LAYOUT_MARKER), b"2\n").unwrap();
+
+        assert!(BootPackage::ensure_managed_network_boot(package.path()).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(package.path().join("boot.ipxe")).unwrap(),
+            MANAGED_IPXE_SCRIPT
+        );
+        let bcd = std::fs::read(package.path().join("boot/easydeploymesh.bcd")).unwrap();
+        assert!(!output_contains_ascii_case_insensitive(&bcd, r"\WEPE\B64"));
+        assert!(output_contains_ascii_case_insensitive(
+            &bcd,
+            r"\Boot\boot.wim"
+        ));
+        assert!(package.path().join(MANAGED_LAYOUT_MARKER).is_file());
+        assert!(!package.path().join(LEGACY_MANAGED_LAYOUT_MARKER).exists());
     }
 
     #[test]
@@ -615,6 +843,47 @@ mod tests {
     }
 
     #[test]
+    fn wepe64_media_uses_managed_uefi_ipxe_instead_of_the_vendor_boot_chain() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("wepe")).unwrap();
+        std::fs::create_dir_all(source.path().join("efi/microsoft/boot")).unwrap();
+        std::fs::create_dir_all(source.path().join("efi/boot")).unwrap();
+        std::fs::write(source.path().join("wepe/WEPE64.WIM"), b"winpe").unwrap();
+        std::fs::write(source.path().join("wepe/WEPE.SDI"), b"sdi").unwrap();
+        let vendor_bcd = r"\WEPE\B64"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        std::fs::write(source.path().join("efi/microsoft/boot/BCD"), vendor_bcd).unwrap();
+        std::fs::write(source.path().join("efi/boot/bootx64.efi"), b"efi").unwrap();
+        std::fs::write(source.path().join("bootmgr"), b"bootmgr").unwrap();
+        let parent = tempfile::tempdir().unwrap();
+
+        let package =
+            build_winpe_package(source.path(), &parent.path().join("managed"), None).unwrap();
+        let root = Path::new(&package.root);
+        let managed_bcd = std::fs::read(root.join("boot/BCD")).unwrap();
+
+        assert!(output_contains_ascii_case_insensitive(
+            &managed_bcd,
+            r"\Boot\boot.wim"
+        ));
+        assert!(!output_contains_ascii_case_insensitive(
+            &managed_bcd,
+            r"\WEPE\B64"
+        ));
+        assert_eq!(package.uefi_x64_boot_file, "ipxe.efi");
+        assert_eq!(
+            std::fs::read(root.join("ipxe.efi")).unwrap(),
+            EMBEDDED_IPXE_EFI
+        );
+        assert!(!root.join("efi/boot/bootx64.efi").exists());
+        assert!(!root.join("efi/microsoft/boot/BCD").exists());
+        assert!(root.join("boot/boot.wim").is_file());
+        assert!(root.join("boot/boot.sdi").is_file());
+    }
+
+    #[test]
     fn unique_boot_index_selects_a_custom_wim_without_using_file_size() {
         let source = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(source.path().join("images")).unwrap();
@@ -678,6 +947,17 @@ mod tests {
                 .contains(r#"call X:\Windows\System32\startnet.easydeploymesh-original.cmd"#)
         );
         assert!(EASYDEPLOYMESH_STARTNET.starts_with("@echo off\r\nwpeinit\r\n"));
+    }
+
+    #[test]
+    fn reads_the_wepe_setup_shell_from_reg_query_output() {
+        let output = b"\r\nHKEY_LOCAL_MACHINE\\EDM_TEST\\Setup\r\n    CmdLine    REG_SZ    PECMD.EXE MAIN %SystemRoot%\\PECMD.INI\r\n";
+
+        assert_eq!(
+            reg_sz_value(output, "CmdLine").as_deref(),
+            Some(r"PECMD.EXE MAIN %SystemRoot%\PECMD.INI")
+        );
+        assert_eq!(reg_sz_value(output, "Missing"), None);
     }
 
     #[test]
@@ -854,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn ipxe_and_wimboot_are_configured_as_a_legacy_pxe_chain() {
+    fn ipxe_and_wimboot_are_configured_for_bios_and_uefi() {
         let source = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(source.path().join("boot/grub")).unwrap();
         std::fs::create_dir_all(source.path().join("efi/boot")).unwrap();
@@ -872,11 +1152,9 @@ mod tests {
         let package =
             build_winpe_package(source.path(), &parent.path().join("managed"), None).unwrap();
         assert_eq!(package.bios_boot_file, "undionly.kpxe");
+        assert_eq!(package.uefi_x64_boot_file, "ipxe.efi");
         let script = std::fs::read_to_string(Path::new(&package.root).join("boot.ipxe")).unwrap();
-        assert_eq!(
-            script,
-            "#!ipxe\nkernel boot/wimboot\ninitrd boot/bootmgr bootmgr\ninitrd boot/BCD BCD\ninitrd boot/boot.sdi boot.sdi\ninitrd boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd boot/boot.wim boot.wim\nboot\n"
-        );
+        assert_eq!(script, MANAGED_IPXE_SCRIPT);
         assert_eq!(
             std::fs::read(Path::new(&package.root).join("boot/bootmgr")).unwrap(),
             b"bootmgr"
@@ -914,12 +1192,9 @@ mod tests {
                     assert!(Path::new(&package.root).join("boot/BCD").is_file());
                     assert!(Path::new(&package.root).join("boot/bootmgr").is_file());
                     assert!(Path::new(&package.root).join("boot/boot.sdi").is_file());
-                    assert!(
-                        Path::new(&package.root)
-                            .join("efi/boot/bootx64.efi")
-                            .is_file()
-                    );
+                    assert!(Path::new(&package.root).join("ipxe.efi").is_file());
                     assert_eq!(package.bios_boot_file, "undionly.kpxe");
+                    assert_eq!(package.uefi_x64_boot_file, "ipxe.efi");
                     assert!(Path::new(&package.root).join("boot.ipxe").is_file());
                 })
                 .unwrap()
@@ -927,12 +1202,192 @@ mod tests {
                 .unwrap();
         }
     }
+
+    #[test]
+    #[ignore = "requires EASYDEPLOYMESH_WEPE_ISO to point to the WEPE64 v2.2 ISO"]
+    fn imports_real_wepe_v2_2_with_the_native_iso_boot_chain() {
+        let source = std::env::var("EASYDEPLOYMESH_WEPE_ISO")
+            .expect("EASYDEPLOYMESH_WEPE_ISO must point to the WEPE64 v2.2 ISO");
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                let parent = tempfile::tempdir().unwrap();
+                let source_digest = agent_binary_sha256(Path::new(&source)).unwrap();
+                let package =
+                    BootPackage::import_media(&source, parent.path().join("managed")).unwrap();
+                let root = Path::new(&package.root);
+
+                assert_eq!(package.bios_boot_file, "undionly.kpxe");
+                assert_eq!(package.uefi_x64_boot_file, "ipxe.efi");
+                assert_eq!(
+                    std::fs::read(root.join("ipxe.efi")).unwrap(),
+                    EMBEDDED_IPXE_EFI
+                );
+                assert!(root.join("boot.ipxe").is_file());
+                assert_eq!(
+                    std::fs::read_to_string(root.join("boot.ipxe")).unwrap(),
+                    NATIVE_ISO_PLACEHOLDER_SCRIPT
+                );
+                assert!(root.join(NATIVE_ISO_LAYOUT_MARKER).is_file());
+                assert_eq!(
+                    agent_binary_sha256(Path::new(&source)).unwrap(),
+                    source_digest
+                );
+                assert!(
+                    !files_have_same_contents(&root.join(NATIVE_ISO_PATH), Path::new(&source))
+                        .unwrap()
+                );
+                let remastered = tempfile::tempdir().unwrap();
+                extract_iso(&root.join(NATIVE_ISO_PATH), remastered.path()).unwrap();
+                assert!(is_private_wepe_layout(remastered.path()));
+                let boot_images = read_el_torito_boot_images(&root.join(NATIVE_ISO_PATH)).unwrap();
+                let source_boot_images = read_el_torito_boot_images(Path::new(&source)).unwrap();
+                assert_eq!(boot_images.bios_load_sectors, 8);
+                assert_eq!(boot_images.uefi_load_sectors, 1);
+                assert_eq!(boot_images.bios, source_boot_images.bios);
+                assert_eq!(boot_images.uefi, source_boot_images.uefi);
+                assert!(
+                    files_have_same_contents(
+                        &remastered.path().join("WEPE/WEPE64.WIM"),
+                        &root.join("boot/boot.wim")
+                    )
+                    .unwrap()
+                );
+                assert!(root.join("boot/wimboot").is_file());
+                assert!(root.join("boot/BCD").is_file());
+                assert!(root.join("boot/easydeploymesh.bcd").is_file());
+                assert!(root.join("boot/boot.wim").is_file());
+                assert!(root.join("boot/boot.sdi").is_file());
+                assert!(!root.join("efi/boot/bootx64.efi").exists());
+                assert!(!root.join("efi/microsoft/boot/BCD").exists());
+                assert!(!output_contains_ascii_case_insensitive(
+                    &std::fs::read(root.join("boot/BCD")).unwrap(),
+                    r"\WEPE\B64",
+                ));
+                assert!(!output_contains_ascii_case_insensitive(
+                    &std::fs::read(root.join("boot/easydeploymesh.bcd")).unwrap(),
+                    r"\WEPE\B64",
+                ));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn recognizes_wepe_private_boot_layout_without_misclassifying_standard_winpe() {
+        let private = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(private.path().join("WEPE")).unwrap();
+        std::fs::write(private.path().join("BOOTMGR"), b"private-loader").unwrap();
+        std::fs::write(private.path().join("WEPE/WEPE64"), b"private-loader").unwrap();
+        std::fs::write(private.path().join("WEPE/B64"), b"bcd").unwrap();
+        std::fs::write(private.path().join("WEPE/WEPE.SDI"), b"sdi").unwrap();
+        std::fs::write(private.path().join("WEPE/WEPE64.WIM"), b"wim").unwrap();
+        assert!(is_private_wepe_layout(private.path()));
+
+        std::fs::create_dir_all(private.path().join("BOOT")).unwrap();
+        std::fs::write(private.path().join("BOOT/BCD"), b"standard-bcd").unwrap();
+        std::fs::write(private.path().join("WEPE/WEPE64"), b"different-loader").unwrap();
+        assert!(!is_private_wepe_layout(private.path()));
+    }
+
+    #[test]
+    fn parses_http_ranges_used_for_native_iso_boot() {
+        use axum::http::HeaderValue;
+
+        assert_eq!(parse_http_byte_range(None, 100), Ok(None));
+        assert_eq!(
+            parse_http_byte_range(Some(&HeaderValue::from_static("bytes=10-19")), 100),
+            Ok(Some((10, 19)))
+        );
+        assert_eq!(
+            parse_http_byte_range(Some(&HeaderValue::from_static("bytes=90-")), 100),
+            Ok(Some((90, 99)))
+        );
+        assert_eq!(
+            parse_http_byte_range(Some(&HeaderValue::from_static("bytes=-10")), 100),
+            Ok(Some((90, 99)))
+        );
+        assert_eq!(
+            parse_http_byte_range(Some(&HeaderValue::from_static("bytes=100-")), 100),
+            Err(())
+        );
+    }
+
+    #[tokio::test]
+    async fn native_iso_http_server_streams_only_the_requested_range() {
+        let media = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(media.path(), b"0123456789abcdef").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let clients = Arc::new(RwLock::new(HashMap::from([(
+            "00:0c:29:ee:3e:8d".into(),
+            PxeDiscoveredClient {
+                mac_address: "00:0c:29:ee:3e:8d".into(),
+                ip_address: Some("127.0.0.1".into()),
+                architecture: Architecture::X86_64,
+                stage: PxeClientStage::Downloading,
+                first_seen_at: Utc::now(),
+                last_seen_at: Utc::now(),
+            },
+        )])));
+        let router = Router::new()
+            .route("/boot/native.iso", get(serve_native_iso))
+            .with_state(NativeIsoHttpState {
+                iso: media.path().to_path_buf(),
+                clients: Arc::clone(&clients),
+            });
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap()
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/boot/native.iso"))
+            .header(header::RANGE, "bytes=4-9")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 4-9/16");
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"456789");
+        assert_eq!(
+            clients.read().await.get("00:0c:29:ee:3e:8d").unwrap().stage,
+            PxeClientStage::WaitingForAgent
+        );
+
+        task.abort();
+    }
 }
 use crate::ActivityRepository;
+use axum::{
+    Router,
+    body::Body,
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::get,
+};
 use chrono::{DateTime, Duration, Utc};
 use easydeploymesh_core::{
     ActivitySeverity, ActivitySource, ActivitySubject, Architecture, PxeClientStage, PxeConfig,
     PxeDiscoveredClient, PxeMode, PxeServiceStatus,
+};
+use hadris_iso::{
+    boot::{
+        EmulationType, PlatformId,
+        options::{BootEntryOptions, BootOptions, BootSectionOptions},
+    },
+    joliet::JolietLevel,
+    read::PathSeparator,
+    write::{
+        InputTree, IsoImageWriter,
+        options::{BaseIsoLevel, CreationFeatures, IsoFormatOptions},
+    },
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -949,16 +1404,32 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    net::UdpSocket,
+    io::{AsyncReadExt, AsyncSeekExt},
+    net::{TcpListener, UdpSocket},
     sync::{Mutex, RwLock, oneshot},
     task::JoinHandle,
     time::{Duration as TokioDuration, timeout},
 };
+use tokio_util::io::ReaderStream;
 
 // iPXE wimboot v2.9.0 (GPLv2), vendored with its license under assets/wimboot.
 const EMBEDDED_WIMBOOT: &[u8] = include_bytes!("../assets/wimboot/wimboot");
 // iPXE undionly.kpxe, vendored with its GPLv2 license under assets/ipxe.
 const EMBEDDED_UNDIONLY: &[u8] = include_bytes!("../assets/ipxe/undionly.kpxe");
+// iPXE x86-64 UEFI executable, vendored with its GPLv2 license under assets/ipxe.
+const EMBEDDED_IPXE_EFI: &[u8] = include_bytes!("../assets/ipxe/ipxe.efi");
+const LEGACY_MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v2";
+const V3_MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v3";
+const MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v4";
+const LEGACY_NATIVE_ISO_LAYOUT_MARKER: &str = ".easydeploymesh-native-iso-layout-v1";
+const NATIVE_ISO_LAYOUT_MARKER: &str = ".easydeploymesh-native-iso-layout-v2";
+const NATIVE_ISO_PATH: &str = "boot/native.iso";
+const NATIVE_ISO_PLACEHOLDER_SCRIPT: &str =
+    "#!ipxe\nsanboot http://${next-server}:0/boot/native.iso || shell\n";
+const LEGACY_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd boot/bootmgr bootmgr\ninitrd boot/BCD BCD\ninitrd boot/boot.sdi boot.sdi\ninitrd boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd boot/boot.wim boot.wim\nboot\n";
+const BROKEN_NAMED_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name bootmgr boot/bootmgr\ninitrd --name BCD boot/BCD\ninitrd --name boot.sdi boot/boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim\nboot\n";
+const V3_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name bootmgr boot/bootmgr bootmgr\ninitrd --name BCD boot/BCD BCD\ninitrd --name boot.sdi boot/boot.sdi boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim boot.wim\nboot\n";
+const MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name bootmgr boot/bootmgr bootmgr\ninitrd --name BCD boot/easydeploymesh.bcd BCD\ninitrd --name boot.sdi boot/boot.sdi boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim boot.wim\nboot\n";
 const DHCP_SERVER_PORT: u16 = 67;
 const DHCP_CLIENT_PORT: u16 = 68;
 const TFTP_PORT: u16 = 69;
@@ -1017,6 +1488,12 @@ pub enum PxeServiceError {
         #[source]
         source: std::io::Error,
     },
+    #[error("could not bind native ISO HTTP service on {address}: {source}")]
+    HttpBind {
+        address: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("PXE service task failed: {0}")]
@@ -1032,6 +1509,80 @@ pub struct BootPackage {
 }
 
 impl BootPackage {
+    /// Refreshes the bundled network loaders for a package created by media import.
+    ///
+    /// The exact managed iPXE script identifies normalized packages without
+    /// rewriting arbitrary user-supplied boot directories.
+    pub fn ensure_managed_network_boot(root: impl AsRef<Path>) -> Result<bool, PxeServiceError> {
+        let root = root.as_ref();
+        if root.join(LEGACY_NATIVE_ISO_LAYOUT_MARKER).is_file()
+            && !root.join(NATIVE_ISO_LAYOUT_MARKER).is_file()
+        {
+            return Err(PxeServiceError::InvalidConfig(
+                "the managed native ISO predates Agent injection; reimport the source ISO".into(),
+            ));
+        }
+        if root.join(NATIVE_ISO_LAYOUT_MARKER).is_file() && root.join(NATIVE_ISO_PATH).is_file() {
+            fs::write(root.join("undionly.kpxe"), EMBEDDED_UNDIONLY)?;
+            fs::write(root.join("ipxe.efi"), EMBEDDED_IPXE_EFI)?;
+            fs::write(root.join("boot.ipxe"), NATIVE_ISO_PLACEHOLDER_SCRIPT)?;
+            return Ok(true);
+        }
+        let script = fs::read(root.join("boot.ipxe")).ok();
+        if !matches!(
+            script.as_deref(),
+            Some(bytes) if bytes == MANAGED_IPXE_SCRIPT.as_bytes()
+                || bytes == LEGACY_MANAGED_IPXE_SCRIPT.as_bytes()
+                || bytes == BROKEN_NAMED_MANAGED_IPXE_SCRIPT.as_bytes()
+                || bytes == V3_MANAGED_IPXE_SCRIPT.as_bytes()
+        ) || ![
+            "boot/boot.sdi",
+            "boot/boot.wim",
+            "boot/bootmgr",
+            "boot/wimboot",
+        ]
+        .iter()
+        .all(|path| root.join(path).is_file())
+        {
+            return Ok(false);
+        }
+        let loader_path = detect_winpe_loader_path(&root.join("boot/boot.wim"))?;
+        let replacement = root
+            .join("boot")
+            .join(format!(".BCD-{}", uuid::Uuid::new_v4()));
+        if let Err(error) = write_clean_winpe_bcd(&replacement, loader_path) {
+            let _ = fs::remove_file(replacement);
+            return Err(error);
+        }
+        let bcd = root.join("boot/easydeploymesh.bcd");
+        let backup = root
+            .join("boot")
+            .join(format!(".BCD-old-{}", uuid::Uuid::new_v4()));
+        let had_bcd = bcd.is_file();
+        if had_bcd && let Err(error) = fs::rename(&bcd, &backup) {
+            let _ = fs::remove_file(replacement);
+            return Err(error.into());
+        }
+        if let Err(error) = fs::rename(&replacement, &bcd) {
+            if had_bcd {
+                let _ = fs::rename(backup, bcd);
+            }
+            let _ = fs::remove_file(replacement);
+            return Err(error.into());
+        }
+        if had_bcd {
+            let _ = fs::remove_file(backup);
+        }
+        fs::write(root.join("undionly.kpxe"), EMBEDDED_UNDIONLY)?;
+        fs::write(root.join("ipxe.efi"), EMBEDDED_IPXE_EFI)?;
+        fs::write(root.join("boot/wimboot"), EMBEDDED_WIMBOOT)?;
+        fs::write(root.join("boot.ipxe"), MANAGED_IPXE_SCRIPT)?;
+        fs::write(root.join(MANAGED_LAYOUT_MARKER), b"4\n")?;
+        let _ = fs::remove_file(root.join(LEGACY_MANAGED_LAYOUT_MARKER));
+        let _ = fs::remove_file(root.join(V3_MANAGED_LAYOUT_MARKER));
+        Ok(true)
+    }
+
     pub fn import(
         source: impl AsRef<Path>,
         managed_root: impl AsRef<Path>,
@@ -1145,8 +1696,26 @@ impl BootPackage {
             let _ = fs::remove_dir_all(&extracted);
             return Err(error);
         }
-        let result =
-            build_winpe_package(&extracted, managed_root, agent.as_ref().map(AsRef::as_ref));
+        let native_boot_images = if extension == "iso" && is_private_wepe_layout(&extracted) {
+            let boot_images = read_el_torito_boot_images(source)?;
+            if let Some(agent) = agent.as_ref().map(AsRef::as_ref) {
+                let native_wim = find_path_case_insensitive(&extracted, &["wepe", "wepe64.wim"])
+                    .ok_or_else(|| PxeServiceError::MissingBootFile("WEPE/WEPE64.WIM".into()))?;
+                Self::ensure_agent_runtime(native_wim, agent)?;
+            }
+            Some(boot_images)
+        } else {
+            None
+        };
+        let result = build_winpe_package_with_native_iso(
+            &extracted,
+            managed_root,
+            native_boot_images
+                .is_none()
+                .then(|| agent.as_ref().map(AsRef::as_ref))
+                .flatten(),
+            native_boot_images.as_ref(),
+        );
         let _ = fs::remove_dir_all(&extracted);
         result
     }
@@ -1161,7 +1730,16 @@ impl BootPackage {
         wim: impl AsRef<Path>,
         bootstrap: &[u8],
     ) -> Result<(), PxeServiceError> {
-        inject_bootstrap_into_winpe(wim.as_ref(), bootstrap)
+        let wim = wim.as_ref();
+        inject_bootstrap_into_winpe(wim, bootstrap)?;
+        let package_root = wim
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or_else(|| Path::new("."));
+        if package_root.join(NATIVE_ISO_LAYOUT_MARKER).is_file() {
+            refresh_native_iso_bootstrap(package_root, bootstrap)?;
+        }
+        Ok(())
     }
 
     /// Ensures the managed WinPE image contains the current Agent and runtime layout.
@@ -1226,7 +1804,7 @@ fn agent_binary_sha256(path: &Path) -> Result<String, PxeServiceError> {
 // Bump this revision whenever WinPE injection behavior changes without changing
 // one of the embedded byte payloads below. Existing packages will then be
 // mounted and refreshed once on their next runtime check.
-const EASYDEPLOYMESH_RUNTIME_LAYOUT_REVISION: &str = "easydeploymesh-winpe-runtime-layout-v1";
+const EASYDEPLOYMESH_RUNTIME_LAYOUT_REVISION: &str = "easydeploymesh-winpe-runtime-layout-v2";
 
 fn winpe_runtime_sha256(agent: &Path) -> Result<String, PxeServiceError> {
     let agent_digest = agent_binary_sha256(agent)?;
@@ -1255,6 +1833,238 @@ fn extract_iso(source: &Path, target: &Path) -> Result<(), PxeServiceError> {
         volume.root_extent_len,
         target,
     )
+}
+
+#[derive(Debug, Clone)]
+struct ElToritoBootImages {
+    bios: Vec<u8>,
+    bios_load_sectors: u16,
+    uefi: Vec<u8>,
+    uefi_load_sectors: u16,
+}
+
+fn read_el_torito_boot_images(source: &Path) -> Result<ElToritoBootImages, PxeServiceError> {
+    const ISO_SECTOR: u64 = 2048;
+    let mut media = File::open(source)?;
+    let media_len = media.metadata()?.len();
+    let mut descriptor = [0u8; 2048];
+    let mut catalog_lba = None;
+    for lba in 16..64u64 {
+        media.seek(SeekFrom::Start(lba * ISO_SECTOR))?;
+        media.read_exact(&mut descriptor)?;
+        if &descriptor[1..6] != b"CD001" {
+            return Err(PxeServiceError::InvalidConfig(
+                "ISO has an invalid volume descriptor".into(),
+            ));
+        }
+        if descriptor[0] == 0 && descriptor[7..39].starts_with(b"EL TORITO SPECIFICATION") {
+            catalog_lba = Some(u32::from_le_bytes(descriptor[71..75].try_into().unwrap()));
+            break;
+        }
+        if descriptor[0] == 255 {
+            break;
+        }
+    }
+    let catalog_lba = catalog_lba.ok_or_else(|| {
+        PxeServiceError::InvalidConfig("ISO has no El Torito boot catalog".into())
+    })?;
+    let mut catalog = [0u8; 2048];
+    media.seek(SeekFrom::Start(u64::from(catalog_lba) * ISO_SECTOR))?;
+    media.read_exact(&mut catalog)?;
+    let checksum = catalog[..32].chunks_exact(2).fold(0u16, |sum, word| {
+        sum.wrapping_add(u16::from_le_bytes([word[0], word[1]]))
+    });
+    if catalog[0] != 1 || catalog[30..32] != [0x55, 0xaa] || checksum != 0 {
+        return Err(PxeServiceError::InvalidConfig(
+            "ISO has an invalid El Torito validation entry".into(),
+        ));
+    }
+    let bios = parse_el_torito_entry(&catalog[32..64], 0x00)?;
+    let mut uefi = None;
+    let mut offset = 64usize;
+    while offset + 32 <= catalog.len() {
+        let entry = &catalog[offset..offset + 32];
+        if matches!(entry[0], 0x90 | 0x91) {
+            let platform = entry[1];
+            let count = usize::from(u16::from_le_bytes([entry[2], entry[3]]));
+            for index in 0..count {
+                let start = offset + 32 * (index + 1);
+                if start + 32 > catalog.len() {
+                    return Err(PxeServiceError::InvalidConfig(
+                        "El Torito boot catalog is truncated".into(),
+                    ));
+                }
+                if platform == 0xef {
+                    uefi = Some(parse_el_torito_entry(&catalog[start..start + 32], 0xef)?);
+                }
+            }
+            offset += 32 * (count + 1);
+            if entry[0] == 0x91 {
+                break;
+            }
+        } else {
+            offset += 32;
+        }
+    }
+    let uefi = uefi.ok_or_else(|| {
+        PxeServiceError::InvalidConfig("ISO has no x64 UEFI El Torito image".into())
+    })?;
+    let bios_bytes = read_iso_extent(&mut media, media_len, bios.1, u64::from(bios.0) * 512)?;
+    let uefi_prefix = read_iso_extent(&mut media, media_len, uefi.1, 512)?;
+    let uefi_size = fat_image_size(&uefi_prefix)?;
+    let uefi_bytes = read_iso_extent(&mut media, media_len, uefi.1, uefi_size)?;
+    Ok(ElToritoBootImages {
+        bios: bios_bytes,
+        bios_load_sectors: bios.0,
+        uefi: uefi_bytes,
+        uefi_load_sectors: uefi.0,
+    })
+}
+
+fn parse_el_torito_entry(entry: &[u8], platform: u8) -> Result<(u16, u32), PxeServiceError> {
+    if entry.len() != 32 || entry[0] != 0x88 || entry[1] != 0 {
+        return Err(PxeServiceError::InvalidConfig(format!(
+            "ISO {platform:#04x} El Torito entry is not bootable no-emulation media"
+        )));
+    }
+    let sectors = u16::from_le_bytes([entry[6], entry[7]]);
+    let lba = u32::from_le_bytes(entry[8..12].try_into().unwrap());
+    if sectors == 0 || lba == 0 {
+        return Err(PxeServiceError::InvalidConfig(
+            "El Torito entry has an empty boot image".into(),
+        ));
+    }
+    Ok((sectors, lba))
+}
+
+fn fat_image_size(boot_sector: &[u8]) -> Result<u64, PxeServiceError> {
+    if boot_sector.len() < 512 || boot_sector[510..512] != [0x55, 0xaa] {
+        return Err(PxeServiceError::InvalidConfig(
+            "UEFI El Torito image has no valid FAT boot sector".into(),
+        ));
+    }
+    let bytes_per_sector = u64::from(u16::from_le_bytes([boot_sector[11], boot_sector[12]]));
+    let short_sectors = u64::from(u16::from_le_bytes([boot_sector[19], boot_sector[20]]));
+    let long_sectors = u64::from(u32::from_le_bytes(boot_sector[32..36].try_into().unwrap()));
+    let sectors = if short_sectors != 0 {
+        short_sectors
+    } else {
+        long_sectors
+    };
+    let size = bytes_per_sector.checked_mul(sectors).ok_or_else(|| {
+        PxeServiceError::InvalidConfig("UEFI El Torito image size overflows".into())
+    })?;
+    if !matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096)
+        || size < 512
+        || size > 64 * 1024 * 1024
+    {
+        return Err(PxeServiceError::InvalidConfig(
+            "UEFI El Torito FAT image has an invalid size".into(),
+        ));
+    }
+    Ok(size)
+}
+
+fn read_iso_extent(
+    media: &mut File,
+    media_len: u64,
+    lba: u32,
+    size: u64,
+) -> Result<Vec<u8>, PxeServiceError> {
+    let offset = u64::from(lba)
+        .checked_mul(2048)
+        .ok_or_else(|| PxeServiceError::InvalidConfig("El Torito image offset overflows".into()))?;
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| PxeServiceError::InvalidConfig("El Torito image length overflows".into()))?;
+    if end > media_len || size > 64 * 1024 * 1024 {
+        return Err(PxeServiceError::InvalidConfig(
+            "El Torito image is outside the ISO".into(),
+        ));
+    }
+    let mut bytes = vec![
+        0u8;
+        usize::try_from(size).map_err(|_| {
+            PxeServiceError::InvalidConfig("El Torito image is too large".into())
+        })?
+    ];
+    media.seek(SeekFrom::Start(offset))?;
+    media.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn remaster_wepe_iso(
+    extracted: &Path,
+    boot_images: &ElToritoBootImages,
+    destination: &Path,
+) -> Result<(), PxeServiceError> {
+    let bios_name = "EDM_BIOS.IMG";
+    let uefi_name = "EDM_UEFI.IMG";
+    let catalog_name = "boot.catalog";
+    fs::write(extracted.join(bios_name), &boot_images.bios)?;
+    fs::write(extracted.join(uefi_name), &boot_images.uefi)?;
+    fs::write(extracted.join(catalog_name), vec![0u8; 2048])?;
+    let input = InputTree::from_fs(extracted, PathSeparator::ForwardSlash).map_err(|error| {
+        PxeServiceError::InvalidConfig(format!("could not stage remastered ISO: {error}"))
+    })?;
+    let options = IsoFormatOptions {
+        volume_name: "EASYDEPLOYMESH_WEPE".into(),
+        system_id: None,
+        volume_set_id: None,
+        publisher_id: None,
+        preparer_id: Some("EasyDeployMesh".into()),
+        application_id: Some("EasyDeployMesh managed WinPE".into()),
+        sector_size: 2048,
+        path_separator: PathSeparator::ForwardSlash,
+        features: CreationFeatures {
+            filenames: BaseIsoLevel::Level2 {
+                supports_lowercase: true,
+                supports_rrip: false,
+            },
+            long_filenames: false,
+            joliet: Some(JolietLevel::Level3),
+            rock_ridge: None,
+            el_torito: Some(BootOptions {
+                write_boot_catalog: true,
+                default: BootEntryOptions {
+                    load_size: std::num::NonZeroU16::new(boot_images.bios_load_sectors),
+                    boot_image_path: bios_name.into(),
+                    boot_info_table: false,
+                    grub2_boot_info: false,
+                    emulation: EmulationType::NoEmulation,
+                },
+                entries: vec![(
+                    BootSectionOptions {
+                        platform: PlatformId::UEFI,
+                    },
+                    BootEntryOptions {
+                        load_size: std::num::NonZeroU16::new(boot_images.uefi_load_sectors),
+                        boot_image_path: uefi_name.into(),
+                        boot_info_table: false,
+                        grub2_boot_info: false,
+                        emulation: EmulationType::NoEmulation,
+                    },
+                )],
+            }),
+            hybrid_boot: None,
+        },
+        strict_charset: false,
+    };
+    let output = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(destination)?;
+    IsoImageWriter::create(output, input, options).map_err(|error| {
+        PxeServiceError::InvalidConfig(format!(
+            "could not create remastered ISO: {error} ({error:?})"
+        ))
+    })?;
+    let _ = fs::remove_file(extracted.join(bios_name));
+    let _ = fs::remove_file(extracted.join(uefi_name));
+    let _ = fs::remove_file(extracted.join(catalog_name));
+    Ok(())
 }
 
 fn copy_iso_directory<B: gpt_disk_io::BlockIo>(
@@ -1394,10 +2204,20 @@ fn copy_fat_directory<T: fatfs::ReadWriteSeek>(
     Ok(())
 }
 
+#[cfg(test)]
 fn build_winpe_package(
     extracted: &Path,
     managed_root: &Path,
     agent: Option<&Path>,
+) -> Result<BootPackage, PxeServiceError> {
+    build_winpe_package_with_native_iso(extracted, managed_root, agent, None)
+}
+
+fn build_winpe_package_with_native_iso(
+    extracted: &Path,
+    managed_root: &Path,
+    agent: Option<&Path>,
+    native_boot_images: Option<&ElToritoBootImages>,
 ) -> Result<BootPackage, PxeServiceError> {
     let files = walk_files(extracted)?;
     let wims = files
@@ -1448,16 +2268,15 @@ fn build_winpe_package(
         .or_else(|| find_unique_uefi_bcd_reference(extracted, &files, "sdi"))
         .or_else(|| find_unique_file_with_extension(&files, "sdi"))
         .ok_or_else(|| PxeServiceError::MissingBootFile("boot.sdi".into()))?;
-    let uefi = find_named(&files, "bootx64.efi")
-        .ok_or_else(|| PxeServiceError::MissingBootFile("bootx64.efi".into()))?;
     let staging = managed_root
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(format!(".pxe-package-{}", uuid::Uuid::new_v4()));
     let populate = (|| -> Result<(), PxeServiceError> {
         fs::create_dir_all(staging.join("boot"))?;
-        fs::create_dir_all(staging.join("efi/boot"))?;
-        write_clean_winpe_bcd(&staging.join("boot/BCD"), loader_path)?;
+        let bios_bcd = staging.join("boot/BCD");
+        write_clean_winpe_bcd(&bios_bcd, loader_path)?;
+        fs::copy(&bios_bcd, staging.join("boot/easydeploymesh.bcd"))?;
         let staged_wim = staging.join("boot/boot.wim");
         fs::copy(wim, &staged_wim)?;
         if let Some(agent) = agent {
@@ -1465,11 +2284,17 @@ fn build_winpe_package(
         }
         fs::copy(bootmgr, staging.join("boot/bootmgr"))?;
         fs::copy(sdi, staging.join("boot/boot.sdi"))?;
-        fs::copy(uefi, staging.join("efi/boot/bootx64.efi"))?;
         fs::write(staging.join("undionly.kpxe"), EMBEDDED_UNDIONLY)?;
+        fs::write(staging.join("ipxe.efi"), EMBEDDED_IPXE_EFI)?;
         fs::write(staging.join("boot/wimboot"), EMBEDDED_WIMBOOT)?;
-        let script = "#!ipxe\nkernel boot/wimboot\ninitrd boot/bootmgr bootmgr\ninitrd boot/BCD BCD\ninitrd boot/boot.sdi boot.sdi\ninitrd boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd boot/boot.wim boot.wim\nboot\n";
-        fs::write(staging.join("boot.ipxe"), script)?;
+        if let Some(boot_images) = native_boot_images {
+            remaster_wepe_iso(extracted, boot_images, &staging.join(NATIVE_ISO_PATH))?;
+            fs::write(staging.join("boot.ipxe"), NATIVE_ISO_PLACEHOLDER_SCRIPT)?;
+            fs::write(staging.join(NATIVE_ISO_LAYOUT_MARKER), b"2\n")?;
+        } else {
+            fs::write(staging.join("boot.ipxe"), MANAGED_IPXE_SCRIPT)?;
+            fs::write(staging.join(MANAGED_LAYOUT_MARKER), b"4\n")?;
+        }
         Ok(())
     })();
     if let Err(error) = populate {
@@ -1496,7 +2321,7 @@ fn build_winpe_package(
     Ok(BootPackage {
         root: managed_root.to_string_lossy().into_owned(),
         bios_boot_file,
-        uefi_x64_boot_file: "efi/boot/bootx64.efi".into(),
+        uefi_x64_boot_file: "ipxe.efi".into(),
     })
 }
 
@@ -1782,6 +2607,48 @@ fn inject_bootstrap_into_winpe(_wim: &Path, _bootstrap: &[u8]) -> Result<(), Pxe
 }
 
 #[cfg(all(target_os = "windows", not(test)))]
+fn refresh_native_iso_bootstrap(
+    package_root: &Path,
+    bootstrap: &[u8],
+) -> Result<(), PxeServiceError> {
+    let iso = package_root.join(NATIVE_ISO_PATH);
+    let boot_images = read_el_torito_boot_images(&iso)?;
+    let workspace = package_root.join(format!(
+        ".easydeploymesh-native-remaster-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let extracted = workspace.join("tree");
+    fs::create_dir_all(&extracted)?;
+    let result = (|| -> Result<(), PxeServiceError> {
+        extract_iso(&iso, &extracted)?;
+        let native_wim = find_path_case_insensitive(&extracted, &["wepe", "wepe64.wim"])
+            .ok_or_else(|| PxeServiceError::MissingBootFile("WEPE/WEPE64.WIM".into()))?;
+        inject_bootstrap_into_winpe(&native_wim, bootstrap)?;
+        let replacement = workspace.join("native.iso");
+        remaster_wepe_iso(&extracted, &boot_images, &replacement)?;
+        let backup = workspace.join("previous.iso");
+        fs::rename(&iso, &backup)?;
+        if let Err(error) = fs::rename(&replacement, &iso) {
+            let _ = fs::rename(&backup, &iso);
+            return Err(error.into());
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&workspace);
+    result
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
+fn refresh_native_iso_bootstrap(
+    _package_root: &Path,
+    _bootstrap: &[u8],
+) -> Result<(), PxeServiceError> {
+    Err(PxeServiceError::InvalidConfig(
+        "remastering the managed native ISO requires Windows DISM".into(),
+    ))
+}
+
+#[cfg(all(target_os = "windows", not(test)))]
 fn inject_agent_into_winpe(wim: &Path, agent: &Path) -> Result<(), PxeServiceError> {
     if !agent.is_file() {
         return Err(PxeServiceError::MissingBootFile(
@@ -1818,16 +2685,23 @@ fn inject_agent_into_winpe(wim: &Path, agent: &Path) -> Result<(), PxeServiceErr
 
         let system32 = mount.join("Windows/System32");
         let winpeshl = system32.join("winpeshl.ini");
+        let mut shell_hook_installed = false;
         if winpeshl.is_file() {
             let patched = patch_winpeshl_for_agent(&fs::read(&winpeshl)?)?;
             fs::write(&winpeshl, patched.ini)?;
-            fs::write(easydeploymesh.join("shell-hook.enabled"), b"enabled\r\n")?;
+            shell_hook_installed = true;
             if let Some(script) = patched.original_shell_script {
                 fs::write(
                     easydeploymesh.join("easydeploymesh-original-shell.cmd"),
                     script,
                 )?;
             }
+        }
+        if patch_setup_cmdline_for_agent(&mount, &easydeploymesh)? {
+            shell_hook_installed = true;
+        }
+        if shell_hook_installed {
+            fs::write(easydeploymesh.join("shell-hook.enabled"), b"enabled\r\n")?;
         }
         let startnet = system32.join("startnet.cmd");
         let original = system32.join("startnet.easydeploymesh-original.cmd");
@@ -1854,6 +2728,81 @@ fn inject_agent_into_winpe(wim: &Path, agent: &Path) -> Result<(), PxeServiceErr
     }
     let _ = fs::remove_dir_all(&mount);
     result
+}
+
+#[cfg(all(target_os = "windows", not(test)))]
+fn patch_setup_cmdline_for_agent(
+    mount: &Path,
+    easydeploymesh: &Path,
+) -> Result<bool, PxeServiceError> {
+    let hive = mount.join("Windows/System32/config/SYSTEM");
+    if !hive.is_file() {
+        return Ok(false);
+    }
+    let hive_name = format!("EDM_{}", uuid::Uuid::new_v4().simple());
+    let hive_key = format!(r"HKLM\{hive_name}");
+    run_reg(&[
+        "load".into(),
+        hive_key.clone().into(),
+        hive.into_os_string(),
+    ])?;
+
+    let result = (|| -> Result<bool, PxeServiceError> {
+        let setup_key = format!(r"{hive_key}\Setup");
+        let query = background_command("reg.exe")
+            .args(["query", &setup_key, "/v", "CmdLine"])
+            .output()?;
+        if !query.status.success() {
+            return Ok(false);
+        }
+        let Some(command) = reg_sz_value(&query.stdout, "CmdLine") else {
+            return Ok(false);
+        };
+        if command.eq_ignore_ascii_case(r"X:\EasyDeployMesh\easydeploymesh-shell.exe") {
+            return Ok(true);
+        }
+        let mut script = b"@echo off\r\n".to_vec();
+        script.extend_from_slice(command.as_bytes());
+        script.extend_from_slice(b"\r\n");
+        fs::write(
+            easydeploymesh.join("easydeploymesh-original-shell.cmd"),
+            script,
+        )?;
+        run_reg(&[
+            "add".into(),
+            setup_key.into(),
+            "/v".into(),
+            "CmdLine".into(),
+            "/t".into(),
+            "REG_SZ".into(),
+            "/d".into(),
+            r"X:\EasyDeployMesh\easydeploymesh-shell.exe".into(),
+            "/f".into(),
+        ])?;
+        Ok(true)
+    })();
+
+    let unload = run_reg(&["unload".into(), hive_key.into()]);
+    match (result, unload) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(installed), Ok(_)) => Ok(installed),
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn reg_sz_value(output: &[u8], name: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(output);
+    text.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if !fields.next()?.eq_ignore_ascii_case(name)
+            || !fields.next()?.eq_ignore_ascii_case("REG_SZ")
+        {
+            return None;
+        }
+        let value = fields.collect::<Vec<_>>().join(" ");
+        (!value.is_empty()).then_some(value)
+    })
 }
 
 #[cfg(any(not(target_os = "windows"), test))]
@@ -1883,6 +2832,19 @@ fn run_dism(arguments: &[std::ffi::OsString]) -> Result<std::process::Output, Px
             .map(|argument| argument.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" "),
+        command_output_text(&output.stdout),
+        command_output_text(&output.stderr)
+    )))
+}
+
+#[cfg(all(target_os = "windows", not(test)))]
+fn run_reg(arguments: &[std::ffi::OsString]) -> Result<std::process::Output, PxeServiceError> {
+    let output = background_command("reg.exe").args(arguments).output()?;
+    if output.status.success() {
+        return Ok(output);
+    }
+    Err(PxeServiceError::InvalidConfig(format!(
+        "offline WinPE registry command failed: {} {}",
         command_output_text(&output.stdout),
         command_output_text(&output.stderr)
     )))
@@ -2061,6 +3023,11 @@ fn write_clean_winpe_bcd(path: &Path, loader_path: &'static str) -> Result<(), P
             )));
         }
     }
+    if output_contains_ascii_case_insensitive(&enumeration.stdout, r"\WEPE\B64") {
+        return Err(PxeServiceError::InvalidConfig(
+            "the generated WinPE BCD store still references \\WEPE\\B64".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -2187,6 +3154,62 @@ fn find_named<'a>(files: &'a [PathBuf], name: &str) -> Option<&'a PathBuf> {
         .min_by_key(|path| path.components().count())
 }
 
+fn is_private_wepe_layout(extracted: &Path) -> bool {
+    let bootmgr = find_path_case_insensitive(extracted, &["bootmgr"]);
+    let private_loader = find_path_case_insensitive(extracted, &["wepe", "wepe64"]);
+    let required_private_files = [
+        ["wepe", "b64"],
+        ["wepe", "wepe.sdi"],
+        ["wepe", "wepe64.wim"],
+    ];
+    let (Some(bootmgr), Some(private_loader)) = (bootmgr, private_loader) else {
+        return false;
+    };
+    if !required_private_files
+        .iter()
+        .all(|path| find_path_case_insensitive(extracted, path).is_some())
+    {
+        return false;
+    }
+    files_have_same_contents(&bootmgr, &private_loader).unwrap_or(false)
+}
+
+fn find_path_case_insensitive(root: &Path, components: &[&str]) -> Option<PathBuf> {
+    let mut current = root.to_path_buf();
+    for expected in components {
+        let entry = fs::read_dir(&current).ok()?.find_map(|entry| {
+            let entry = entry.ok()?;
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case(expected))
+                .then_some(entry.path())
+        })?;
+        current = entry;
+    }
+    current.is_file().then_some(current)
+}
+
+fn files_have_same_contents(left: &Path, right: &Path) -> Result<bool, io::Error> {
+    if fs::metadata(left)?.len() != fs::metadata(right)?.len() {
+        return Ok(false);
+    }
+    let mut left = File::open(left)?;
+    let mut right = File::open(right)?;
+    let mut left_buffer = [0u8; 64 * 1024];
+    let mut right_buffer = [0u8; 64 * 1024];
+    loop {
+        let left_read = left.read(&mut left_buffer)?;
+        let right_read = right.read(&mut right_buffer)?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
 fn copy_tree(source: &Path, target: &Path) -> Result<(), std::io::Error> {
     fs::create_dir_all(target)?;
     for entry in fs::read_dir(source)? {
@@ -2300,6 +3323,100 @@ struct RunningPxe {
     tasks: Vec<JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+struct NativeIsoHttpState {
+    iso: PathBuf,
+    clients: Arc<RwLock<HashMap<String, PxeDiscoveredClient>>>,
+}
+
+async fn serve_native_iso(
+    State(state): State<NativeIsoHttpState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(mut file) = tokio::fs::File::open(&state.iso).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(metadata) = file.metadata().await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let total = metadata.len();
+    let range = match parse_http_byte_range(headers.get(header::RANGE), total) {
+        Ok(range) => range,
+        Err(()) => {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+                .body(Body::empty())
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+    update_client_stage_by_ip(&state.clients, peer.ip(), PxeClientStage::WaitingForAgent).await;
+    let (start, end, status) = range
+        .map(|(start, end)| (start, end, StatusCode::PARTIAL_CONTENT))
+        .unwrap_or((0, total.saturating_sub(1), StatusCode::OK));
+    if file.seek(SeekFrom::Start(start)).await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let length = end.saturating_sub(start).saturating_add(1);
+    let stream = ReaderStream::new(file.take(length));
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, length.to_string())
+        .header(header::CONTENT_TYPE, "application/octet-stream");
+    if status == StatusCode::PARTIAL_CONTENT {
+        response = response.header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{total}"),
+        );
+    }
+    response
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn parse_http_byte_range(
+    header_value: Option<&axum::http::HeaderValue>,
+    total: u64,
+) -> Result<Option<(u64, u64)>, ()> {
+    let Some(value) = header_value else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| ())?;
+    let value = value.strip_prefix("bytes=").ok_or(())?;
+    if value.contains(',') || total == 0 {
+        return Err(());
+    }
+    let (start, end) = value.split_once('-').ok_or(())?;
+    let (start, end) = if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| ())?;
+        if suffix == 0 {
+            return Err(());
+        }
+        (total.saturating_sub(suffix.min(total)), total - 1)
+    } else {
+        let start = start.parse::<u64>().map_err(|_| ())?;
+        if start >= total {
+            return Err(());
+        }
+        let end = if end.is_empty() {
+            total - 1
+        } else {
+            end.parse::<u64>().map_err(|_| ())?.min(total - 1)
+        };
+        if end < start {
+            return Err(());
+        }
+        (start, end)
+    };
+    Ok(Some((start, end)))
+}
+
+fn native_iso_ipxe_script(bind: Ipv4Addr, port: u16) -> String {
+    format!("#!ipxe\nsanboot http://{bind}:{port}/boot/native.iso || shell\n")
+}
+
 pub struct PxeService {
     running: Mutex<Option<RunningPxe>>,
     leases: Arc<RwLock<HashMap<String, Lease>>>,
@@ -2386,13 +3503,33 @@ impl PxeService {
             None
         };
         dhcp.set_broadcast(true)?;
+        let root = PathBuf::from(&config.tftp_root);
+        let native_iso_http = if root.join(NATIVE_ISO_LAYOUT_MARKER).is_file() {
+            let iso = root.join(NATIVE_ISO_PATH);
+            if !iso.is_file() {
+                return Err(PxeServiceError::MissingBootFile(NATIVE_ISO_PATH.into()));
+            }
+            let requested = SocketAddr::new(IpAddr::V4(bind), 0);
+            let listener =
+                TcpListener::bind(requested)
+                    .await
+                    .map_err(|source| PxeServiceError::HttpBind {
+                        address: requested.to_string(),
+                        source,
+                    })?;
+            let port = listener.local_addr()?.port();
+            let script = native_iso_ipxe_script(bind, port);
+            fs::write(root.join("boot.ipxe"), script)?;
+            Some((listener, iso))
+        } else {
+            None
+        };
         let (tftp_tx, tftp_rx) = oneshot::channel();
         let (dhcp_tx, dhcp_rx) = oneshot::channel();
-        let root = PathBuf::from(&config.tftp_root);
         let clients_for_tftp = Arc::clone(&self.clients);
         let tftp_task = tokio::spawn(run_tftp(
             tftp,
-            root,
+            root.clone(),
             clients_for_tftp,
             self.activities.clone(),
             tftp_rx,
@@ -2413,6 +3550,26 @@ impl PxeService {
         ));
         let mut shutdown = vec![tftp_tx, dhcp_tx];
         let mut tasks = vec![tftp_task, dhcp_task];
+        if let Some((listener, iso)) = native_iso_http {
+            let (tx, rx) = oneshot::channel();
+            let router = Router::new()
+                .route("/boot/native.iso", get(serve_native_iso))
+                .with_state(NativeIsoHttpState {
+                    iso,
+                    clients: Arc::clone(&self.clients),
+                });
+            tasks.push(tokio::spawn(async move {
+                let _ = axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await;
+            }));
+            shutdown.push(tx);
+        }
         if let Some(proxy_socket) = proxy_discovery {
             let (tx, rx) = oneshot::channel();
             tasks.push(tokio::spawn(run_dhcp(

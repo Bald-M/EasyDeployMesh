@@ -41,6 +41,17 @@ Run the application in the Tauri desktop shell:
 pnpm tauri:dev
 ```
 
+Build every installer supported by the current host with:
+
+```bash
+pnpm build
+```
+
+Use a selector such as `pnpm build -- windows` or
+`pnpm build -- windows-x64` for a narrower build. macOS and Linux packages
+require their respective native hosts; Windows packages can be cross-compiled
+from non-Windows hosts with `cargo-xwin`.
+
 The browser development mode uses safe fallbacks for native Tauri commands, so
 features that depend on the host operating system should also be tested in the
 desktop shell.
