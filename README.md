@@ -176,6 +176,13 @@ x86, and x64 NSIS installers, and Linux ARM64 and x64 AppImages. Run the macOS
 and Linux commands on their respective operating systems; non-Windows hosts use
 `cargo-xwin` for Windows cross-builds.
 
+Before building the Windows installers on a non-Windows host, install the
+additional Rust targets:
+
+```bash
+rustup target add aarch64-pc-windows-msvc i686-pc-windows-msvc
+```
+
 An individual architecture can also be built directly, for example:
 
 ```bash
