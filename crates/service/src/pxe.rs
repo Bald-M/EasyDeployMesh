@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ActivityQuery;
     use easydeploymesh_core::{PxeConfig, PxeMode};
 
     fn valid_config() -> (tempfile::TempDir, PxeConfig) {
@@ -457,6 +458,273 @@ mod tests {
 
         assert_eq!(downloaded, EMBEDDED_IPXE_EFI);
         task.abort();
+    }
+
+    async fn assert_tftp_ack_failure(
+        root: &Path,
+        request: &'static [u8],
+        expected_block: u16,
+        acknowledge_first_block: bool,
+        clients: Arc<RwLock<HashMap<String, PxeDiscoveredClient>>>,
+    ) -> std::io::Result<()> {
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = client.local_addr().unwrap();
+        let root = root.to_path_buf();
+        let transfer =
+            tokio::spawn(async move { serve_tftp_request(request, peer, &root, &clients).await });
+        let mut packet = [0u8; 2048];
+        let mut acknowledged_first_block = false;
+        for _ in 0..(4 + usize::from(acknowledge_first_block)) {
+            let (_size, server) = client.recv_from(&mut packet).await.unwrap();
+            let opcode = u16::from_be_bytes([packet[0], packet[1]]);
+            let block = if opcode == 6 {
+                0
+            } else {
+                assert_eq!(opcode, 3);
+                u16::from_be_bytes([packet[2], packet[3]])
+            };
+            if acknowledge_first_block && block == 1 && !acknowledged_first_block {
+                client.send_to(&[0, 4, 0, 1], server).await.unwrap();
+                acknowledged_first_block = true;
+                continue;
+            }
+            assert_eq!(block, expected_block);
+            let wrong_block = expected_block.wrapping_add(1).to_be_bytes();
+            client
+                .send_to(&[0, 4, wrong_block[0], wrong_block[1]], server)
+                .await
+                .unwrap();
+            if transfer.is_finished() {
+                break;
+            }
+        }
+        transfer.await.unwrap()
+    }
+
+    async fn wait_for_activity_count(activities: &ActivityRepository, count: usize) {
+        timeout(TokioDuration::from_secs(1), async {
+            loop {
+                let current = activities
+                    .query(&ActivityQuery {
+                        limit: 10,
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .len();
+                if current >= count {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tftp_reports_oack_ack_exhaustion_as_failure() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("boot.bin"), b"small").unwrap();
+        let result = assert_tftp_ack_failure(
+            root.path(),
+            b"\0\x01boot.bin\0octet\0blksize\01468\0",
+            0,
+            false,
+            Arc::new(RwLock::new(HashMap::new())),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("OACK"));
+    }
+
+    #[tokio::test]
+    async fn tftp_reports_data_ack_exhaustion_as_failure() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("boot.bin"), b"small").unwrap();
+        let result = assert_tftp_ack_failure(
+            root.path(),
+            b"\0\x01boot.bin\0octet\0",
+            1,
+            false,
+            Arc::new(RwLock::new(HashMap::new())),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("block 1"));
+    }
+
+    #[tokio::test]
+    async fn boot_wim_final_empty_block_requires_an_ack_before_waiting_for_agent() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("boot")).unwrap();
+        std::fs::write(root.path().join("boot/boot.wim"), vec![0u8; 512]).unwrap();
+        let clients = Arc::new(RwLock::new(HashMap::new()));
+        record_client(
+            &clients,
+            "00:0C:29:8B:E0:ED",
+            Some("127.0.0.1".into()),
+            Architecture::X86_64,
+            PxeClientStage::Discovered,
+        )
+        .await;
+        let result = assert_tftp_ack_failure(
+            root.path(),
+            b"\0\x01boot/boot.wim\0octet\0",
+            2,
+            true,
+            Arc::clone(&clients),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            clients.read().await.get("00:0C:29:8B:E0:ED").unwrap().stage,
+            PxeClientStage::Downloading
+        );
+    }
+
+    #[tokio::test]
+    async fn tftp_failure_records_only_a_sanitized_failure_event() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("boot.bin"), b"small").unwrap();
+        let activity_dir = tempfile::tempdir().unwrap();
+        let activities = Arc::new(
+            ActivityRepository::open(activity_dir.path().join("activities.json")).unwrap(),
+        );
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let (_stop_tx, stop_rx) = oneshot::channel();
+        let task = tokio::spawn(run_tftp(
+            server,
+            root.path().to_path_buf(),
+            Arc::new(RwLock::new(HashMap::new())),
+            Some(Arc::clone(&activities)),
+            stop_rx,
+        ));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(b"\0\x01boot.bin\0octet\0", address)
+            .await
+            .unwrap();
+        let mut packet = [0u8; 64];
+        for _ in 0..4 {
+            let (_, transfer) = client.recv_from(&mut packet).await.unwrap();
+            client.send_to(&[0, 4, 0, 2], transfer).await.unwrap();
+        }
+        wait_for_activity_count(&activities, 1).await;
+
+        let events = activities
+            .query(&ActivityQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "tftp_failed");
+        let message = events[0].raw_message.as_deref().unwrap();
+        assert!(message.contains("boot.bin"));
+        assert!(message.contains("127.0.0.1"));
+        assert!(message.contains("block 1"));
+        assert!(!message.contains(&root.path().to_string_lossy().to_string()));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn complete_boot_wim_records_one_success_and_waits_for_agent() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("boot")).unwrap();
+        std::fs::write(root.path().join("boot/boot.wim"), vec![0u8; 512]).unwrap();
+        let activity_dir = tempfile::tempdir().unwrap();
+        let activities = Arc::new(
+            ActivityRepository::open(activity_dir.path().join("activities.json")).unwrap(),
+        );
+        let clients = Arc::new(RwLock::new(HashMap::new()));
+        record_client(
+            &clients,
+            "00:0C:29:8B:E0:ED",
+            Some("127.0.0.1".into()),
+            Architecture::X86_64,
+            PxeClientStage::Discovered,
+        )
+        .await;
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let (_stop_tx, stop_rx) = oneshot::channel();
+        let task = tokio::spawn(run_tftp(
+            server,
+            root.path().to_path_buf(),
+            Arc::clone(&clients),
+            Some(Arc::clone(&activities)),
+            stop_rx,
+        ));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(b"\0\x01boot/boot.wim\0octet\0", address)
+            .await
+            .unwrap();
+        let mut packet = [0u8; 516];
+        for expected_block in [1u16, 2] {
+            let (size, transfer) = client.recv_from(&mut packet).await.unwrap();
+            assert_eq!(u16::from_be_bytes([packet[2], packet[3]]), expected_block);
+            if expected_block == 2 {
+                assert_eq!(size, 4);
+            }
+            client
+                .send_to(&[0, 4, packet[2], packet[3]], transfer)
+                .await
+                .unwrap();
+        }
+        wait_for_activity_count(&activities, 1).await;
+
+        assert_eq!(
+            clients.read().await.get("00:0C:29:8B:E0:ED").unwrap().stage,
+            PxeClientStage::WaitingForAgent
+        );
+        let events = activities
+            .query(&ActivityQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "boot_file_sent");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn tftp_large_transfer_wraps_the_block_number() {
+        let root = tempfile::tempdir().unwrap();
+        let contents = vec![0x5a; 8 * 65_536 + 3];
+        std::fs::write(root.path().join("large.bin"), &contents).unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = client.local_addr().unwrap();
+        let root_path = root.path().to_path_buf();
+        let transfer = tokio::spawn(async move {
+            serve_tftp_request(
+                b"\0\x01large.bin\0octet\0blksize\08\0",
+                peer,
+                &root_path,
+                &Arc::new(RwLock::new(HashMap::new())),
+            )
+            .await
+        });
+        let mut packet = [0u8; 12];
+        let (size, server) = client.recv_from(&mut packet).await.unwrap();
+        assert_eq!(&packet[..2], &[0, 6]);
+        assert!(size > 2);
+        client.send_to(&[0, 4, 0, 0], server).await.unwrap();
+        let mut downloaded = Vec::with_capacity(contents.len());
+        for sequence in 1..=65_537u32 {
+            let size = client.recv(&mut packet).await.unwrap();
+            let expected_block = sequence as u16;
+            assert_eq!(u16::from_be_bytes([packet[2], packet[3]]), expected_block);
+            downloaded.extend_from_slice(&packet[4..size]);
+            client
+                .send_to(&[0, 4, packet[2], packet[3]], server)
+                .await
+                .unwrap();
+        }
+        assert!(transfer.await.unwrap().is_ok());
+        assert_eq!(downloaded, contents);
     }
 
     #[tokio::test]
@@ -4116,7 +4384,8 @@ async fn serve_tftp_request(
         return send_tftp_error(peer, 2, "access violation").await;
     }
     update_client_stage_by_ip(clients, peer.ip(), PxeClientStage::Downloading).await;
-    let data = fs::read(canonical)?;
+    let mut file = tokio::fs::File::open(canonical).await?;
+    let file_size = file.metadata().await?.len();
     let mut block_size = 512usize;
     let mut timeout_secs = 3u64;
     let mut requested_options = Vec::new();
@@ -4137,7 +4406,7 @@ async fn serve_tftp_request(
                     requested_options.push(("timeout", timeout_secs.to_string()))
                 }
             }
-            "tsize" => requested_options.push(("tsize", data.len().to_string())),
+            "tsize" => requested_options.push(("tsize", file_size.to_string())),
             _ => {}
         }
         i += 2
@@ -4154,28 +4423,52 @@ async fn serve_tftp_request(
             oack.push(0)
         }
         if !send_tftp_with_ack(&socket, &oack, 0, timeout_secs).await? {
-            return Ok(());
+            return Err(tftp_ack_timeout(relative_name, peer.ip(), "OACK"));
         }
     }
-    for chunk in data.chunks(block_size) {
-        let mut packet = vec![0, 3];
+    let mut remaining = file_size;
+    while remaining > 0 {
+        let chunk_size = usize::try_from(remaining.min(block_size as u64)).unwrap_or(block_size);
+        let mut packet = Vec::with_capacity(4 + chunk_size);
+        packet.extend_from_slice(&[0, 3]);
         packet.extend_from_slice(&block.to_be_bytes());
-        packet.extend_from_slice(chunk);
+        let payload_start = packet.len();
+        packet.resize(payload_start + chunk_size, 0);
+        file.read_exact(&mut packet[payload_start..]).await?;
         if !send_tftp_with_ack(&socket, &packet, block, timeout_secs).await? {
-            return Ok(());
+            return Err(tftp_ack_timeout(
+                relative_name,
+                peer.ip(),
+                &format!("data block {block}"),
+            ));
         }
+        remaining -= chunk_size as u64;
         block = block.wrapping_add(1)
     }
-    if data.len() % block_size == 0 {
+    if file_size % block_size as u64 == 0 {
         let mut packet = vec![0, 3];
         packet.extend_from_slice(&block.to_be_bytes());
-        let _ = send_tftp_with_ack(&socket, &packet, block, timeout_secs).await?;
+        if !send_tftp_with_ack(&socket, &packet, block, timeout_secs).await? {
+            return Err(tftp_ack_timeout(
+                relative_name,
+                peer.ip(),
+                &format!("final data block {block}"),
+            ));
+        }
     }
     if relative_name.eq_ignore_ascii_case("boot/boot.wim") {
         update_client_stage_by_ip(clients, peer.ip(), PxeClientStage::WaitingForAgent).await;
     }
     Ok(())
 }
+
+fn tftp_ack_timeout(file_name: &str, client_ip: IpAddr, stage: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("TFTP transfer of {file_name} to {client_ip} timed out awaiting ACK for {stage}"),
+    )
+}
+
 async fn send_tftp_with_ack(
     socket: &UdpSocket,
     packet: &[u8],
