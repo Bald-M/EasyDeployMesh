@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Import Edgeless UDF media through its complete filesystem view, use the boot
+  manager embedded in its WIM, and embed its external runtime resources into
+  the managed WinPE image so PXE boots do not stop at the missing-folder prompt.
 - Streamed TFTP files without blocking the async service on large WinPE images,
   and now report exhausted ACK retries as failures before logging success or
   advancing a `boot.wim` client to the Agent-waiting stage.
