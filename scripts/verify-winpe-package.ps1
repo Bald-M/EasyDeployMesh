@@ -410,7 +410,7 @@ try {
     $collectorExists = Test-Path -LiteralPath $runtimeCollectorPath -PathType Leaf
     $startnetExists = Test-Path -LiteralPath $startnetPath -PathType Leaf
     if ($agentExists -and $collectorExists -and $startnetExists -and $runtimeMarkerValid) {
-        $runtimeRevision = 'easydeploymesh-winpe-runtime-layout-v1'
+        $runtimeRevision = 'easydeploymesh-winpe-runtime-layout-v3'
         $runtimeManifest = "revision=$runtimeRevision`n" +
             "agent=$(Get-Sha256 -Path $agentPath)`n" +
             "startnet=$(Get-Sha256 -Path $startnetPath)`n" +

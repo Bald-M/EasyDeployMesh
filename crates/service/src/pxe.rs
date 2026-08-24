@@ -1264,6 +1264,12 @@ mod tests {
     }
 
     #[test]
+    fn easyu_winpeshl_hook_takes_precedence_over_the_setup_cmdline_fallback() {
+        assert!(!should_patch_setup_cmdline(true));
+        assert!(should_patch_setup_cmdline(false));
+    }
+
+    #[test]
     fn runtime_diagnostic_collector_is_bundled_for_injected_winpe() {
         let collector = std::str::from_utf8(EASYDEPLOYMESH_RUNTIME_COLLECTOR)
             .expect("the WinPE collector should remain an ASCII-compatible CMD script");
@@ -2082,7 +2088,7 @@ fn agent_binary_sha256(path: &Path) -> Result<String, PxeServiceError> {
 // Bump this revision whenever WinPE injection behavior changes without changing
 // one of the embedded byte payloads below. Existing packages will then be
 // mounted and refreshed once on their next runtime check.
-const EASYDEPLOYMESH_RUNTIME_LAYOUT_REVISION: &str = "easydeploymesh-winpe-runtime-layout-v2";
+const EASYDEPLOYMESH_RUNTIME_LAYOUT_REVISION: &str = "easydeploymesh-winpe-runtime-layout-v3";
 
 fn winpe_runtime_sha256(agent: &Path) -> Result<String, PxeServiceError> {
     let agent_digest = agent_binary_sha256(agent)?;
@@ -2975,7 +2981,14 @@ fn inject_agent_into_winpe(wim: &Path, agent: &Path) -> Result<(), PxeServiceErr
                 )?;
             }
         }
-        if patch_setup_cmdline_for_agent(&mount, &easydeploymesh)? {
+        // EasyU can expose both winpeshl.ini and Setup\CmdLine. Hooking both
+        // launches two vendor shells and overwrites the command preserved from
+        // winpeshl.ini; EXLOAD can then run before PECMD establishes its PE
+        // environment. Setup\CmdLine is only a fallback for images without a
+        // usable winpeshl.ini hook.
+        if should_patch_setup_cmdline(shell_hook_installed)
+            && patch_setup_cmdline_for_agent(&mount, &easydeploymesh)?
+        {
             shell_hook_installed = true;
         }
         if shell_hook_installed {
@@ -3006,6 +3019,11 @@ fn inject_agent_into_winpe(wim: &Path, agent: &Path) -> Result<(), PxeServiceErr
     }
     let _ = fs::remove_dir_all(&mount);
     result
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn should_patch_setup_cmdline(winpeshl_hook_installed: bool) -> bool {
+    !winpeshl_hook_installed
 }
 
 #[cfg(all(target_os = "windows", not(test)))]
