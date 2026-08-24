@@ -88,10 +88,13 @@ flowchart LR
 | PE 媒体 | PXE 启动 | Agent 注册 | 自动部署 | 当前状态 |
 | --- | :---: | :---: | :---: | --- |
 | EasyU 3.6 | 是 | 是 | 是 | 当前已验证可用 |
+| Edgeless Beta 4.1.0 | 是 | 是 | 是 | 已在 Legacy BIOS 和 UEFI x64 下完成 PXE 与自动部署全流程验证 |
 | 具备网络功能的标准 WinPE | 预期支持 | 预期支持 | 预期支持 | 取决于 Windows 版本和网卡驱动，使用前必须验证 |
 | WePE 2.2 | 仅能通过原生 ISO 启动 | 否 | 否 | 不支持：官方明确裁剪了 Windows 网络模块 |
 
-EasyU 3.6 是目前完成验证的 PE 运行环境。WePE 2.2 可以通过原生 ISO 路径进入桌面，
+EasyU 3.6 和 Edgeless Beta 4.1.0 是目前完成完整自动部署流程验证的 PE 运行环境。
+Edgeless 已在 Legacy BIOS 和 UEFI x64 模式下通过托管 PXE 启动、Agent 注册和自动
+部署验证，其外置运行资源会嵌入托管 WIM。WePE 2.2 可以通过原生 ISO 路径进入桌面，
 但其官方版本不提供网络模块，因此 EasyDeployMesh Agent 无法注册或下载部署镜像。
 更换 VMware 网卡型号或只注入网卡驱动，无法恢复已经缺失的 TCP/IP 和 DHCP 网络栈。
 EasyDeployMesh 不会修改用户选择的源 ISO；不支持的离线 PE 不得用于自动部署。

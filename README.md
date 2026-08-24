@@ -96,15 +96,20 @@ see [DESIGN.md](DESIGN.md).
 | PE media | PXE boot | Agent registration | Automated deployment | Status |
 | --- | :---: | :---: | :---: | --- |
 | EasyU 3.6 | Yes | Yes | Yes | Currently verified |
+| Edgeless Beta 4.1.0 | Yes | Yes | Yes | Complete PXE and automated deployment flow verified with Legacy BIOS and UEFI x64 |
 | Standard network-enabled WinPE | Expected | Expected | Expected | Depends on the Windows build and NIC drivers; validate before use |
 | WePE 2.2 | Native ISO boot only | No | No | Unsupported: the vendor intentionally omits the Windows network module |
 
-EasyU 3.6 is the currently verified PE runtime. WePE 2.2 can reach its desktop
-through the native ISO boot path, but it has no supported network module, so the
-EasyDeployMesh Agent cannot register or download deployment images. Changing
-the VMware adapter or injecting only a NIC driver does not restore the missing
-TCP/IP and DHCP stack. EasyDeployMesh does not modify the user-selected source
-ISO; unsupported offline PE media must not be used for automated deployment.
+EasyU 3.6 and Edgeless Beta 4.1.0 are currently verified for the complete
+automated deployment flow. Edgeless has passed managed PXE boot, Agent
+registration, and automated deployment in both Legacy BIOS and UEFI x64 modes;
+its external runtime resources are embedded in the managed WIM. WePE 2.2 can
+reach its desktop through the native ISO boot path, but it has no supported
+network module, so the EasyDeployMesh Agent cannot register or download
+deployment images. Changing the VMware adapter or injecting only a NIC driver
+does not restore the missing TCP/IP and DHCP stack. EasyDeployMesh does not
+modify the user-selected source ISO; unsupported offline PE media must not be
+used for automated deployment.
 
 | Format | Catalog | Deploy | Notes |
 | --- | :---: | :---: | --- |
