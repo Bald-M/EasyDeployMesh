@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">FirPE</title>
+  <desc id="desc">FirPE 黑色圆形几何字标</desc>
+  <defs>
+    <clipPath id="disk"><circle cx="32" cy="32" r="30"/></clipPath>
+    <linearGradient id="diskTone" x1="10" y1="8" x2="53" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#202124"/>
+      <stop offset=".55" stop-color="#171719"/>
+      <stop offset="1" stop-color="#262629"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="48" y1="8" x2="35" y2="31" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#d9d9da" stop-opacity=".78"/>
+      <stop offset="1" stop-color="#8b8b8e" stop-opacity=".08"/>
+    </linearGradient>
+  </defs>
+  <g clip-path="url(#disk)">
+    <circle cx="32" cy="32" r="30" fill="url(#diskTone)"/>
+    <path fill="#303034" opacity=".62" d="M2 9 28 32 2 55Zm60 8L38 32l24 20Z"/>
+    <path fill="#111113" opacity=".72" d="m8 2 24 29L2 19V2Zm54 60H36l14-18Z"/>
+    <path fill="url(#beam)" d="M64 2 38.2 25.8l5.1 5.3L64 13.2Z"/>
+    <path fill="#fff" d="M2 56.2c8.6-5.3 18.8-7.9 30-7.9s21.4 2.6 30 7.9V64H2Z"/>
+    <!-- FIR is drawn as geometry so it remains deterministic and font-free. -->
+    <path fill="#fff" d="M13 27h11v4.2h-6.5v3.1h5.8v4h-5.8V45H13Zm15.2 0h4.6v18h-4.6Zm9.2 0h7.3c4.2 0 6.8 2.2 6.8 5.8 0 2.5-1.2 4.2-3.3 5.1l4.2 7.1h-5.2l-3.5-6.3H42V45h-4.6Zm4.6 4v4h2.4c1.6 0 2.5-.7 2.5-2s-.9-2-2.5-2Z"/>
+    <g fill="#0b0b0c">
+      <path d="M26.6 53.1h4.7v4.6h-4.7Zm5.4 0h4.7v4.6H32Zm-5.4 5.3h4.7V63h-4.7Zm5.4 0h4.7V63H32Z"/>
+    </g>
+  </g>
+</svg>

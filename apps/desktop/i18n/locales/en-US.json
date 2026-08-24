@@ -413,6 +413,8 @@
     "importPxeMedia": "Import third-party PE (ISO/IMG)",
     "replacePxeMedia": "Replace third-party PE",
     "pxeMediaImported": "Third-party PE media converted",
+    "wepeUnsupported": "WePE import is not supported",
+    "wepeUnsupportedHint": "WePE uses a private boot chain, so EasyDeployMesh cannot currently guarantee that an Agent-injected image will boot and deploy correctly. The import was cancelled to avoid creating an unusable boot package.",
     "peRequiredForControl": "Import a PE boot package first",
     "peRequiredForControlHint": "The control service needs to write the Agent configuration into WinPE. Import third-party PE media or a PXE/WinPE directory, then try again.",
     "pxeBiosUnavailable": "The media has no PXEboot.n12. UEFI x64 is available; Legacy BIOS requires a separate iPXE or Windows PXE loader.",

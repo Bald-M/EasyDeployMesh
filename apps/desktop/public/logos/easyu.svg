@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">EasyU 优启通</title>
+  <desc id="desc">蓝色鲸鱼形品牌标识</desc>
+  <defs>
+    <linearGradient id="body" x1="18" y1="14" x2="48" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#61d6f1"/>
+      <stop offset=".58" stop-color="#26b8df"/>
+      <stop offset="1" stop-color="#0798cc"/>
+    </linearGradient>
+    <linearGradient id="belly" x1="18" y1="48" x2="54" y2="54" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0aa2d2"/>
+      <stop offset="1" stop-color="#007db9"/>
+    </linearGradient>
+  </defs>
+  <!-- The broad crescent body follows the supplied EasyU whale reference. -->
+  <path fill="url(#body)" d="M5.5 39.2 14.8 30c5.3 6.2 12.6 9.6 20.4 9.2 10.3-.6 17.2-7.6 17.2-17.3 0-6.5-3.2-11.8-8.6-15.7 11.6 3.9 19.7 14.6 19.7 27.3 0 16.2-12.5 28.7-29.5 28.7-12.4 0-23.3-7.5-28.5-23Z"/>
+  <path fill="url(#belly)" d="M7.8 45.1c6 10.7 15.4 15.9 26.2 15.9 17 0 28.2-11.8 28.2-27.7 0-3.5-.6-6.9-1.8-10 1.1 15.8-7.3 28.4-21.4 31.3-11.1 2.4-22.2-.9-31.2-9.5Z"/>
+  <!-- Two clean tail lobes remain readable at the 32 px UI size. -->
+  <path fill="#5bcfee" d="m44.1 7-8.9-3.7 2.2-5.2 8.7 3.7 1.7 6.8 6.8-5 3.4 4.6-9.5 7Z"/>
+  <circle cx="17.2" cy="43.4" r="2.5" fill="#087eae"/>
+</svg>

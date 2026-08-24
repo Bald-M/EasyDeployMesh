@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">USM U盘魔术师</title>
+  <desc id="desc">U盘魔术师蓝色倾斜徽记</desc>
+  <defs>
+    <linearGradient id="tile" x1="15" y1="9" x2="48" y2="55" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#36b3ff"/>
+      <stop offset="1" stop-color="#087ddd"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(4 4) scale(.875)">
+    <g transform="rotate(-10 32 32)">
+    <path fill="url(#tile)" d="M24.4 4.2 57 29.3c2.5 1.9 2.9 5.4.9 7.9L42.3 57.5c-2 2.6-5.7 3-8.2 1L6.8 37.4c-2.5-1.9-2.9-5.5-.9-7.9L18.1 13.7l-1.6-5.5Z"/>
+    <path fill="none" stroke="#fff" stroke-width="3" stroke-linejoin="round" d="m22.9 10.1 28.8 22.2-14 18.2L11.1 30l10.2-13.3Z"/>
+    <!-- Block-built S echoes the interlocking mark in the official USM artwork. -->
+    <path fill="none" stroke="#fff" stroke-width="5" stroke-linecap="square" stroke-linejoin="miter" d="m37.8 22.9-9.2-7-8 10.4 16.2 12.5-8.2 10.6-10.2-7.8"/>
+    <path fill="#fff" d="m17.2 7.6 8.4 6.5-2.8 3.7-8.5-6.5Z"/>
+    </g>
+  </g>
+</svg>

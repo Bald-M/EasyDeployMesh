@@ -413,6 +413,8 @@
     "importPxeMedia": "导入第三方 PE（ISO/IMG）",
     "replacePxeMedia": "更换第三方 PE",
     "pxeMediaImported": "第三方 PE 镜像已转换",
+    "wepeUnsupported": "暂不支持导入微PE",
+    "wepeUnsupportedHint": "微PE使用私有启动链，当前无法保证 EasyDeployMesh Agent 注入后能够正常启动和执行部署。为避免生成无法部署的启动包，本次导入已取消。",
     "peRequiredForControl": "请先导入 PE 启动包",
     "peRequiredForControlHint": "控制服务启动时需要将 Agent 配置写入 WinPE。请导入第三方 PE 镜像或 PXE/WinPE 启动目录后重试。",
     "pxeBiosUnavailable": "镜像内没有 PXEboot.n12；UEFI x64 可启动，Legacy BIOS 需要另行提供 iPXE 或 Windows PXE 启动器。",
