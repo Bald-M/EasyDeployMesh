@@ -6,8 +6,10 @@ mod models;
 pub use job::{
     AgentDeploymentImage, AgentGhoDeployment, AgentJobCompletion, AgentJobLease, AgentJobProgress,
     CreateDeploymentJob, DeploymentJob, DeploymentOptions, DeploymentStage, DeploymentTarget,
-    JobState, JobTransitionError, PartitionFileSystem, PartitionPlan, PartitionPlanError,
-    PartitionRole, PartitionSpec, PartitionTable,
+    IMAGE_CACHE_HEADROOM_MIB, JobState, JobTransitionError, MIB_BYTES, MINIMUM_DATA_MIB,
+    MINIMUM_WINDOWS_MIB, PARTITION_ALIGNMENT_HEADROOM_MIB, PartitionCapacityError,
+    PartitionFileSystem, PartitionPlan, PartitionPlanError, PartitionRole, PartitionSpec,
+    PartitionTable,
 };
 pub use models::{
     ActivityEvent, ActivitySeverity, ActivitySource, ActivitySubject, AgentHeartbeat,

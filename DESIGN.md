@@ -236,11 +236,25 @@ Windows or data partition that consumes remaining space. GPT plans require EFI
 and MSR partitions; MBR plans require a system partition. Labels, filesystems,
 sizes, and data drive letters are constrained. The executor additionally rejects
 unsupported recovery partitions and disks too small for Windows plus the image
-cache and alignment headroom.
+cache and alignment headroom. Capacity validation is a shared Core invariant
+used by the desktop host before job creation and by the Agent before it builds
+the destructive DiskPart script. It uses the target's reported byte capacity,
+all fixed partitions (including GPT/MBR boot partitions), the rounded-up image
+size plus 512 MiB cache headroom, 32 MiB alignment headroom, and at least 1 GiB
+for a remaining data partition or 20 GiB for a remaining Windows partition.
+The frontend mirrors this calculation only to identify every undersized batch
+target early; Rust remains authoritative. The custom-template editor derives
+its fixed-partition limits and remaining-space preview from the same inputs, so
+decimal manufacturer capacity is not presented as fully allocatable GiB.
 
 The image is first stored on a temporary NTFS cache partition. After successful
 application and boot configuration, that partition is deleted and the intended
-remaining-space partition is extended.
+remaining-space partition is extended. An MBR layout that would otherwise need
+more than four primary partitions keeps the System Reserved and Windows
+partitions primary, then places all data volumes and the temporary cache in one
+extended partition as logical volumes. Data partitions must be last in such a
+plan so the extended container cannot consume space needed by a later primary
+partition.
 
 ### PXE and WinPE
 

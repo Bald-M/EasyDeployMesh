@@ -1,6 +1,6 @@
 use easydeploymesh_core::{
-    AgentJobLease, DeploymentStage, Disk, ImageFormat, JobState, Operation, PartitionFileSystem,
-    PartitionRole, PartitionTable,
+    AgentJobLease, DeploymentStage, Disk, ImageFormat, JobState, MIB_BYTES, Operation,
+    PARTITION_ALIGNMENT_HEADROOM_MIB, PartitionFileSystem, PartitionRole, PartitionTable,
 };
 use reqwest::blocking::Client;
 #[cfg(target_os = "windows")]
@@ -14,7 +14,7 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::Path,
-    process::Command,
+    process::{Command, Stdio},
     thread,
     time::Duration,
 };
@@ -25,11 +25,6 @@ unsafe extern "system" {
     fn NtSuspendProcess(process_handle: *mut c_void) -> i32;
     fn NtResumeProcess(process_handle: *mut c_void) -> i32;
 }
-
-const MIB: u64 = 1024 * 1024;
-const MINIMUM_WINDOWS_MIB: u64 = 20 * 1024;
-const IMAGE_CACHE_HEADROOM_MIB: u64 = 512;
-const PARTITION_ALIGNMENT_HEADROOM_MIB: u64 = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreparedLayout {
@@ -205,6 +200,9 @@ fn prepare_layout(lease: &AgentJobLease, disk: &Disk) -> Result<PreparedLayout, 
     {
         return Err("recovery partitions are not yet supported by the executor".into());
     }
+    lease
+        .partition_plan
+        .validate_capacity(disk.size_bytes, lease.image.size_bytes)?;
 
     let disk_number = physical_drive_number(&disk.id)?;
     let fixed_mib = lease
@@ -216,9 +214,9 @@ fn prepare_layout(lease: &AgentJobLease, disk: &Disk) -> Result<PreparedLayout, 
     let cache_mib = lease
         .image
         .size_bytes
-        .div_ceil(MIB)
-        .saturating_add(IMAGE_CACHE_HEADROOM_MIB);
-    let disk_mib = disk.size_bytes / MIB;
+        .div_ceil(MIB_BYTES)
+        .saturating_add(easydeploymesh_core::IMAGE_CACHE_HEADROOM_MIB);
+    let disk_mib = disk.size_bytes / MIB_BYTES;
     let remaining_role = lease
         .partition_plan
         .partitions
@@ -226,21 +224,32 @@ fn prepare_layout(lease: &AgentJobLease, disk: &Disk) -> Result<PreparedLayout, 
         .find(|partition| partition.size_mib.is_none())
         .map(|partition| partition.role)
         .ok_or("partition plan has no remaining-space partition")?;
-    let remaining_minimum_mib = if remaining_role == PartitionRole::Windows {
-        MINIMUM_WINDOWS_MIB
-    } else {
-        1024
-    };
-    let required_mib = fixed_mib
-        .saturating_add(cache_mib)
-        .saturating_add(remaining_minimum_mib)
-        .saturating_add(PARTITION_ALIGNMENT_HEADROOM_MIB);
-    if disk_mib < required_mib {
-        return Err(
-            format!("target disk is too small: requires at least {required_mib} MiB").into(),
-        );
-    }
     let remaining_mib = disk_mib - fixed_mib - cache_mib - PARTITION_ALIGNMENT_HEADROOM_MIB;
+    let data_partition_count = lease
+        .partition_plan
+        .partitions
+        .iter()
+        .filter(|partition| partition.role == PartitionRole::Data)
+        .count();
+    let use_mbr_extended_partition = lease.partition_plan.table == PartitionTable::Mbr
+        && data_partition_count.saturating_add(3) > 4;
+    if use_mbr_extended_partition {
+        let first_data = lease
+            .partition_plan
+            .partitions
+            .iter()
+            .position(|partition| partition.role == PartitionRole::Data)
+            .ok_or("MBR extended layout has no data partition")?;
+        if lease.partition_plan.partitions[first_data..]
+            .iter()
+            .any(|partition| partition.role != PartitionRole::Data)
+        {
+            return Err(
+                "MBR plans that require an extended partition must place data partitions last"
+                    .into(),
+            );
+        }
+    }
     let mut script = format!(
         "select disk {disk_number}\nclean\nconvert {}\n",
         match lease.partition_plan.table {
@@ -249,20 +258,32 @@ fn prepare_layout(lease: &AgentJobLease, disk: &Disk) -> Result<PreparedLayout, 
         }
     );
     let mut windows_partition = 0_u32;
+    let mut created_extended_partition = false;
     for (index, partition) in lease.partition_plan.partitions.iter().enumerate() {
         if partition.role == PartitionRole::Windows {
             windows_partition = u32::try_from(index + 1)?;
         }
-        if partition.size_mib.is_none() {
-            script.push_str(&format!("create partition primary size={remaining_mib}\n"));
+        let partition_kind = if use_mbr_extended_partition && partition.role == PartitionRole::Data
+        {
+            if !created_extended_partition {
+                script.push_str("create partition extended\n");
+                created_extended_partition = true;
+            }
+            "logical"
         } else {
-            let size = partition.size_mib.ok_or("partition size is missing")?;
-            let kind = match partition.role {
+            match partition.role {
                 PartitionRole::Efi => "efi",
                 PartitionRole::Msr => "msr",
                 _ => "primary",
-            };
-            script.push_str(&format!("create partition {kind} size={size}\n"));
+            }
+        };
+        if partition.size_mib.is_none() {
+            script.push_str(&format!(
+                "create partition {partition_kind} size={remaining_mib}\n"
+            ));
+        } else {
+            let size = partition.size_mib.ok_or("partition size is missing")?;
+            script.push_str(&format!("create partition {partition_kind} size={size}\n"));
         }
         if let Some(file_system) = partition.file_system {
             let file_system = match file_system {
@@ -290,8 +311,13 @@ fn prepare_layout(lease: &AgentJobLease, disk: &Disk) -> Result<PreparedLayout, 
             _ => {}
         }
     }
+    let cache_partition_kind = if use_mbr_extended_partition {
+        "logical"
+    } else {
+        "primary"
+    };
     script.push_str(&format!(
-        "create partition primary size={cache_mib}\nformat quick fs=ntfs label=\"EasyDeployMesh Cache\"\nassign letter=R\nexit\n"
+        "create partition {cache_partition_kind} size={cache_mib}\nformat quick fs=ntfs label=\"EasyDeployMesh Cache\"\nassign letter=R\nexit\n"
     ));
     let extend_letter = if remaining_role == PartitionRole::Data {
         lease
@@ -586,7 +612,13 @@ where
     S: AsRef<OsStr>,
 {
     let program_name = program.as_ref().to_string_lossy().into_owned();
-    let mut child = Command::new(program.as_ref()).args(arguments).spawn()?;
+    let mut child = Command::new(program.as_ref())
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().map(spawn_output_reader);
+    let stderr = child.stderr.take().map(spawn_output_reader);
     let process_handle = child.as_raw_handle() as *mut c_void;
     let mut suspended = false;
     loop {
@@ -629,13 +661,60 @@ where
             }
         }
         if let Some(status) = child.try_wait()? {
+            let output = process_output(stdout, stderr);
             return if status.success() {
                 Ok(())
             } else {
-                Err(format!("{program_name} failed ({status})").into())
+                Err(format!("{program_name} failed ({status}){output}").into())
             };
         }
         thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_output_reader(mut reader: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        const OUTPUT_LIMIT: usize = 8 * 1024;
+        let mut captured = Vec::with_capacity(OUTPUT_LIMIT);
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let Ok(count) = reader.read(&mut buffer) else {
+                break;
+            };
+            if count == 0 {
+                break;
+            }
+            let remaining = OUTPUT_LIMIT.saturating_sub(captured.len());
+            captured.extend_from_slice(&buffer[..count.min(remaining)]);
+        }
+        captured
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn process_output(
+    stdout: Option<thread::JoinHandle<Vec<u8>>>,
+    stderr: Option<thread::JoinHandle<Vec<u8>>>,
+) -> String {
+    let mut bytes = stdout
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
+    if let Some(mut error) = stderr.and_then(|reader| reader.join().ok()) {
+        if !bytes.is_empty() && !error.is_empty() {
+            bytes.push(b'\n');
+        }
+        bytes.append(&mut error);
+    }
+    let output = String::from_utf8_lossy(&bytes)
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .collect::<String>();
+    let output = output.trim();
+    if output.is_empty() {
+        String::new()
+    } else {
+        format!("; output: {output}")
     }
 }
 
@@ -710,13 +789,134 @@ mod tests {
             drive_letter: Some('D'),
         });
 
-        let prepared = prepare_layout(&lease(plan), &disk()).expect("layout should be generated");
+        let mut target_disk = disk();
+        target_disk.size_bytes = 100 * 1024 * 1024 * 1024;
+        let prepared =
+            prepare_layout(&lease(plan), &target_disk).expect("layout should be generated");
         assert!(prepared.prepare_script.contains("size=30720"));
         assert!(prepared.prepare_script.contains("assign letter=D"));
         assert!(prepared.prepare_script.contains("assign letter=R"));
         assert!(prepared.cleanup_script.contains("select volume R"));
         assert!(prepared.cleanup_script.contains("select volume D\nextend"));
         assert!(prepared.image_path.to_string_lossy().starts_with(r"R:\"));
+    }
+
+    #[test]
+    fn legacy_three_volume_layout_does_not_exceed_the_mbr_primary_partition_limit() {
+        let mut plan = PartitionPlan::legacy_bios_mbr();
+        plan.partitions.last_mut().unwrap().size_mib = Some(30 * 1024);
+        plan.partitions.extend([
+            easydeploymesh_core::PartitionSpec {
+                role: PartitionRole::Data,
+                size_mib: Some(40 * 1024),
+                file_system: Some(PartitionFileSystem::Ntfs),
+                label: "Software".to_owned(),
+                drive_letter: Some('D'),
+            },
+            easydeploymesh_core::PartitionSpec {
+                role: PartitionRole::Data,
+                size_mib: None,
+                file_system: Some(PartitionFileSystem::Ntfs),
+                label: "Data".to_owned(),
+                drive_letter: Some('E'),
+            },
+        ]);
+
+        let mut target_disk = disk();
+        target_disk.size_bytes = 100 * 1024 * 1024 * 1024;
+        let prepared =
+            prepare_layout(&lease(plan), &target_disk).expect("layout should be generated");
+        let primary_count = prepared
+            .prepare_script
+            .lines()
+            .filter(|line| {
+                *line == "create partition primary"
+                    || line.starts_with("create partition primary size=")
+            })
+            .count();
+
+        assert!(
+            primary_count <= 4,
+            "MBR script exceeded four primary partitions:\n{}",
+            prepared.prepare_script
+        );
+        assert!(
+            prepared
+                .prepare_script
+                .contains("create partition extended")
+        );
+        assert!(prepared.prepare_script.contains("create partition logical"));
+        assert_eq!(
+            prepared
+                .prepare_script
+                .lines()
+                .filter(|line| line.starts_with("create partition logical"))
+                .count(),
+            3,
+            "D, E, and the temporary cache must be logical volumes"
+        );
+        assert!(prepared.cleanup_script.contains("select volume E\nextend"));
+    }
+
+    #[test]
+    fn uefi_three_volume_layout_remains_a_gpt_layout() {
+        let mut plan = PartitionPlan::uefi_gpt();
+        plan.partitions.last_mut().unwrap().size_mib = Some(30 * 1024);
+        plan.partitions.extend([
+            easydeploymesh_core::PartitionSpec {
+                role: PartitionRole::Data,
+                size_mib: Some(40 * 1024),
+                file_system: Some(PartitionFileSystem::Ntfs),
+                label: "Software".to_owned(),
+                drive_letter: Some('D'),
+            },
+            easydeploymesh_core::PartitionSpec {
+                role: PartitionRole::Data,
+                size_mib: None,
+                file_system: Some(PartitionFileSystem::Ntfs),
+                label: "Data".to_owned(),
+                drive_letter: Some('E'),
+            },
+        ]);
+        let mut target_disk = disk();
+        target_disk.size_bytes = 100_000_000_000;
+
+        let prepared =
+            prepare_layout(&lease(plan), &target_disk).expect("GPT layout should be generated");
+
+        assert!(prepared.prepare_script.contains("convert gpt"));
+        assert!(!prepared.prepare_script.contains("partition extended"));
+        assert!(!prepared.prepare_script.contains("partition logical"));
+        assert!(prepared.cleanup_script.contains("select volume E\nextend"));
+    }
+
+    #[test]
+    fn insufficient_capacity_fails_before_a_diskpart_script_is_available() {
+        let mut plan = PartitionPlan::legacy_bios_mbr();
+        plan.partitions.last_mut().unwrap().size_mib = Some(30 * 1024);
+        plan.partitions.extend([
+            easydeploymesh_core::PartitionSpec {
+                role: PartitionRole::Data,
+                size_mib: Some(70 * 1024),
+                file_system: Some(PartitionFileSystem::Ntfs),
+                label: "Software".to_owned(),
+                drive_letter: Some('D'),
+            },
+            easydeploymesh_core::PartitionSpec {
+                role: PartitionRole::Data,
+                size_mib: None,
+                file_system: Some(PartitionFileSystem::Ntfs),
+                label: "Data".to_owned(),
+                drive_letter: Some('E'),
+            },
+        ]);
+        let mut target_disk = disk();
+        target_disk.size_bytes = 100_000_000_000;
+
+        let error = prepare_layout(&lease(plan), &target_disk)
+            .expect_err("capacity validation must stop layout generation");
+
+        assert!(error.to_string().contains("partition plan requires"));
     }
 
     #[test]

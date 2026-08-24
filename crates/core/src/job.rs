@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub const MIB_BYTES: u64 = 1024 * 1024;
+pub const MINIMUM_WINDOWS_MIB: u64 = 20 * 1024;
+pub const MINIMUM_DATA_MIB: u64 = 1024;
+pub const IMAGE_CACHE_HEADROOM_MIB: u64 = 512;
+pub const PARTITION_ALIGNMENT_HEADROOM_MIB: u64 = 32;
+
 /// Lifecycle for a deployment or capture job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -297,6 +303,63 @@ impl PartitionPlan {
         }
         Ok(())
     }
+
+    /// Validates that the physical disk can hold the final plan and the temporary image cache.
+    pub fn validate_capacity(
+        &self,
+        disk_size_bytes: u64,
+        image_size_bytes: u64,
+    ) -> Result<(), PartitionCapacityError> {
+        let available_mib = disk_size_bytes / MIB_BYTES;
+        let fixed_mib = self
+            .partitions
+            .iter()
+            .filter_map(|partition| partition.size_mib)
+            .fold(0_u64, u64::saturating_add);
+        let cache_mib = image_size_bytes
+            .div_ceil(MIB_BYTES)
+            .saturating_add(IMAGE_CACHE_HEADROOM_MIB);
+        let remaining_minimum_mib = self
+            .partitions
+            .iter()
+            .find(|partition| partition.size_mib.is_none())
+            .map_or(MINIMUM_WINDOWS_MIB, |partition| {
+                if partition.role == PartitionRole::Data {
+                    MINIMUM_DATA_MIB
+                } else {
+                    MINIMUM_WINDOWS_MIB
+                }
+            });
+        let required_mib = fixed_mib
+            .saturating_add(cache_mib)
+            .saturating_add(remaining_minimum_mib)
+            .saturating_add(PARTITION_ALIGNMENT_HEADROOM_MIB);
+
+        if available_mib < required_mib {
+            return Err(PartitionCapacityError {
+                required_mib,
+                available_mib,
+                fixed_mib,
+                cache_mib,
+                remaining_minimum_mib,
+                alignment_headroom_mib: PARTITION_ALIGNMENT_HEADROOM_MIB,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error(
+    "partition plan requires {required_mib} MiB but target disk provides {available_mib} MiB (fixed partitions: {fixed_mib} MiB, image cache: {cache_mib} MiB, remaining partition minimum: {remaining_minimum_mib} MiB, alignment reserve: {alignment_headroom_mib} MiB)"
+)]
+pub struct PartitionCapacityError {
+    pub required_mib: u64,
+    pub available_mib: u64,
+    pub fixed_mib: u64,
+    pub cache_mib: u64,
+    pub remaining_minimum_mib: u64,
+    pub alignment_headroom_mib: u64,
 }
 
 fn require_partition(
@@ -561,5 +624,40 @@ mod tests {
         });
 
         assert_eq!(plan.validate(), Ok(()));
+    }
+
+    #[test]
+    fn partition_capacity_rejects_fixed_partitions_that_fill_the_target_disk() {
+        let mut plan = PartitionPlan::uefi_gpt();
+        plan.partitions.pop();
+        plan.partitions.extend([
+            PartitionSpec {
+                role: PartitionRole::Windows,
+                size_mib: Some(30 * 1024),
+                file_system: Some(PartitionFileSystem::Ntfs),
+                label: "Windows".to_owned(),
+                drive_letter: None,
+            },
+            PartitionSpec {
+                role: PartitionRole::Data,
+                size_mib: Some(70 * 1024),
+                file_system: Some(PartitionFileSystem::Ntfs),
+                label: "Software".to_owned(),
+                drive_letter: Some('D'),
+            },
+            PartitionSpec {
+                role: PartitionRole::Data,
+                size_mib: None,
+                file_system: Some(PartitionFileSystem::Ntfs),
+                label: "Data".to_owned(),
+                drive_letter: Some('E'),
+            },
+        ]);
+
+        let error = plan
+            .validate_capacity(100_000_000_000, 5 * 1024 * 1024 * 1024)
+            .expect_err("cache, alignment, and the remaining partition require extra capacity");
+        assert!(error.required_mib > error.available_mib);
+        assert_eq!(error.available_mib, 95_367);
     }
 }
