@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Streamed TFTP files without blocking the async service on large WinPE images,
+  and now report exhausted ACK retries as failures before logging success or
+  advancing a `boot.wim` client to the Agent-waiting stage.
 - Improved Agent startup diagnostics and native Windows MAC-address fallback
   behavior for compatible reduced WinPE environments, fixed diagnostic-directory
   detection on RAM disks, and hid the managed shell host console.
