@@ -16,6 +16,26 @@ export interface SettingsDraft {
   uefiX64BootFile: string
 }
 
+export type PeBrand = 'easyu' | 'edgeless' | 'firpe' | 'hotpe' | 'usm' | 'wepe' | 'unknown'
+
+/**
+ * Infers a PE brand from the imported media's display name. Matching is
+ * intentionally anchored so custom names that merely contain a brand name do
+ * not receive a misleading logo.
+ */
+export function peBrandFromName(name: string): PeBrand {
+  const normalized = name.trim()
+
+  if (/^easyu(?:[_ .-]|$)/i.test(normalized)) return 'easyu'
+  if (/^edgeless(?:[_ .-]|$)/i.test(normalized)) return 'edgeless'
+  if (/^firpe(?:[_ .-]|$)/i.test(normalized)) return 'firpe'
+  if (/^hotpe(?:[_ .-]|$)/i.test(normalized)) return 'hotpe'
+  if (/^usm(?:[_ .-]|$)/i.test(normalized)) return 'usm'
+  if (/^(?:wepe(?:32|64)?|微pe)(?:[_ .-]|$)/i.test(normalized)) return 'wepe'
+
+  return 'unknown'
+}
+
 export const settingsDraftStorageKey = 'easydeploymesh.settings.draft.v1'
 
 export function parseSettingsDraft(value: string | null): SettingsDraft | null {
@@ -55,6 +75,10 @@ export function parseSettingsDraft(value: string | null): SettingsDraft | null {
 export function pxeSourceDisplayName(source: string): string {
   const name = source.split(/[\\/]/).filter(Boolean).pop() ?? ''
   return name.replace(/\.(?:iso|img)$/i, '')
+}
+
+export function isUnsupportedWepeSource(source: string): boolean {
+  return peBrandFromName(pxeSourceDisplayName(source)) === 'wepe'
 }
 
 export function controlStartNeedsPe(tftpRoot: string, error?: unknown): boolean {

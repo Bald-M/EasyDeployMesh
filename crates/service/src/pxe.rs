@@ -23,6 +23,41 @@ mod tests {
         (root, config)
     }
 
+    fn write_fat_image_fixture(path: &Path, files: &[(&str, &[u8])]) {
+        const PARTITION_START_SECTORS: u32 = 2_048;
+        const PARTITION_SECTORS: u32 = 32_768;
+        let partition_start = PARTITION_START_SECTORS as usize * 512;
+        let mut image = vec![0_u8; (PARTITION_START_SECTORS + PARTITION_SECTORS) as usize * 512];
+        image[446 + 4] = 0x0c;
+        image[446 + 8..446 + 12].copy_from_slice(&PARTITION_START_SECTORS.to_le_bytes());
+        image[446 + 12..446 + 16].copy_from_slice(&PARTITION_SECTORS.to_le_bytes());
+        image[510..512].copy_from_slice(b"\x55\xAA");
+
+        fatfs::format_volume(
+            std::io::Cursor::new(&mut image[partition_start..]),
+            fatfs::FormatVolumeOptions::new(),
+        )
+        .unwrap();
+        {
+            let filesystem = fatfs::FileSystem::new(
+                std::io::Cursor::new(&mut image[partition_start..]),
+                fatfs::FsOptions::new(),
+            )
+            .unwrap();
+            let root = filesystem.root_dir();
+            root.create_dir("WEPE").unwrap();
+            for (relative, contents) in files {
+                let mut file = if let Some((directory, name)) = relative.split_once('/') {
+                    root.open_dir(directory).unwrap().create_file(name).unwrap()
+                } else {
+                    root.create_file(relative).unwrap()
+                };
+                file.write_all(contents).unwrap();
+            }
+        }
+        std::fs::write(path, image).unwrap();
+    }
+
     #[test]
     fn standalone_configuration_accepts_an_isolated_slash_24_pool() {
         let (_root, config) = valid_config();
@@ -1174,12 +1209,8 @@ mod tests {
 
     #[test]
     #[ignore = "requires the user-provided external media samples"]
-    fn imports_easyu_firpe_and_wepe_media_samples() {
-        for variable in [
-            "EASYDEPLOYMESH_EASYU_ISO",
-            "EASYDEPLOYMESH_FIRPE_IMG",
-            "EASYDEPLOYMESH_WEPE_ISO",
-        ] {
+    fn imports_supported_easyu_and_firpe_media_samples() {
+        for variable in ["EASYDEPLOYMESH_EASYU_ISO", "EASYDEPLOYMESH_FIRPE_IMG"] {
             let source = std::env::var(variable)
                 .unwrap_or_else(|_| panic!("{variable} must point to the external media sample"));
             std::thread::Builder::new()
@@ -1204,70 +1235,53 @@ mod tests {
     }
 
     #[test]
+    fn public_media_import_rejects_wepe_and_cleans_staging() {
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("WePE64.img");
+        write_fat_image_fixture(
+            &source,
+            &[
+                ("BOOTMGR", b"private-loader"),
+                ("WEPE/WEPE64", b"private-loader"),
+                ("WEPE/B64", b"bcd"),
+                ("WEPE/WEPE.SDI", b"sdi"),
+                ("WEPE/WEPE64.WIM", b"wim"),
+            ],
+        );
+        let managed = parent.path().join("managed");
+
+        let error = BootPackage::import_media(&source, &managed).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "invalid PXE configuration: WePE media is unsupported because its private boot chain cannot reliably start an Agent-injected deployment image"
+        );
+        assert!(!managed.exists());
+        assert!(std::fs::read_dir(parent.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".pxe-media-")
+        }));
+    }
+
+    #[test]
     #[ignore = "requires EASYDEPLOYMESH_WEPE_ISO to point to the WEPE64 v2.2 ISO"]
-    fn imports_real_wepe_v2_2_with_the_native_iso_boot_chain() {
+    fn rejects_real_wepe_v2_2_before_creating_a_managed_package() {
         let source = std::env::var("EASYDEPLOYMESH_WEPE_ISO")
             .expect("EASYDEPLOYMESH_WEPE_ISO must point to the WEPE64 v2.2 ISO");
         std::thread::Builder::new()
             .stack_size(1024 * 1024)
             .spawn(move || {
                 let parent = tempfile::tempdir().unwrap();
-                let source_digest = agent_binary_sha256(Path::new(&source)).unwrap();
-                let package =
-                    BootPackage::import_media(&source, parent.path().join("managed")).unwrap();
-                let root = Path::new(&package.root);
-
-                assert_eq!(package.bios_boot_file, "undionly.kpxe");
-                assert_eq!(package.uefi_x64_boot_file, "ipxe.efi");
+                let managed = parent.path().join("managed");
+                let error = BootPackage::import_media(&source, &managed).unwrap_err();
                 assert_eq!(
-                    std::fs::read(root.join("ipxe.efi")).unwrap(),
-                    EMBEDDED_IPXE_EFI
+                    error.to_string(),
+                    "invalid PXE configuration: WePE media is unsupported because its private boot chain cannot reliably start an Agent-injected deployment image"
                 );
-                assert!(root.join("boot.ipxe").is_file());
-                assert_eq!(
-                    std::fs::read_to_string(root.join("boot.ipxe")).unwrap(),
-                    NATIVE_ISO_PLACEHOLDER_SCRIPT
-                );
-                assert!(root.join(NATIVE_ISO_LAYOUT_MARKER).is_file());
-                assert_eq!(
-                    agent_binary_sha256(Path::new(&source)).unwrap(),
-                    source_digest
-                );
-                assert!(
-                    !files_have_same_contents(&root.join(NATIVE_ISO_PATH), Path::new(&source))
-                        .unwrap()
-                );
-                let remastered = tempfile::tempdir().unwrap();
-                extract_iso(&root.join(NATIVE_ISO_PATH), remastered.path()).unwrap();
-                assert!(is_private_wepe_layout(remastered.path()));
-                let boot_images = read_el_torito_boot_images(&root.join(NATIVE_ISO_PATH)).unwrap();
-                let source_boot_images = read_el_torito_boot_images(Path::new(&source)).unwrap();
-                assert_eq!(boot_images.bios_load_sectors, 8);
-                assert_eq!(boot_images.uefi_load_sectors, 1);
-                assert_eq!(boot_images.bios, source_boot_images.bios);
-                assert_eq!(boot_images.uefi, source_boot_images.uefi);
-                assert!(
-                    files_have_same_contents(
-                        &remastered.path().join("WEPE/WEPE64.WIM"),
-                        &root.join("boot/boot.wim")
-                    )
-                    .unwrap()
-                );
-                assert!(root.join("boot/wimboot").is_file());
-                assert!(root.join("boot/BCD").is_file());
-                assert!(root.join("boot/easydeploymesh.bcd").is_file());
-                assert!(root.join("boot/boot.wim").is_file());
-                assert!(root.join("boot/boot.sdi").is_file());
-                assert!(!root.join("efi/boot/bootx64.efi").exists());
-                assert!(!root.join("efi/microsoft/boot/BCD").exists());
-                assert!(!output_contains_ascii_case_insensitive(
-                    &std::fs::read(root.join("boot/BCD")).unwrap(),
-                    r"\WEPE\B64",
-                ));
-                assert!(!output_contains_ascii_case_insensitive(
-                    &std::fs::read(root.join("boot/easydeploymesh.bcd")).unwrap(),
-                    r"\WEPE\B64",
-                ));
+                assert!(!managed.exists());
             })
             .unwrap()
             .join()
@@ -1284,6 +1298,12 @@ mod tests {
         std::fs::write(private.path().join("WEPE/WEPE.SDI"), b"sdi").unwrap();
         std::fs::write(private.path().join("WEPE/WEPE64.WIM"), b"wim").unwrap();
         assert!(is_private_wepe_layout(private.path()));
+        assert_eq!(
+            ensure_supported_pe_layout(private.path())
+                .unwrap_err()
+                .to_string(),
+            "invalid PXE configuration: WePE media is unsupported because its private boot chain cannot reliably start an Agent-injected deployment image"
+        );
 
         std::fs::create_dir_all(private.path().join("BOOT")).unwrap();
         std::fs::write(private.path().join("BOOT/BCD"), b"standard-bcd").unwrap();
@@ -1696,25 +1716,15 @@ impl BootPackage {
             let _ = fs::remove_dir_all(&extracted);
             return Err(error);
         }
-        let native_boot_images = if extension == "iso" && is_private_wepe_layout(&extracted) {
-            let boot_images = read_el_torito_boot_images(source)?;
-            if let Some(agent) = agent.as_ref().map(AsRef::as_ref) {
-                let native_wim = find_path_case_insensitive(&extracted, &["wepe", "wepe64.wim"])
-                    .ok_or_else(|| PxeServiceError::MissingBootFile("WEPE/WEPE64.WIM".into()))?;
-                Self::ensure_agent_runtime(native_wim, agent)?;
-            }
-            Some(boot_images)
-        } else {
-            None
-        };
+        if let Err(error) = ensure_supported_pe_layout(&extracted) {
+            let _ = fs::remove_dir_all(&extracted);
+            return Err(error);
+        }
         let result = build_winpe_package_with_native_iso(
             &extracted,
             managed_root,
-            native_boot_images
-                .is_none()
-                .then(|| agent.as_ref().map(AsRef::as_ref))
-                .flatten(),
-            native_boot_images.as_ref(),
+            agent.as_ref().map(AsRef::as_ref),
+            None,
         );
         let _ = fs::remove_dir_all(&extracted);
         result
@@ -3172,6 +3182,16 @@ fn is_private_wepe_layout(extracted: &Path) -> bool {
         return false;
     }
     files_have_same_contents(&bootmgr, &private_loader).unwrap_or(false)
+}
+
+fn ensure_supported_pe_layout(extracted: &Path) -> Result<(), PxeServiceError> {
+    if is_private_wepe_layout(extracted) {
+        return Err(PxeServiceError::InvalidConfig(
+            "WePE media is unsupported because its private boot chain cannot reliably start an Agent-injected deployment image"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn find_path_case_insensitive(root: &Path, components: &[&str]) -> Option<PathBuf> {

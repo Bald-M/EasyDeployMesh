@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { controlStartNeedsPe, parseSettingsDraft, pxeSourceDisplayName } from '../app/utils/settings'
+import { controlStartNeedsPe, isUnsupportedWepeSource, parseSettingsDraft, peBrandFromName, pxeSourceDisplayName } from '../app/utils/settings'
 
 const validDraft = {
   bindAddress: '192.168.1.24',
@@ -41,6 +41,37 @@ describe('PXE source display name', () => {
     ['/srv/pxe/Custom WinPE', 'Custom WinPE']
   ])('extracts a readable name from %s', (source, expected) => {
     expect(pxeSourceDisplayName(source)).toBe(expected)
+  })
+})
+
+describe('PE brand identification', () => {
+  it.each([
+    ['EasyU_v3.6', 'easyu'],
+    ['Edgeless_Beta_4.1.0', 'edgeless'],
+    ['FirPE-V2.1.1', 'firpe'],
+    ['HotPE-V2.8.251018', 'hotpe'],
+    ['Usm_v5F', 'usm'],
+    ['WePE64_V2.2', 'wepe'],
+    ['微PE_2.3', 'wepe']
+  ])('identifies %s as %s', (name, expected) => {
+    expect(peBrandFromName(name)).toBe(expected)
+  })
+
+  it.each(['MyFirPEBackup', 'NotHotPE', 'Custom WinPE', ''])('does not over-match %s', (name) => {
+    expect(peBrandFromName(name)).toBe('unknown')
+  })
+})
+
+describe('unsupported WePE media', () => {
+  it.each([
+    'C:\\Images\\WePE64_V2.2.iso',
+    '/Volumes/PE/微PE_2.3.img'
+  ])('blocks %s before native import', (source) => {
+    expect(isUnsupportedWepeSource(source)).toBe(true)
+  })
+
+  it.each(['FirPE-V2.1.1.iso', 'MyWePEBackup.iso'])('does not block %s', (source) => {
+    expect(isUnsupportedWepeSource(source)).toBe(false)
   })
 })
 

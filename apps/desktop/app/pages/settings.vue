@@ -4,7 +4,7 @@ import { importPxeBootPackage, importPxeMedia, loadPxeConfig, savePxeConfig } fr
 import { open } from '@tauri-apps/plugin-dialog'
 import type { PxeConfig, PxeMode } from '~/types/runtime'
 import { preferredIpv4Interface, suggestedPxeNetwork } from '~/utils/network'
-import { controlStartNeedsPe, parseSettingsDraft, pxeSourceDisplayName, settingsDraftStorageKey, type SettingsDraft } from '~/utils/settings'
+import { controlStartNeedsPe, isUnsupportedWepeSource, parseSettingsDraft, pxeSourceDisplayName, settingsDraftStorageKey, type SettingsDraft } from '~/utils/settings'
 
 definePageMeta({ titleKey: 'nav.settings' })
 
@@ -194,6 +194,15 @@ async function handleImportMedia() {
   if (isImportingPxeMedia.value) return
   const source = await open({ multiple: false, filters: [{ name: 'PE boot media', extensions: ['iso', 'img'] }] })
   if (!source || Array.isArray(source)) return
+  if (isUnsupportedWepeSource(source)) {
+    toast.add({
+      title: t('settings.wepeUnsupported'),
+      description: t('settings.wepeUnsupportedHint'),
+      color: 'warning',
+      icon: 'i-lucide-shield-alert'
+    })
+    return
+  }
   isImportingPxeMedia.value = true
   try {
     const imported = await importPxeMedia(source)
@@ -563,9 +572,7 @@ async function copyAgentCommand() {
           <div v-if="tftpRoot" class="relative overflow-hidden rounded-xl border border-success/25 bg-default/80 p-4 shadow-sm">
             <div class="absolute inset-y-0 left-0 w-1 bg-success" />
             <div class="flex items-start gap-3">
-            <div class="grid size-10 shrink-0 place-items-center rounded-xl bg-success/10 text-success ring-1 ring-success/15">
-              <UIcon name="i-lucide-circle-check-big" class="size-5" />
-            </div>
+            <PeBrandLogo :name="peName" />
             <div class="min-w-0 flex-1">
               <div class="flex items-start justify-between gap-3">
                 <div class="min-w-0">
