@@ -944,6 +944,34 @@ mod tests {
     }
 
     #[test]
+    fn edgeless_external_payload_is_staged_at_the_winpe_root() {
+        let media = tempfile::tempdir().unwrap();
+        let payload = media.path().join("Edgeless");
+        std::fs::create_dir_all(payload.join("Resource")).unwrap();
+        std::fs::write(payload.join("version.txt"), b"4.1.0").unwrap();
+        std::fs::write(payload.join("Nes_Inport.7z"), b"required components").unwrap();
+        std::fs::write(payload.join("Resource/tool.7z"), b"plugin").unwrap();
+        let files = walk_files(media.path()).unwrap();
+        let mount = tempfile::tempdir().unwrap();
+
+        let detected = find_edgeless_payload(media.path(), &files).unwrap();
+        copy_winpe_media_payload(detected, mount.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(mount.path().join("Edgeless/version.txt")).unwrap(),
+            b"4.1.0"
+        );
+        assert_eq!(
+            std::fs::read(mount.path().join("Edgeless/Nes_Inport.7z")).unwrap(),
+            b"required components"
+        );
+        assert_eq!(
+            std::fs::read(mount.path().join("Edgeless/Resource/tool.7z")).unwrap(),
+            b"plugin"
+        );
+    }
+
+    #[test]
     fn existing_normalized_package_receives_the_current_bios_and_uefi_ipxe_loaders() {
         let package = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(package.path().join("boot")).unwrap();
@@ -1007,7 +1035,7 @@ mod tests {
             .lines()
             .filter(|line| line.starts_with("initrd "))
             .collect::<Vec<_>>();
-        assert_eq!(initrds.len(), 5);
+        assert_eq!(initrds.len(), 4);
         for line in initrds {
             let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
             assert_eq!(fields.len(), 5, "invalid dual-mode initrd line: {line}");
@@ -1018,6 +1046,22 @@ mod tests {
         }
         assert!(MANAGED_IPXE_SCRIPT.contains("initrd --name BCD boot/easydeploymesh.bcd BCD"));
         assert!(!MANAGED_IPXE_SCRIPT.contains("--name BCD boot/BCD BCD"));
+    }
+
+    #[test]
+    fn managed_ipxe_lets_wimboot_select_the_boot_manager_from_the_wim() {
+        assert!(!MANAGED_IPXE_SCRIPT.lines().any(|line| {
+            line.starts_with("initrd ")
+                && line.split_ascii_whitespace().any(|field| {
+                    matches!(
+                        field.to_ascii_lowercase().as_str(),
+                        "bootmgr" | "bootmgr.exe"
+                    )
+                })
+        }));
+        assert!(MANAGED_IPXE_SCRIPT.contains("initrd --name BCD boot/easydeploymesh.bcd BCD"));
+        assert!(MANAGED_IPXE_SCRIPT.contains("initrd --name boot.sdi boot/boot.sdi boot.sdi"));
+        assert!(MANAGED_IPXE_SCRIPT.contains("initrd --name boot.wim boot/boot.wim boot.wim"));
     }
 
     #[test]
@@ -1053,6 +1097,35 @@ mod tests {
         ));
         assert!(package.path().join(MANAGED_LAYOUT_MARKER).is_file());
         assert!(!package.path().join(LEGACY_MANAGED_LAYOUT_MARKER).exists());
+    }
+
+    #[test]
+    fn v4_package_stops_loading_the_vendor_boot_manager() {
+        let package = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(package.path().join("boot")).unwrap();
+        for (path, bytes) in [
+            ("boot/BCD", b"bcd".as_slice()),
+            ("boot/boot.sdi", b"sdi"),
+            ("boot/boot.wim", br"\Windows\System32\winload.exe"),
+            ("boot/bootmgr", b"vendor-bootmgr"),
+            ("boot/wimboot", b"wimboot"),
+        ] {
+            std::fs::write(package.path().join(path), bytes).unwrap();
+        }
+        std::fs::write(package.path().join("boot.ipxe"), V4_MANAGED_IPXE_SCRIPT).unwrap();
+        std::fs::write(package.path().join(V4_MANAGED_LAYOUT_MARKER), b"4\n").unwrap();
+
+        assert!(BootPackage::ensure_managed_network_boot(package.path()).unwrap());
+
+        assert_eq!(
+            std::fs::read_to_string(package.path().join("boot.ipxe")).unwrap(),
+            MANAGED_IPXE_SCRIPT
+        );
+        assert!(!package.path().join(V4_MANAGED_LAYOUT_MARKER).exists());
+        assert_eq!(
+            std::fs::read_to_string(package.path().join(MANAGED_LAYOUT_MARKER)).unwrap(),
+            "5\n"
+        );
     }
 
     #[test]
@@ -1509,6 +1582,97 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires EASYDEPLOYMESH_EDGELESS_ISO to point to Edgeless Beta 4.1.0"]
+    fn imports_real_edgeless_beta_4_1_0_from_its_udf_view() {
+        let source = std::env::var("EASYDEPLOYMESH_EDGELESS_ISO")
+            .expect("EASYDEPLOYMESH_EDGELESS_ISO must point to the external ISO sample");
+        let parent = tempfile::tempdir().unwrap();
+        let extracted = parent.path().join("extracted");
+        extract_iso(Path::new(&source), &extracted).unwrap();
+        let files = walk_files(&extracted).unwrap();
+        let payload = find_edgeless_payload(&extracted, &files).unwrap();
+        let simulated_wim_mount = parent.path().join("simulated-wim-mount");
+        copy_winpe_media_payload(payload, &simulated_wim_mount).unwrap();
+
+        let package =
+            build_winpe_package(&extracted, &parent.path().join("managed"), None).unwrap();
+        let root = Path::new(&package.root);
+
+        assert!(simulated_wim_mount.join("Edgeless/version.txt").is_file());
+        assert!(simulated_wim_mount.join("Edgeless/Nes_Inport.7z").is_file());
+        assert!(simulated_wim_mount.join("Edgeless/Resource").is_dir());
+        assert!(root.join("boot/boot.wim").is_file());
+        assert!(root.join("boot/BCD").is_file());
+        assert!(root.join("boot/bootmgr").is_file());
+        assert!(root.join("boot/boot.sdi").is_file());
+        assert!(root.join("ipxe.efi").is_file());
+        let script = std::fs::read_to_string(root.join("boot.ipxe")).unwrap();
+        assert!(!script.lines().any(|line| line.contains("boot/bootmgr")));
+        assert!(script.contains("boot/easydeploymesh.bcd BCD"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(MANAGED_LAYOUT_MARKER)).unwrap(),
+            "5\n"
+        );
+    }
+
+    #[test]
+    fn extracts_winpe_files_from_a_udf_only_view() {
+        use hadris_udf::write::{SimpleDir, SimpleFile, UdfWriteOptions, UdfWriter};
+
+        let mut root = SimpleDir::root();
+        root.add_file(SimpleFile::new("bootmgr", b"bios".to_vec()));
+        let mut boot = SimpleDir::new("boot");
+        boot.add_file(SimpleFile::new("boot.sdi", b"sdi".to_vec()));
+        root.add_dir(boot);
+        let mut sources = SimpleDir::new("sources");
+        sources.add_file(SimpleFile::new("boot.wim", b"wim".to_vec()));
+        root.add_dir(sources);
+        let mut efi = SimpleDir::new("efi");
+        let mut efi_boot = SimpleDir::new("boot");
+        efi_boot.add_file(SimpleFile::new("bootx64.efi", b"uefi".to_vec()));
+        efi.add_dir(efi_boot);
+        root.add_dir(efi);
+
+        let image = tempfile::NamedTempFile::new().unwrap();
+        image.as_file().set_len(2 * 1024 * 1024).unwrap();
+        UdfWriter::create(image.reopen().unwrap(), &root, UdfWriteOptions::default()).unwrap();
+        let extracted = tempfile::tempdir().unwrap();
+
+        assert!(extract_udf(image.path(), extracted.path()).unwrap());
+        assert_eq!(
+            std::fs::read(extracted.path().join("sources/boot.wim")).unwrap(),
+            b"wim"
+        );
+        assert_eq!(
+            std::fs::read(extracted.path().join("boot/boot.sdi")).unwrap(),
+            b"sdi"
+        );
+        assert_eq!(
+            std::fs::read(extracted.path().join("bootmgr")).unwrap(),
+            b"bios"
+        );
+        assert_eq!(
+            std::fs::read(extracted.path().join("efi/boot/bootx64.efi")).unwrap(),
+            b"uefi"
+        );
+    }
+
+    #[test]
+    fn malformed_udf_is_reported_as_a_filesystem_compatibility_error() {
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("malformed.iso");
+        let mut contents = vec![0_u8; 40 * 2048];
+        contents[17 * 2048 + 1..17 * 2048 + 6].copy_from_slice(b"NSR02");
+        std::fs::write(&source, contents).unwrap();
+
+        let error = extract_iso(&source, &parent.path().join("extracted")).unwrap_err();
+
+        assert!(error.to_string().contains(
+            "ISO contains UDF data that could not be read safely: could not parse the UDF filesystem"
+        ));
+    }
+
+    #[test]
     fn public_media_import_rejects_wepe_and_cleans_staging() {
         let parent = tempfile::tempdir().unwrap();
         let source = parent.path().join("WePE64.img");
@@ -1688,7 +1852,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
@@ -1714,7 +1878,8 @@ const EMBEDDED_UNDIONLY: &[u8] = include_bytes!("../assets/ipxe/undionly.kpxe");
 const EMBEDDED_IPXE_EFI: &[u8] = include_bytes!("../assets/ipxe/ipxe.efi");
 const LEGACY_MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v2";
 const V3_MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v3";
-const MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v4";
+const V4_MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v4";
+const MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v5";
 const LEGACY_NATIVE_ISO_LAYOUT_MARKER: &str = ".easydeploymesh-native-iso-layout-v1";
 const NATIVE_ISO_LAYOUT_MARKER: &str = ".easydeploymesh-native-iso-layout-v2";
 const NATIVE_ISO_PATH: &str = "boot/native.iso";
@@ -1723,7 +1888,8 @@ const NATIVE_ISO_PLACEHOLDER_SCRIPT: &str =
 const LEGACY_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd boot/bootmgr bootmgr\ninitrd boot/BCD BCD\ninitrd boot/boot.sdi boot.sdi\ninitrd boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd boot/boot.wim boot.wim\nboot\n";
 const BROKEN_NAMED_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name bootmgr boot/bootmgr\ninitrd --name BCD boot/BCD\ninitrd --name boot.sdi boot/boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim\nboot\n";
 const V3_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name bootmgr boot/bootmgr bootmgr\ninitrd --name BCD boot/BCD BCD\ninitrd --name boot.sdi boot/boot.sdi boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim boot.wim\nboot\n";
-const MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name bootmgr boot/bootmgr bootmgr\ninitrd --name BCD boot/easydeploymesh.bcd BCD\ninitrd --name boot.sdi boot/boot.sdi boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim boot.wim\nboot\n";
+const V4_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name bootmgr boot/bootmgr bootmgr\ninitrd --name BCD boot/easydeploymesh.bcd BCD\ninitrd --name boot.sdi boot/boot.sdi boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim boot.wim\nboot\n";
+const MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name BCD boot/easydeploymesh.bcd BCD\ninitrd --name boot.sdi boot/boot.sdi boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim boot.wim\nboot\n";
 const DHCP_SERVER_PORT: u16 = 67;
 const DHCP_CLIENT_PORT: u16 = 68;
 const TFTP_PORT: u16 = 69;
@@ -1829,6 +1995,7 @@ impl BootPackage {
                 || bytes == LEGACY_MANAGED_IPXE_SCRIPT.as_bytes()
                 || bytes == BROKEN_NAMED_MANAGED_IPXE_SCRIPT.as_bytes()
                 || bytes == V3_MANAGED_IPXE_SCRIPT.as_bytes()
+                || bytes == V4_MANAGED_IPXE_SCRIPT.as_bytes()
         ) || ![
             "boot/boot.sdi",
             "boot/boot.wim",
@@ -1871,9 +2038,10 @@ impl BootPackage {
         fs::write(root.join("ipxe.efi"), EMBEDDED_IPXE_EFI)?;
         fs::write(root.join("boot/wimboot"), EMBEDDED_WIMBOOT)?;
         fs::write(root.join("boot.ipxe"), MANAGED_IPXE_SCRIPT)?;
-        fs::write(root.join(MANAGED_LAYOUT_MARKER), b"4\n")?;
+        fs::write(root.join(MANAGED_LAYOUT_MARKER), b"5\n")?;
         let _ = fs::remove_file(root.join(LEGACY_MANAGED_LAYOUT_MARKER));
         let _ = fs::remove_file(root.join(V3_MANAGED_LAYOUT_MARKER));
+        let _ = fs::remove_file(root.join(V4_MANAGED_LAYOUT_MARKER));
         Ok(true)
     }
 
@@ -2035,34 +2203,41 @@ impl BootPackage {
         wim: impl AsRef<Path>,
         agent: impl AsRef<Path>,
     ) -> Result<bool, PxeServiceError> {
-        let wim = wim.as_ref();
-        let agent = agent.as_ref();
-        if !wim.is_file() {
-            return Err(PxeServiceError::MissingBootFile(
-                wim.to_string_lossy().into_owned(),
-            ));
-        }
-        if !agent.is_file() {
-            return Err(PxeServiceError::MissingBootFile(
-                agent.to_string_lossy().into_owned(),
-            ));
-        }
-        let expected_agent_digest = agent_binary_sha256(agent)?;
-        let expected_runtime_digest = winpe_runtime_sha256(agent)?;
-        let marker_directory = wim.parent().unwrap_or_else(|| Path::new("."));
-        let agent_marker = marker_directory.join("easydeploymesh-agent.sha256");
-        let runtime_marker = marker_directory.join("easydeploymesh-runtime.sha256");
-        if marker_matches(&agent_marker, &expected_agent_digest)
-            && marker_matches(&runtime_marker, &expected_runtime_digest)
-        {
-            return Ok(false);
-        }
-
-        inject_agent_into_winpe(wim, agent)?;
-        fs::write(agent_marker, expected_agent_digest)?;
-        fs::write(runtime_marker, expected_runtime_digest)?;
-        Ok(true)
+        ensure_agent_runtime_with_payload(wim.as_ref(), agent.as_ref(), None)
     }
+}
+
+fn ensure_agent_runtime_with_payload(
+    wim: &Path,
+    agent: &Path,
+    media_payload: Option<&Path>,
+) -> Result<bool, PxeServiceError> {
+    if !wim.is_file() {
+        return Err(PxeServiceError::MissingBootFile(
+            wim.to_string_lossy().into_owned(),
+        ));
+    }
+    if !agent.is_file() {
+        return Err(PxeServiceError::MissingBootFile(
+            agent.to_string_lossy().into_owned(),
+        ));
+    }
+    let expected_agent_digest = agent_binary_sha256(agent)?;
+    let expected_runtime_digest = winpe_runtime_sha256(agent)?;
+    let marker_directory = wim.parent().unwrap_or_else(|| Path::new("."));
+    let agent_marker = marker_directory.join("easydeploymesh-agent.sha256");
+    let runtime_marker = marker_directory.join("easydeploymesh-runtime.sha256");
+    if media_payload.is_none()
+        && marker_matches(&agent_marker, &expected_agent_digest)
+        && marker_matches(&runtime_marker, &expected_runtime_digest)
+    {
+        return Ok(false);
+    }
+
+    inject_agent_into_winpe(wim, agent, media_payload)?;
+    fs::write(agent_marker, expected_agent_digest)?;
+    fs::write(runtime_marker, expected_runtime_digest)?;
+    Ok(true)
 }
 
 fn marker_matches(path: &Path, expected_digest: &str) -> bool {
@@ -2107,6 +2282,16 @@ fn bytes_sha256(contents: &[u8]) -> String {
 }
 
 fn extract_iso(source: &Path, target: &Path) -> Result<(), PxeServiceError> {
+    match extract_udf(source, target) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(error) => {
+            return Err(PxeServiceError::InvalidConfig(format!(
+                "ISO contains UDF data that could not be read safely: {error}"
+            )));
+        }
+    }
+
     let block_size = gpt_disk_io::gpt_disk_types::BlockSize::new(2048).unwrap();
     let mut media = gpt_disk_io::BlockIoAdapter::new(File::open(source)?, block_size);
     let volume = iso9660::mount(&mut media, 0)
@@ -2117,6 +2302,114 @@ fn extract_iso(source: &Path, target: &Path) -> Result<(), PxeServiceError> {
         volume.root_extent_len,
         target,
     )
+}
+
+fn extract_udf(source: &Path, target: &Path) -> Result<bool, isomage::Error> {
+    let mut media = File::open(source)?;
+    let has_udf = has_udf_volume_recognition_sequence(&mut media)?;
+    if !has_udf {
+        return Ok(false);
+    }
+    media.seek(SeekFrom::Start(0))?;
+    let root = match isomage::udf::parse_udf(&mut media) {
+        Ok(root) => root,
+        Err(error) => return Err(format!("could not parse the UDF filesystem: {error}").into()),
+    };
+    validate_udf_tree(&root, media.metadata()?.len())?;
+    extract_udf_tree(&mut media, &root, target)?;
+    Ok(true)
+}
+
+fn extract_udf_tree(
+    media: &mut File,
+    node: &isomage::TreeNode,
+    target: &Path,
+) -> Result<(), isomage::Error> {
+    if node.is_directory {
+        fs::create_dir_all(target)?;
+        for child in &node.children {
+            extract_udf_tree(media, child, &target.join(&child.name))?;
+        }
+    } else {
+        let mut output = File::create(target)?;
+        isomage::cat_node(media, node, &mut output)?;
+    }
+    Ok(())
+}
+
+fn has_udf_volume_recognition_sequence(media: &mut File) -> io::Result<bool> {
+    let mut identifier = [0_u8; 5];
+    for sector in 16..32_u64 {
+        media.seek(SeekFrom::Start(sector * 2048 + 1))?;
+        if let Err(error) = media.read_exact(&mut identifier) {
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        if matches!(&identifier, b"NSR02" | b"NSR03") {
+            return Ok(true);
+        }
+        if &identifier == b"TEA01" {
+            break;
+        }
+    }
+    Ok(false)
+}
+
+fn validate_udf_tree(root: &isomage::TreeNode, media_len: u64) -> Result<(), isomage::Error> {
+    const MAX_ENTRIES: usize = 100_000;
+    const MAX_DEPTH: usize = 32;
+
+    let max_extracted_bytes = media_len
+        .checked_mul(2)
+        .ok_or("UDF media size exceeds the supported range")?;
+    let mut entries = 0_usize;
+    let mut extracted_bytes = 0_u64;
+    let mut pending = vec![(root, 0_usize)];
+    while let Some((node, depth)) = pending.pop() {
+        entries = entries.checked_add(1).ok_or("UDF entry count overflow")?;
+        if entries > MAX_ENTRIES {
+            return Err(format!("UDF contains more than {MAX_ENTRIES} entries").into());
+        }
+        if depth > MAX_DEPTH {
+            return Err(format!("UDF directory depth exceeds {MAX_DEPTH}").into());
+        }
+        if node.is_directory {
+            let mut names = HashSet::with_capacity(node.children.len());
+            for child in &node.children {
+                if child.name.is_empty()
+                    || matches!(child.name.as_str(), "." | "..")
+                    || child.name.contains(['/', '\\', '\0'])
+                {
+                    return Err(format!("UDF contains unsafe entry name {:?}", child.name).into());
+                }
+                if !names.insert(child.name.to_ascii_lowercase()) {
+                    return Err(format!(
+                        "UDF directory contains case-conflicting entry {:?}",
+                        child.name
+                    )
+                    .into());
+                }
+            }
+            pending.extend(node.children.iter().map(|child| (child, depth + 1)));
+            continue;
+        }
+        let (offset, length) = node
+            .file_location
+            .zip(node.file_length)
+            .ok_or_else(|| format!("UDF file {:?} has no readable data extent", node.name))?;
+        if length != node.size || offset.checked_add(length).is_none_or(|end| end > media_len) {
+            return Err(format!("UDF file {:?} has an invalid data extent", node.name).into());
+        }
+        extracted_bytes = extracted_bytes
+            .checked_add(length)
+            .ok_or("UDF extracted size overflow")?;
+        if extracted_bytes > max_extracted_bytes {
+            return Err("UDF extracted size exceeds twice the source image size".into());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -2504,6 +2797,7 @@ fn build_winpe_package_with_native_iso(
     native_boot_images: Option<&ElToritoBootImages>,
 ) -> Result<BootPackage, PxeServiceError> {
     let files = walk_files(extracted)?;
+    let edgeless_payload = find_edgeless_payload(extracted, &files);
     let wims = files
         .iter()
         .filter(|path| {
@@ -2564,7 +2858,7 @@ fn build_winpe_package_with_native_iso(
         let staged_wim = staging.join("boot/boot.wim");
         fs::copy(wim, &staged_wim)?;
         if let Some(agent) = agent {
-            BootPackage::ensure_agent_runtime(&staged_wim, agent)?;
+            ensure_agent_runtime_with_payload(&staged_wim, agent, edgeless_payload)?;
         }
         fs::copy(bootmgr, staging.join("boot/bootmgr"))?;
         fs::copy(sdi, staging.join("boot/boot.sdi"))?;
@@ -2577,7 +2871,7 @@ fn build_winpe_package_with_native_iso(
             fs::write(staging.join(NATIVE_ISO_LAYOUT_MARKER), b"2\n")?;
         } else {
             fs::write(staging.join("boot.ipxe"), MANAGED_IPXE_SCRIPT)?;
-            fs::write(staging.join(MANAGED_LAYOUT_MARKER), b"4\n")?;
+            fs::write(staging.join(MANAGED_LAYOUT_MARKER), b"5\n")?;
         }
         Ok(())
     })();
@@ -2607,6 +2901,47 @@ fn build_winpe_package_with_native_iso(
         bios_boot_file,
         uefi_x64_boot_file: "ipxe.efi".into(),
     })
+}
+
+fn find_edgeless_payload<'a>(extracted: &Path, files: &'a [PathBuf]) -> Option<&'a Path> {
+    let version = files.iter().find(|path| {
+        path.strip_prefix(extracted).is_ok_and(|relative| {
+            path_components_eq_ascii_case_insensitive(relative, &["Edgeless", "version.txt"])
+        })
+    })?;
+    let payload = version.parent()?;
+    let has_required_archive = files.iter().any(|path| {
+        path.parent() == Some(payload)
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("Nes_Inport.7z"))
+    });
+    has_required_archive.then_some(payload)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn copy_winpe_media_payload(payload: &Path, mount: &Path) -> Result<(), PxeServiceError> {
+    let destination_root = mount.join("Edgeless");
+    fs::create_dir_all(&destination_root)?;
+    for source in walk_files(payload)? {
+        let metadata = fs::symlink_metadata(&source)?;
+        if metadata.file_type().is_symlink() {
+            return Err(PxeServiceError::InvalidConfig(format!(
+                "WinPE media payload contains a symbolic link: {}",
+                source.display()
+            )));
+        }
+        let relative = source.strip_prefix(payload).map_err(|_| {
+            PxeServiceError::InvalidConfig("WinPE media payload escaped its source root".into())
+        })?;
+        let destination = destination_root.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, destination)?;
+    }
+    Ok(())
 }
 
 fn find_unique_file_with_extension<'a>(
@@ -2933,7 +3268,11 @@ fn refresh_native_iso_bootstrap(
 }
 
 #[cfg(all(target_os = "windows", not(test)))]
-fn inject_agent_into_winpe(wim: &Path, agent: &Path) -> Result<(), PxeServiceError> {
+fn inject_agent_into_winpe(
+    wim: &Path,
+    agent: &Path,
+    media_payload: Option<&Path>,
+) -> Result<(), PxeServiceError> {
     if !agent.is_file() {
         return Err(PxeServiceError::MissingBootFile(
             agent.to_string_lossy().into_owned(),
@@ -2966,6 +3305,9 @@ fn inject_agent_into_winpe(wim: &Path, agent: &Path) -> Result<(), PxeServiceErr
             easydeploymesh.join("collect-winpe-runtime.cmd"),
             EASYDEPLOYMESH_RUNTIME_COLLECTOR,
         )?;
+        if let Some(payload) = media_payload {
+            copy_winpe_media_payload(payload, &mount)?;
+        }
 
         let system32 = mount.join("Windows/System32");
         let winpeshl = system32.join("winpeshl.ini");
@@ -3102,7 +3444,11 @@ fn reg_sz_value(output: &[u8], name: &str) -> Option<String> {
 }
 
 #[cfg(any(not(target_os = "windows"), test))]
-fn inject_agent_into_winpe(_wim: &Path, _agent: &Path) -> Result<(), PxeServiceError> {
+fn inject_agent_into_winpe(
+    _wim: &Path,
+    _agent: &Path,
+    _media_payload: Option<&Path>,
+) -> Result<(), PxeServiceError> {
     Err(PxeServiceError::InvalidConfig(
         "injecting EasyDeployMesh Agent into WinPE requires Windows DISM".into(),
     ))

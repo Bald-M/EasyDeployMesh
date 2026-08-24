@@ -960,8 +960,10 @@ dependencies = [
  "fatfs",
  "gpt_disk_io",
  "hadris-iso",
+ "hadris-udf",
  "if-addrs",
  "iso9660-rs",
+ "isomage",
  "rand 0.9.5",
  "reqwest",
  "serde",
@@ -1637,6 +1639,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "351b73ecd5556a7f3709fd1d61dff9149e7b7f9aab4e2483400c9b29d35b2afc"
 
 [[package]]
+name = "hadris-udf"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c8490765b591607a93f978f3edda74e5e9b7c6faff0157a584581523bdd7d1f"
+dependencies = [
+ "bitflags 2.13.1",
+ "bytemuck",
+ "hadris-common",
+ "hadris-io",
+ "hadris-macros",
+ "hadris-path",
+ "spin",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2017,6 +2035,12 @@ dependencies = [
  "gpt_disk_io",
  "gpt_disk_types",
 ]
+
+[[package]]
+name = "isomage"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78e76f0ebdb7f589dafb6f6deb9dd4c341b108272af52a97185ba80510527fce"
 
 [[package]]
 name = "itoa"

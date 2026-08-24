@@ -258,12 +258,18 @@ partition.
 
 ### PXE and WinPE
 
-Boot media import supports an existing directory or ISO/IMG media. Import occurs
-in a temporary directory and replaces the managed boot tree only after the new
-package is complete. Standard media uses bundled iPXE chainloaders for both BIOS
-and UEFI x64; both paths then load the same `boot.ipxe`, wimboot, generated BCD,
-WIM, and SDI. Vendor EFI executables and vendor-specific BCD references are not
-retained in that normalized boot chain. The managed BCD is regenerated and
+Boot media import supports an existing directory or ISO/IMG media. ISO import
+uses a validated, read-only UDF view when the image advertises UDF, with ISO 9660
+as the fallback for media without UDF. A malformed or unsupported advertised
+UDF filesystem fails with a compatibility error instead of being mistaken for
+ISO media without a WinPE WIM. Import occurs in a temporary directory and
+replaces the managed boot tree only after the new package is complete. Standard
+media uses bundled iPXE chainloaders for both BIOS and UEFI x64; both paths then
+load the same `boot.ipxe`, wimboot, generated BCD, WIM, and SDI. WIMboot selects
+the matching BIOS or UEFI Boot Manager embedded in the WIM instead of receiving
+a potentially vendor-patched `bootmgr` from the source media. Vendor EFI
+executables and vendor-specific BCD references are not retained in that
+normalized boot chain. The managed BCD is regenerated and
 validated before each PXE service start; the layout marker records the package
 revision but is not trusted as a substitute for validating current BCD content.
 The iPXE script supplies each flat initrd name through both
@@ -273,6 +279,13 @@ managed store. The managed store is served from the distinct source path
 `boot/easydeploymesh.bcd` and mapped to the flat virtual name `BCD`; this avoids
 reusing a stale or vendor-provided `boot/BCD` file while preserving the path
 expected by Windows Boot Manager.
+
+Some third-party WinPE media, including Edgeless Beta 4.1.0, keeps required
+runtime resources beside `boot.wim` instead of inside it. When import detects
+the Edgeless root marker and required component archive, it copies that bounded,
+already-extracted resource tree into `X:\Edgeless` while the managed WIM is
+mounted. This preserves the vendor initialization contract in PXE boots, where
+no removable-media drive exists, while leaving the source ISO unchanged.
 
 WEPE64 v2.2 is rejected during import. Its private `WEPE/WEPE64` boot chain can
 be made PXE-bootable, but the vendor runtime omits the Windows network module,
