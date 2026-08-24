@@ -4,9 +4,11 @@ import test from "node:test";
 
 const verifierPath = new URL("./verify-winpe-package.ps1", import.meta.url);
 const collectorPath = new URL("./collect-winpe-runtime.cmd", import.meta.url);
-const [verifier, collector] = await Promise.all([
+const pxeSourcePath = new URL("../crates/service/src/pxe.rs", import.meta.url);
+const [verifier, collector, pxeSource] = await Promise.all([
   readFile(verifierPath, "utf8"),
   readFile(collectorPath, "utf8"),
+  readFile(pxeSourcePath, "utf8"),
 ]);
 
 test("package verifier uses the WIM header boot index and a discard-only mount", () => {
@@ -38,7 +40,10 @@ test("package verifier checks every injected startup-chain artifact", () => {
     assert.match(verifier, new RegExp(artifact.replaceAll(".", "\\."), "i"));
   }
   assert.match(verifier, /Get-FileHash[\s\S]*SHA256/);
-  assert.match(verifier, /easydeploymesh-winpe-runtime-layout-v1/);
+  const verifierRevision = verifier.match(/easydeploymesh-winpe-runtime-layout-v\d+/)?.[0];
+  const runtimeRevision = pxeSource.match(/easydeploymesh-winpe-runtime-layout-v\d+/)?.[0];
+  assert.ok(verifierRevision, "verifier runtime layout revision is missing");
+  assert.equal(verifierRevision, runtimeRevision);
   assert.match(verifier, /Embedded runtime layout hash/);
   assert.match(verifier, /Original EasyU shell preservation/);
 });

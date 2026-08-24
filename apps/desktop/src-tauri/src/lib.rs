@@ -463,6 +463,18 @@ impl DeploymentMutationCoordinator {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("deployment image was not found: {}", request.image_id))?;
         validate_deployment_compatibility(request.operation, &image)?;
+        for target in &request.targets {
+            request
+                .options
+                .partition_plan
+                .validate_capacity(target.target_disk_size_bytes, image.size_bytes)
+                .map_err(|error| {
+                    format!(
+                        "target disk capacity is insufficient for {} ({}): {error}",
+                        target.target_disk_model, target.target_disk_id
+                    )
+                })?;
+        }
         let images = Arc::clone(&self.images);
         let image_id = request.image_id;
         let image_index = request.options.image_index;
@@ -925,6 +937,61 @@ mod tests {
             !image_is_referenced || image_exists,
             "a deployment job must never reference a removed image"
         );
+    }
+
+    #[tokio::test]
+    async fn job_creation_rejects_a_partition_plan_that_exhausts_the_target_disk() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let images = Arc::new(
+            ImageLibrary::open(temp.path().join("images")).expect("image library should open"),
+        );
+        let jobs = Arc::new(
+            JobRepository::open(temp.path().join("jobs")).expect("job repository should open"),
+        );
+        let coordinator = DeploymentMutationCoordinator::new(Arc::clone(&images), jobs);
+        let source = temp.path().join("windows.wim");
+        fs::write(&source, wim_fixture(b"capacity-preflight")).expect("WIM fixture should write");
+        let image = images.import(&source).expect("WIM fixture should import");
+
+        let mut plan = PartitionPlan::uefi_gpt();
+        plan.partitions.last_mut().unwrap().size_mib = Some(30 * 1024);
+        plan.partitions.push(easydeploymesh_core::PartitionSpec {
+            role: easydeploymesh_core::PartitionRole::Data,
+            size_mib: Some(70 * 1024),
+            file_system: Some(easydeploymesh_core::PartitionFileSystem::Ntfs),
+            label: "Software".to_owned(),
+            drive_letter: Some('D'),
+        });
+        plan.partitions.push(easydeploymesh_core::PartitionSpec {
+            role: easydeploymesh_core::PartitionRole::Data,
+            size_mib: None,
+            file_system: Some(easydeploymesh_core::PartitionFileSystem::Ntfs),
+            label: "Data".to_owned(),
+            drive_letter: Some('E'),
+        });
+        let request = CreateDeploymentJob {
+            name: "Capacity preflight".to_owned(),
+            operation: Operation::DeployWim,
+            image_id: image.id,
+            targets: vec![DeploymentTarget {
+                device_id: Uuid::new_v4(),
+                target_disk_id: r"\\.\PhysicalDrive0".to_owned(),
+                target_disk_model: "100 GiB test disk".to_owned(),
+                target_disk_serial: None,
+                target_disk_size_bytes: 100_000_000_000,
+            }],
+            options: DeploymentOptions {
+                image_index: 1,
+                partition_plan: plan,
+            },
+        };
+
+        let error = coordinator
+            .create_job(request)
+            .await
+            .expect_err("capacity must fail before the job is persisted");
+        assert!(error.contains("capacity is insufficient"));
+        assert!(error.contains("fixed partitions"));
     }
 
     #[tokio::test]

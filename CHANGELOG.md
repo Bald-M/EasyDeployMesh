@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Reject partition plans that cannot fit the selected target disk before job
+  creation, with per-device capacity details for batch deployment, while
+  retaining the Agent's pre-destructive capacity check.
+- Use an MBR extended partition for three-volume templates so the temporary
+  image cache does not exceed the four-primary-partition limit during restore.
+- Calculate custom-template limits and remaining-space previews from actual disk
+  bytes and deployment reserves, and include bounded command output when a
+  Windows deployment tool fails.
+
 All notable changes to EasyDeployMesh will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),

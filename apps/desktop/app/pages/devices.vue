@@ -13,6 +13,7 @@ import {
   type DeviceSelectionState
 } from '~/utils/device-selection'
 import { partitionPlanFor, type PartitionPreset } from '~/utils/partition-plans'
+import { partitionCapacity, partitionUserBudgets } from '~/utils/partition-capacity'
 import { templateDiskGroups } from '~/utils/template-disk-groups'
 import {
   clampFixedPartitionSizes,
@@ -97,16 +98,19 @@ const sendTargets = computed(() => {
 })
 const sendTargetCount = computed(() => sendTargets.value.length)
 const templateTargetDiskGroups = computed(() => templateDiskGroups(sendTargets.value, selectedDiskIds.value))
-const templateSelectedDisks = computed(() => templateTargetDiskGroups.value.flatMap(group =>
-  group.disks.filter(row => row.selected)
-))
-const templateTargetDiskSizesGib = computed(() => templateSelectedDisks.value.map(({ disk }) =>
-  Math.floor(disk.sizeBytes / (1024 ** 3))
-))
-const smallestTemplateTargetDiskGib = computed(() => templateTargetDiskSizesGib.value.length
-  ? Math.min(...templateTargetDiskSizesGib.value)
-  : null
-)
+function templatePartitionBudgets(template: CustomPartitionTemplate) {
+  const image = selectedImage.value
+  if (!image) return { fixed: [] as number[], total: [] as number[] }
+  const budgets = sendTargets.value.flatMap((entry) => {
+    const disk = selectedDisk(entry)
+    const plan = customPartitionPlan(template, entry.device.bootMode)
+    return disk && plan ? [partitionUserBudgets(plan, disk.sizeBytes, image.sizeBytes)] : []
+  })
+  return {
+    fixed: budgets.map(budget => budget.fixedGib),
+    total: budgets.map(budget => budget.totalGib)
+  }
+}
 const sendTargetsAreDeployable = computed(() => sendTargets.value.every(isDeployableDevice))
 const sendDialogTitle = computed(() => {
   if (sendAll.value) return t('devices.sendAllTitle', { count: sendTargetCount.value })
@@ -199,6 +203,32 @@ const partitionPresetItems = computed(() => [
 const sendTargetDisksAreValid = computed(() => sendTargets.value.every(entry =>
   selectedDisk(entry) !== null
 ))
+const targetsWithoutPartitionCapacity = computed(() => {
+  const image = selectedImage.value
+  if (!image) return []
+  return sendTargets.value.flatMap((entry) => {
+    const disk = selectedDisk(entry)
+    const plan = selectedPartitionPlan(entry.device.bootMode)
+    if (!disk || !plan) return []
+    const capacity = partitionCapacity(plan, disk.sizeBytes, image.sizeBytes)
+    return capacity.fits ? [] : [{ entry, disk, capacity }]
+  })
+})
+const partitionCapacityErrorDescription = computed(() => {
+  const failures = targetsWithoutPartitionCapacity.value
+  if (!failures.length) return ''
+  const smallest = failures.reduce((current, failure) =>
+    failure.capacity.availableMib < current.capacity.availableMib ? failure : current
+  )
+  const names = new Intl.ListFormat(locale.value, { style: 'short', type: 'conjunction' })
+    .format(failures.map(failure => displayName(failure.entry)))
+  return t('devices.partitionCapacityInsufficientHint', {
+    names,
+    required: formatBytes(smallest.capacity.requiredMib * 1024 ** 2, locale.value),
+    available: formatBytes(smallest.disk.sizeBytes, locale.value),
+    fixed: formatBytes(smallest.capacity.fixedMib * 1024 ** 2, locale.value)
+  })
+})
 const deploymentConfirmationKey = computed(() => JSON.stringify({
   mode: sendMode.value,
   image: selectedImage.value
@@ -249,6 +279,7 @@ const canSend = computed(() => Boolean(
   && sendTargetsAreDeployable.value
   && selectedPlansAreKnown.value
   && sendTargetDisksAreValid.value
+  && targetsWithoutPartitionCapacity.value.length === 0
   && !sending.value
 ))
 
@@ -550,14 +581,15 @@ function editSelectedTemplate() {
 
 function clampDraftPartitionSizes() {
   const draft = templateDraft.value
-  const targetSize = smallestTemplateTargetDiskGib.value
+  const fixedBudgets = draft ? templatePartitionBudgets(draft).fixed : []
+  const targetSize = fixedBudgets.length ? Math.min(...fixedBudgets) : null
   if (draft && targetSize !== null) clampFixedPartitionSizes(draft, targetSize)
 }
 
 function maximumDraftPartitionSizeGib(index: number) {
   const draft = templateDraft.value
   if (!draft) return undefined
-  return maximumPartitionSizeGib(draft, index, templateTargetDiskSizesGib.value) ?? undefined
+  return maximumPartitionSizeGib(draft, index, templatePartitionBudgets(draft).fixed) ?? undefined
 }
 
 function addDataPartition() {
@@ -582,7 +614,7 @@ function setRemainingPartition(index: number, remaining: boolean) {
     templateDraft.value,
     index,
     remaining,
-    templateTargetDiskSizesGib.value
+    templatePartitionBudgets(templateDraft.value).fixed
   )
   clampDraftPartitionSizes()
 }
@@ -592,7 +624,7 @@ function remainingSizeGib(index: number) {
   return remainingPartitionSizeGib(
     templateDraft.value,
     index,
-    templateTargetDiskSizesGib.value
+    templatePartitionBudgets(templateDraft.value).total
   )
 }
 
@@ -667,7 +699,7 @@ watch(deploymentConfirmationKey, (current, previous) => {
   }
 })
 
-watch(smallestTemplateTargetDiskGib, () => {
+watch(() => [selectedImage.value?.sizeBytes, JSON.stringify(selectedDiskIds.value)], () => {
   if (templateDialogOpen.value) clampDraftPartitionSizes()
 })
 
@@ -1109,6 +1141,14 @@ onBeforeUnmount(() => {
             icon="i-lucide-circle-alert"
             :title="$t('devices.bootModeRequiredTitle')"
             :description="partitionPlanErrorDescription"
+          />
+          <UAlert
+            v-if="targetsWithoutPartitionCapacity.length"
+            color="error"
+            variant="subtle"
+            icon="i-lucide-hard-drive"
+            :title="$t('devices.partitionCapacityInsufficientTitle')"
+            :description="partitionCapacityErrorDescription"
           />
           <UCheckbox v-model="deploymentConfirmation" :label="$t('devices.confirmDeployment')" :disabled="sending" />
         </div>
