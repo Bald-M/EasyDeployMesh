@@ -429,6 +429,8 @@
     "managedPackagePath": "受管启动包路径",
     "pxePackageImported": "PXE 启动包已导入",
     "pxeImportFailed": "无法导入 PXE 启动包",
+    "pxeImportWindowsOnly": "当前主机无法导入 PE 启动包",
+    "pxeImportWindowsOnlyHint": "WinPE 导入后端未通过运行时自检。macOS 需要应用随附且版本、架构校验正确的 wimlib；Windows 继续使用 DISM 和 BCDEdit。",
     "startPxe": "启动 PXE 服务",
     "startingPxe": "正在启动 PXE 服务…",
     "stopPxe": "停止 PXE 服务",

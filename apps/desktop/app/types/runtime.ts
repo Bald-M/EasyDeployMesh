@@ -48,6 +48,13 @@ export interface BootPackage {
   uefiX64BootFile: string
 }
 
+export interface WinpeImportCapability {
+  supported: boolean
+  backend: 'windows_native' | 'wimlib' | null
+  reason: string | null
+  version: string | null
+}
+
 export interface PxeServiceStatus {
   state: ServiceState
   mode: PxeMode | null

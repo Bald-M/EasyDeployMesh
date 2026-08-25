@@ -1067,6 +1067,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "easydeploymesh-bcd"
+version = "0.2.4"
+dependencies = [
+ "regf",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "easydeploymesh-core"
 version = "0.2.4"
 dependencies = [
@@ -1109,6 +1117,7 @@ version = "0.2.4"
 dependencies = [
  "axum",
  "chrono",
+ "easydeploymesh-bcd",
  "easydeploymesh-core",
  "easydeploymesh-gho",
  "fatfs",
@@ -1118,6 +1127,7 @@ dependencies = [
  "if-addrs",
  "iso9660-rs",
  "isomage",
+ "nix 0.30.1",
  "rand 0.9.5",
  "reqwest",
  "serde",
@@ -1166,6 +1176,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2564b9f813c544241430e147d8bc454815ef9ac998878d30cc3055449f7fd4c0"
 dependencies = [
  "embedded-io",
+]
+
+[[package]]
+name = "encoding_rs"
+version = "0.8.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
+dependencies = [
+ "cfg-if",
 ]
 
 [[package]]
@@ -2489,7 +2508,7 @@ version = "1.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0aeb26bf5e836cc1c341c8106051b573f1766dfa05aa87f0b98be5e51b02303"
 dependencies = [
- "nix",
+ "nix 0.29.0",
  "winapi",
 ]
 
@@ -2625,6 +2644,19 @@ name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+ "memoffset",
+]
+
+[[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
 dependencies = [
  "bitflags 2.13.1",
  "cfg-if",
@@ -3409,6 +3441,19 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "regf"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c58f645b9512345197fd9509bdd4a0c0843eeb8e2980e70a828f018f52bc7c4"
+dependencies = [
+ "bitflags 2.13.1",
+ "byteorder",
+ "chrono",
+ "encoding_rs",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "reqwest"

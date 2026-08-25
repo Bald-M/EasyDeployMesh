@@ -5,7 +5,7 @@ use easydeploymesh_core::{
 };
 use easydeploymesh_service::{
     ActivityQuery, ActivityRepository, BootPackage, ControlPlane, DeviceRegistry, ImageLibrary,
-    JobRepository, NetworkInterfaceSummary, PxeService,
+    JobRepository, NetworkInterfaceSummary, PxeService, WimlibCapability,
 };
 use serde::Deserialize;
 use std::{
@@ -236,6 +236,22 @@ fn persist_pxe_config(config: &PxeConfig, path: &std::path::Path) -> Result<(), 
     fs::rename(&temporary, path).map_err(|error| error.to_string())
 }
 
+fn require_winpe_import_host() -> Result<(), String> {
+    let capability = easydeploymesh_service::wimlib_capability();
+    if capability.supported {
+        Ok(())
+    } else {
+        Err(capability
+            .reason
+            .unwrap_or_else(|| "WinPE import is unavailable".into()))
+    }
+}
+
+#[tauri::command]
+fn winpe_import_capability() -> WimlibCapability {
+    easydeploymesh_service::wimlib_capability()
+}
+
 #[tauri::command]
 fn import_pxe_boot_package(
     source: String,
@@ -243,6 +259,7 @@ fn import_pxe_boot_package(
     uefi_x64_boot_file: String,
     state: State<'_, AppState>,
 ) -> Result<BootPackage, String> {
+    require_winpe_import_host()?;
     if !state.agent_binary_path.is_file() {
         return Err(format!(
             "EasyDeployMesh Agent sidecar is missing: {}",
@@ -263,6 +280,7 @@ fn import_pxe_boot_package(
 
 #[tauri::command]
 fn import_pxe_media(source: String, state: State<'_, AppState>) -> Result<BootPackage, String> {
+    require_winpe_import_host()?;
     if !state.agent_binary_path.is_file() {
         return Err(format!(
             "EasyDeployMesh Agent sidecar is missing: {}",
@@ -722,6 +740,29 @@ pub fn run() {
                 "easydeploymesh-agent.exe",
                 tauri::path::BaseDirectory::Resource,
             )?;
+            #[cfg(target_os = "macos")]
+            {
+                let target = if cfg!(target_arch = "aarch64") {
+                    "aarch64-apple-darwin"
+                } else {
+                    "x86_64-apple-darwin"
+                };
+                let executable = std::env::current_exe()?;
+                let resource_dir = app.path().resource_dir()?;
+                let candidates = [
+                    executable
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .join("wimlib-imagex"),
+                    resource_dir.join("wimlib-imagex"),
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join(format!("binaries/wimlib-imagex-{target}")),
+                ];
+                if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
+                    easydeploymesh_service::configure_wimlib(path)
+                        .map_err(std::io::Error::other)?;
+                }
+            }
             let devices = Arc::new(DeviceRegistry::open(app_data_dir.join("devices"))?);
             let images = Arc::new(ImageLibrary::open(app_data_dir.join("library"))?);
             let jobs = Arc::new(JobRepository::open(app_data_dir.join("jobs"))?);
@@ -757,6 +798,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             runtime_status,
+            winpe_import_capability,
             network_interfaces,
             load_pxe_config,
             save_pxe_config,
@@ -792,6 +834,16 @@ mod tests {
     use easydeploymesh_core::{
         DeploymentOptions, DeploymentTarget, ImageFormat, Operation, PartitionPlan,
     };
+
+    #[test]
+    fn winpe_import_is_rejected_before_native_tools_run_on_unsupported_hosts() {
+        let result = require_winpe_import_host();
+        if cfg!(target_os = "windows") {
+            assert!(result.is_ok());
+        } else {
+            assert!(!result.unwrap_err().is_empty());
+        }
+    }
 
     fn wim_fixture(payload: &[u8]) -> Vec<u8> {
         const HEADER_SIZE: usize = 208;

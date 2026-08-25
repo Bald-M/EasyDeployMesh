@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mark and opening the project page in the system browser.
 - A host-aware `pnpm build` entry point for building all supported native and
   cross-compiled Windows installers, with optional platform and target selectors.
+- Native macOS WinPE and third-party PE import using pinned Intel and Apple
+  Silicon `wimlib-imagex` sidecars, with runtime version, architecture, and
+  SHA-256 capability checks.
+- A bounded, platform-independent Rust REGF module for generating canonical
+  WinPE BCD stores and updating the restricted `SYSTEM\Setup\CmdLine` fallback.
 
 ### Changed
 
@@ -37,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Receive DHCP broadcasts on the selected macOS interface while keeping the
+  privileged PXE sockets interface-bound, so remote PXE clients can be
+  discovered without exposing the service on other adapters.
+- Start macOS DHCP and TFTP through a narrowly scoped administrator-authorized
+  socket helper, and keep failed imports in staging so an existing boot package
+  remains unchanged.
+- Detect and free an occupied Nuxt development port before `pnpm tauri:dev`,
+  preventing the desktop window from loading a stale or unavailable frontend.
 - Import Edgeless UDF media through its complete filesystem view, use the boot
   manager embedded in its WIM, and embed its external runtime resources into
   the managed WinPE image so PXE boots do not stop at the missing-folder prompt.

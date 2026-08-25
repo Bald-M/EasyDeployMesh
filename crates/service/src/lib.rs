@@ -9,7 +9,10 @@ mod control_plane;
 mod device_registry;
 mod image_library;
 mod job_repository;
+#[cfg(target_os = "macos")]
+mod macos_privileged;
 mod pxe;
+mod wimlib;
 
 pub use activity_repository::{ActivityQuery, ActivityRepository, ActivityRepositoryError};
 pub use control_plane::{ControlPlane, ControlPlaneError};
@@ -19,7 +22,10 @@ pub use image_library::{
     PreparedGhoImageSet,
 };
 pub use job_repository::{JobRepository, JobRepositoryError};
+#[cfg(target_os = "macos")]
+pub use macos_privileged::run_privileged_socket_helper_from_args;
 pub use pxe::{BootPackage, PxeService, PxeServiceError, validate_pxe_config};
+pub use wimlib::{WimlibCapability, configure_wimlib, wimlib_capability};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]

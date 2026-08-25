@@ -1904,6 +1904,8 @@ mod tests {
     }
 }
 use crate::ActivityRepository;
+#[cfg(all(target_os = "macos", not(test)))]
+use crate::wimlib;
 use axum::{
     Router,
     body::Body,
@@ -1913,6 +1915,8 @@ use axum::{
     routing::get,
 };
 use chrono::{DateTime, Duration, Utc};
+#[cfg(all(target_os = "macos", not(test)))]
+use easydeploymesh_bcd::{create_winpe_bcd, replace_setup_cmdline, validate_winpe_bcd};
 use easydeploymesh_core::{
     ActivitySeverity, ActivitySource, ActivitySubject, Architecture, PxeClientStage, PxeConfig,
     PxeDiscoveredClient, PxeMode, PxeServiceStatus,
@@ -1932,6 +1936,7 @@ use hadris_iso::{
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(not(target_os = "macos"))]
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::{HashMap, HashSet},
@@ -1988,9 +1993,7 @@ const PXE_BOOT_PROGRESS_TTL: Duration = Duration::minutes(5);
 const WINPE_LOADER_ID: &str = "{9f2f2f90-0f5a-4d8b-9e9f-5decb22bbf0a}";
 #[cfg(any(target_os = "windows", test))]
 const WINPE_RAMDISK_DEVICE: &str = "ramdisk=[boot]\\Boot\\boot.wim,{ramdiskoptions}";
-#[cfg(any(target_os = "windows", test))]
 const WINPE_STANDARD_LOADER_PATH: &str = r"\windows\system32\winload.exe";
-#[cfg(any(target_os = "windows", test))]
 const WINPE_SYSTEM32_BOOT_LOADER_PATH: &str = r"\windows\system32\boot\winload.exe";
 const WIM_SIGNATURE: &[u8; 8] = b"MSWIM\0\0\0";
 const WIM_HEADER_SIZE_OFFSET: usize = 0x08;
@@ -2940,8 +2943,15 @@ fn build_winpe_package_with_native_iso(
         }
     };
     let loader_path = detect_winpe_loader_path(wim)?;
-    let bootmgr = find_named(&files, "bootmgr")
-        .ok_or_else(|| PxeServiceError::MissingBootFile("bootmgr".into()))?;
+    let bootmgr = find_named(&files, "bootmgr").ok_or_else(|| {
+        if find_named(&files, "grldr").is_some() {
+            PxeServiceError::InvalidConfig(
+                "this EasyU media contains GRLDR but no Windows bootmgr; GRLDR cannot safely replace bootmgr for the managed BIOS/UEFI wimboot package".into(),
+            )
+        } else {
+            PxeServiceError::MissingBootFile("bootmgr".into())
+        }
+    })?;
     let sdi = find_named(&files, "boot.sdi")
         .or_else(|| find_unique_uefi_bcd_reference(extracted, &files, "sdi"))
         .or_else(|| find_unique_file_with_extension(&files, "sdi"))
@@ -3026,7 +3036,6 @@ fn find_edgeless_payload<'a>(extracted: &Path, files: &'a [PathBuf]) -> Option<&
     has_required_archive.then_some(payload)
 }
 
-#[cfg(any(target_os = "windows", test))]
 fn copy_winpe_media_payload(payload: &Path, mount: &Path) -> Result<(), PxeServiceError> {
     let destination_root = mount.join("Edgeless");
     fs::create_dir_all(&destination_root)?;
@@ -3148,16 +3157,13 @@ if exist X:\\Windows\\System32\\startnet.easydeploymesh-original.cmd call X:\\Wi
 const EASYDEPLOYMESH_RUNTIME_COLLECTOR: &[u8] =
     include_bytes!("../../../scripts/collect-winpe-runtime.cmd");
 
-#[cfg(any(target_os = "windows", test))]
 const EASYDEPLOYMESH_SHELL_LAUNCHER: &[u8] = b"X:\\EasyDeployMesh\\easydeploymesh-shell.exe\r\n";
 
-#[cfg(any(target_os = "windows", test))]
 struct PatchedWinpeshl {
     ini: Vec<u8>,
     original_shell_script: Option<Vec<u8>>,
 }
 
-#[cfg(any(target_os = "windows", test))]
 fn patch_winpeshl_for_agent(input: &[u8]) -> Result<PatchedWinpeshl, PxeServiceError> {
     let mut lines = Vec::new();
     let mut start = 0;
@@ -3324,7 +3330,27 @@ fn inject_bootstrap_into_winpe(wim: &Path, bootstrap: &[u8]) -> Result<(), PxeSe
     result
 }
 
-#[cfg(any(not(target_os = "windows"), test))]
+#[cfg(all(target_os = "macos", not(test)))]
+fn inject_bootstrap_into_winpe(wim: &Path, bootstrap: &[u8]) -> Result<(), PxeServiceError> {
+    mutate_wim_with_tree(wim, |tree, _index| {
+        let easydeploymesh = tree.join("EasyDeployMesh");
+        fs::create_dir_all(&easydeploymesh)?;
+        fs::write(
+            easydeploymesh.join("easydeploymesh-bootstrap.json"),
+            bootstrap,
+        )?;
+        fs::write(
+            easydeploymesh.join("collect-winpe-runtime.cmd"),
+            EASYDEPLOYMESH_RUNTIME_COLLECTOR,
+        )?;
+        Ok(())
+    })
+}
+
+#[cfg(any(
+    all(not(any(target_os = "windows", target_os = "macos")), not(test)),
+    test
+))]
 fn inject_bootstrap_into_winpe(_wim: &Path, _bootstrap: &[u8]) -> Result<(), PxeServiceError> {
     Err(PxeServiceError::InvalidConfig(
         "injecting the Agent bootstrap into WinPE requires Windows DISM".into(),
@@ -3469,6 +3495,85 @@ fn inject_agent_into_winpe(
     result
 }
 
+#[cfg(all(target_os = "macos", not(test)))]
+fn inject_agent_into_winpe(
+    wim: &Path,
+    agent: &Path,
+    media_payload: Option<&Path>,
+) -> Result<(), PxeServiceError> {
+    if !agent.is_file() {
+        return Err(PxeServiceError::MissingBootFile(
+            agent.to_string_lossy().into_owned(),
+        ));
+    }
+    mutate_wim_with_tree(wim, |tree, index| {
+        let easydeploymesh = tree.join("EasyDeployMesh");
+        fs::create_dir_all(&easydeploymesh)?;
+        fs::copy(agent, easydeploymesh.join("easydeploymesh-agent.exe"))?;
+        fs::copy(agent, easydeploymesh.join("easydeploymesh-shell.exe"))?;
+        fs::write(
+            easydeploymesh.join("collect-winpe-runtime.cmd"),
+            EASYDEPLOYMESH_RUNTIME_COLLECTOR,
+        )?;
+        if let Some(payload) = media_payload {
+            copy_winpe_media_payload(payload, tree)?;
+        }
+
+        let system32 = tree.join("Windows/System32");
+        fs::create_dir_all(&system32)?;
+        let extraction = tree.join(".inspection");
+        fs::create_dir_all(&extraction)?;
+        let mut shell_hook_installed = false;
+        if wimlib::extract(wim, index, "/Windows/System32/winpeshl.ini", &extraction).is_ok() {
+            let source = extraction.join("winpeshl.ini");
+            let patched = patch_winpeshl_for_agent(&fs::read(source)?)?;
+            fs::write(system32.join("winpeshl.ini"), patched.ini)?;
+            shell_hook_installed = true;
+            if let Some(script) = patched.original_shell_script {
+                fs::write(
+                    easydeploymesh.join("easydeploymesh-original-shell.cmd"),
+                    script,
+                )?;
+            }
+        }
+        if !shell_hook_installed
+            && wimlib::extract(wim, index, "/Windows/System32/config/SYSTEM", &extraction).is_ok()
+        {
+            let hive_path = extraction.join("SYSTEM");
+            let (original, patched) =
+                replace_setup_cmdline(&fs::read(&hive_path)?).map_err(|error| {
+                    PxeServiceError::InvalidConfig(format!(
+                        "could not patch offline WinPE SYSTEM hive: {error}"
+                    ))
+                })?;
+            if !original.eq_ignore_ascii_case(easydeploymesh_bcd::AGENT_SHELL) {
+                let mut script = b"@echo off\r\n".to_vec();
+                script.extend_from_slice(original.as_bytes());
+                script.extend_from_slice(b"\r\n");
+                fs::write(
+                    easydeploymesh.join("easydeploymesh-original-shell.cmd"),
+                    script,
+                )?;
+            }
+            fs::create_dir_all(system32.join("config"))?;
+            fs::write(system32.join("config/SYSTEM"), patched)?;
+            shell_hook_installed = true;
+        }
+        if shell_hook_installed {
+            fs::write(easydeploymesh.join("shell-hook.enabled"), b"enabled\r\n")?;
+        }
+        if wimlib::extract(wim, index, "/Windows/System32/startnet.cmd", &extraction).is_ok() {
+            fs::copy(
+                extraction.join("startnet.cmd"),
+                system32.join("startnet.easydeploymesh-original.cmd"),
+            )?;
+        }
+        fs::write(system32.join("startnet.cmd"), EASYDEPLOYMESH_STARTNET)?;
+        fs::remove_dir_all(extraction)?;
+        Ok(())
+    })
+}
+
 #[cfg(any(target_os = "windows", test))]
 fn should_patch_setup_cmdline(winpeshl_hook_installed: bool) -> bool {
     !winpeshl_hook_installed
@@ -3549,7 +3654,10 @@ fn reg_sz_value(output: &[u8], name: &str) -> Option<String> {
     })
 }
 
-#[cfg(any(not(target_os = "windows"), test))]
+#[cfg(any(
+    all(not(any(target_os = "windows", target_os = "macos")), not(test)),
+    test
+))]
 fn inject_agent_into_winpe(
     _wim: &Path,
     _agent: &Path,
@@ -3558,6 +3666,45 @@ fn inject_agent_into_winpe(
     Err(PxeServiceError::InvalidConfig(
         "injecting EasyDeployMesh Agent into WinPE requires Windows DISM".into(),
     ))
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn mutate_wim_with_tree(
+    wim: &Path,
+    populate: impl FnOnce(&Path, u32) -> Result<(), PxeServiceError>,
+) -> Result<(), PxeServiceError> {
+    let mut header = [0_u8; WIM_BOOT_INDEX_OFFSET + 4];
+    File::open(wim)?.read_exact(&mut header)?;
+    let index = wim_boot_index_from_header(&header).ok_or_else(|| {
+        PxeServiceError::InvalidConfig(format!("{} has no valid boot image index", wim.display()))
+    })?;
+    let parent = wim.parent().unwrap_or_else(|| Path::new("."));
+    let workspace = parent.join(format!(".easydeploymesh-wim-{}", uuid::Uuid::new_v4()));
+    let replacement = workspace.join("boot.wim");
+    let tree = workspace.join("tree");
+    fs::create_dir_all(&tree)?;
+    fs::copy(wim, &replacement)?;
+    let result = (|| {
+        populate(&tree, index)?;
+        wimlib::add_tree(&replacement, index, &tree)
+            .map_err(|error| PxeServiceError::InvalidConfig(error.to_string()))?;
+        let mut verified = [0_u8; WIM_BOOT_INDEX_OFFSET + 4];
+        File::open(&replacement)?.read_exact(&mut verified)?;
+        if wim_boot_index_from_header(&verified) != Some(index) {
+            return Err(PxeServiceError::InvalidConfig(
+                "wimlib produced an invalid boot image".into(),
+            ));
+        }
+        let backup = workspace.join("previous.wim");
+        fs::rename(wim, &backup)?;
+        if let Err(error) = fs::rename(&replacement, wim) {
+            let _ = fs::rename(&backup, wim);
+            return Err(error.into());
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&workspace);
+    result
 }
 
 #[cfg(all(target_os = "windows", not(test)))]
@@ -3693,13 +3840,38 @@ fn detect_winpe_loader_path(wim: &Path) -> Result<&'static str, PxeServiceError>
     })
 }
 
+#[cfg(all(target_os = "macos", not(test)))]
+fn detect_winpe_loader_path(wim: &Path) -> Result<&'static str, PxeServiceError> {
+    let mut header = [0_u8; WIM_BOOT_INDEX_OFFSET + 4];
+    File::open(wim)?.read_exact(&mut header)?;
+    let index = wim_boot_index_from_header(&header).ok_or_else(|| {
+        PxeServiceError::InvalidConfig(format!("{} has no valid boot image index", wim.display()))
+    })?;
+    for (image_path, loader) in [
+        ("/Windows/System32/winload.exe", WINPE_STANDARD_LOADER_PATH),
+        (
+            "/Windows/System32/Boot/winload.exe",
+            WINPE_SYSTEM32_BOOT_LOADER_PATH,
+        ),
+    ] {
+        if wimlib::image_path_exists(wim, index, image_path)
+            .map_err(|error| PxeServiceError::InvalidConfig(error.to_string()))?
+        {
+            return Ok(loader);
+        }
+    }
+    Err(PxeServiceError::InvalidConfig(format!(
+        "WinPE boot image {index} contains neither {WINPE_STANDARD_LOADER_PATH} nor {WINPE_SYSTEM32_BOOT_LOADER_PATH}"
+    )))
+}
+
 #[cfg(test)]
 fn detect_winpe_loader_path(wim: &Path) -> Result<&'static str, PxeServiceError> {
     let listing = fs::read(wim)?;
     Ok(winpe_loader_path_from_listing(&listing).unwrap_or(WINPE_STANDARD_LOADER_PATH))
 }
 
-#[cfg(all(not(target_os = "windows"), not(test)))]
+#[cfg(all(not(any(target_os = "windows", target_os = "macos")), not(test)))]
 fn detect_winpe_loader_path(_wim: &Path) -> Result<&'static str, PxeServiceError> {
     Err(PxeServiceError::InvalidConfig(
         "inspecting a WinPE boot image requires Windows dism.exe".into(),
@@ -3776,6 +3948,22 @@ fn write_clean_winpe_bcd(path: &Path, loader_path: &'static str) -> Result<(), P
             "the generated WinPE BCD store still references \\WEPE\\B64".into(),
         ));
     }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn write_clean_winpe_bcd(path: &Path, loader_path: &'static str) -> Result<(), PxeServiceError> {
+    let bytes = create_winpe_bcd(loader_path).map_err(|error| {
+        PxeServiceError::InvalidConfig(format!("could not create WinPE BCD: {error}"))
+    })?;
+    validate_winpe_bcd(&bytes, loader_path).map_err(|error| {
+        PxeServiceError::InvalidConfig(format!("could not validate WinPE BCD: {error}"))
+    })?;
+    let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+    let mut file = File::create(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
     Ok(())
 }
 
@@ -3857,7 +4045,7 @@ fn write_clean_winpe_bcd(path: &Path, loader_path: &'static str) -> Result<(), P
     Ok(())
 }
 
-#[cfg(all(not(target_os = "windows"), not(test)))]
+#[cfg(all(not(any(target_os = "windows", target_os = "macos")), not(test)))]
 fn write_clean_winpe_bcd(_path: &Path, _loader_path: &'static str) -> Result<(), PxeServiceError> {
     Err(PxeServiceError::InvalidConfig(
         "creating a Legacy BIOS WinPE package requires Windows bcdedit.exe".into(),
@@ -4232,22 +4420,53 @@ impl PxeService {
             return Err(PxeServiceError::AlreadyRunning);
         }
         let bind = parse_ipv4(&config.bind_address, "bind address")?;
-        if config.mode == PxeMode::StandaloneDhcp && detect_dhcp_server(bind).await? {
+        #[cfg(target_os = "macos")]
+        let privileged = crate::macos_privileged::acquire_pxe_sockets(bind)
+            .await
+            .map_err(PxeServiceError::InvalidConfig)?;
+        #[cfg(target_os = "macos")]
+        let conflict = config.mode == PxeMode::StandaloneDhcp
+            && detect_dhcp_server_on(&privileged.client).await?;
+        #[cfg(not(target_os = "macos"))]
+        let conflict = config.mode == PxeMode::StandaloneDhcp && detect_dhcp_server(bind).await?;
+        if conflict {
             return Err(PxeServiceError::DhcpConflict);
         }
+        #[cfg(target_os = "macos")]
+        let tftp = privileged.tftp;
+        #[cfg(target_os = "macos")]
+        let mut privileged_server = Some(privileged.server);
+        #[cfg(not(target_os = "macos"))]
         let tftp = bind_udp(bind, TFTP_PORT).await?;
         let dhcp_port = if config.mode == PxeMode::StandaloneDhcp {
             DHCP_SERVER_PORT
         } else {
             PROXY_DHCP_PORT
         };
-        let dhcp = match bind_udp(bind, dhcp_port).await {
+        #[cfg(target_os = "macos")]
+        let dhcp_result = if config.mode == PxeMode::StandaloneDhcp {
+            Ok(privileged_server
+                .take()
+                .expect("privileged DHCP socket is available"))
+        } else {
+            bind_udp(bind, dhcp_port).await
+        };
+        #[cfg(not(target_os = "macos"))]
+        let dhcp_result = bind_udp(bind, dhcp_port).await;
+        let dhcp = match dhcp_result {
             Ok(s) => s,
             Err(e) => {
                 drop(tftp);
                 return Err(e);
             }
         };
+        #[cfg(target_os = "macos")]
+        let proxy_discovery = if config.mode == PxeMode::ProxyDhcp {
+            privileged_server.take()
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "macos"))]
         let proxy_discovery = if config.mode == PxeMode::ProxyDhcp {
             match bind_reusable_udp(bind, DHCP_SERVER_PORT) {
                 Ok(s) => Some(s),
@@ -4437,6 +4656,7 @@ async fn bind_udp(address: Ipv4Addr, port: u16) -> Result<UdpSocket, PxeServiceE
         })
 }
 
+#[cfg(not(target_os = "macos"))]
 fn bind_reusable_udp(address: Ipv4Addr, port: u16) -> Result<UdpSocket, PxeServiceError> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).map_err(|source| {
         PxeServiceError::Bind {
@@ -4473,8 +4693,13 @@ fn bind_reusable_udp(address: Ipv4Addr, port: u16) -> Result<UdpSocket, PxeServi
     })
 }
 
+#[cfg(not(target_os = "macos"))]
 async fn detect_dhcp_server(bind: Ipv4Addr) -> Result<bool, PxeServiceError> {
     let socket = bind_reusable_udp(bind, DHCP_CLIENT_PORT)?;
+    detect_dhcp_server_on(&socket).await
+}
+
+async fn detect_dhcp_server_on(socket: &UdpSocket) -> Result<bool, PxeServiceError> {
     socket.set_broadcast(true)?;
     let mut discover = vec![0u8; 240];
     discover[0] = 1;

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "externalBin": ["binaries/wimlib-imagex"],
+    "resources": {
+      "binaries/wimlib-COPYING.GPLv3": "licenses/wimlib-COPYING.GPLv3"
+    }
+  }
+}

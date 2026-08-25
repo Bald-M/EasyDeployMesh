@@ -309,10 +309,30 @@ uses the existing network DHCP service while providing boot information.
 `PxeService` binds only the configured IPv4 interface, persists DHCP leases, and
 tracks clients through discovery, download, and Agent-waiting stages.
 
+macOS reserves the DHCP and TFTP UDP ports below 1024. When PXE starts, the
+desktop therefore launches its own executable in a narrowly scoped helper mode
+through the system administrator authorization dialog. The helper can only bind
+UDP 67, 68, and 69 on the selected IPv4 address; it passes those three file
+descriptors back over a private, owner-only Unix socket and immediately exits.
+All DHCP conflict detection, lease handling, packet processing, TFTP file access,
+and application state remain in the unprivileged desktop process. Windows keeps
+its existing direct socket path.
+
 The Agent binary, bootstrap, startup scripts, and diagnostics collector are
 injected into `boot.wim`. SHA-256 marker files plus a runtime-layout revision
 avoid unnecessary mounts while ensuring an upgraded Agent or injection layout
 refreshes an existing package.
+
+Windows keeps the native DISM, BCDEdit, and registry-tool import path. On macOS,
+the desktop verifies and invokes its pinned, architecture-specific
+`wimlib-imagex` sidecar and uses `crates/bcd` to generate a fresh canonical BCD
+store and, only when the startup-file route is unavailable, to update the
+bounded `SYSTEM\\Setup\\CmdLine` value. The imported media's BCD is never trusted
+or edited in place. WIM changes and all injected resources are verified in a
+staging copy before atomic boot-package replacement, so a failed macOS import or
+bootstrap refresh leaves the current package authoritative. A read-only runtime
+capability command exposes the selected backend to the UI; the service repeats
+the capability check before mutation.
 
 ## Persistence model
 
@@ -387,6 +407,8 @@ problem is not a reason to bypass authentication, verification, or targeting.
 ## Testing strategy
 
 - `crates/core`: pure state-machine, fingerprint, and partition invariants.
+- `crates/bcd`: bounded, platform-independent REGF parsing and the narrow BCD
+  and SYSTEM Hive operations needed to construct WinPE boot packages.
 - `crates/gho`: decoder behavior, truncation, corruption, compression, and
   expansion limits.
 - `crates/service`: repository persistence, validation, authentication, HTTP

@@ -34,6 +34,9 @@ if (process.platform === "win32") {
 }
 
 await run("node", ["scripts/stage-agent.mjs"]);
+if (target.platform === "macos") {
+  await run("node", ["scripts/stage-wimlib.mjs", targetName]);
+}
 
 const tauriArguments = [
   "--filter",

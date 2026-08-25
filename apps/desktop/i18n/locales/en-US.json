@@ -429,6 +429,8 @@
     "managedPackagePath": "Managed boot package path",
     "pxePackageImported": "PXE boot package imported",
     "pxeImportFailed": "Could not import PXE boot package",
+    "pxeImportWindowsOnly": "This host cannot import PE boot packages",
+    "pxeImportWindowsOnlyHint": "The WinPE import backend did not pass its runtime checks. macOS requires the bundled wimlib with the expected version and architecture; Windows continues to use DISM and BCDEdit.",
     "startPxe": "Start PXE service",
     "startingPxe": "Starting PXE service…",
     "stopPxe": "Stop PXE service",
