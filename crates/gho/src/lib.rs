@@ -4,12 +4,12 @@ use flate2::read::ZlibDecoder;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use thiserror::Error;
 
-pub const PARSER_VERSION: u32 = 1;
+pub const PARSER_VERSION: u32 = 3;
 const HEADER_SIZE: u64 = 512;
 const RECORD_HEADER_SIZE: usize = 10;
 const RECORD_MAGIC: u32 = 0x012f_18d8;
 const BLOCK_SIZE: usize = 32 * 1024;
-const MAX_STORED_LEN: usize = BLOCK_SIZE + 6;
+const MAX_STORED_LEN: usize = 33_002;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
@@ -43,11 +43,13 @@ pub enum Error {
     InvalidRecord,
     #[error("GHO compression type {0} is unsupported")]
     UnsupportedCompression(u8),
-    #[error("spanned GHO images are unsupported")]
+    #[error("a GHS continuation file cannot be opened as the primary GHO")]
     SpannedUnsupported,
+    #[error("GHO span header does not match the primary image")]
+    SpanMismatch,
     #[error("encrypted GHO images are unsupported")]
     EncryptedUnsupported,
-    #[error("GHO must contain exactly one partition, found {0}")]
+    #[error("GHO partition selection is invalid for an image containing {0} partitions")]
     PartitionCount(u32),
     #[error("GHO compressed block is invalid")]
     CorruptBlock,
@@ -60,6 +62,123 @@ pub enum Error {
 #[derive(Debug, Clone)]
 struct Partition {
     spans: Vec<(u64, u64)>,
+}
+
+/// Presents a primary GHO and its ordered GHS files as one seekable stream.
+/// Ghost span headers are validated and omitted from the virtual byte range.
+pub struct SpanReader<R> {
+    readers: Vec<R>,
+    starts: Vec<u64>,
+    lengths: Vec<u64>,
+    position: u64,
+    total: u64,
+}
+
+impl<R: Read + Seek> SpanReader<R> {
+    pub fn new(mut readers: Vec<R>) -> Result<Self, Error> {
+        if readers.is_empty() {
+            return Err(Error::Truncated);
+        }
+        let mut starts = Vec::with_capacity(readers.len());
+        let mut lengths = Vec::with_capacity(readers.len());
+        let mut total = 0_u64;
+        let mut primary_header = [0_u8; HEADER_SIZE as usize];
+        readers[0].seek(SeekFrom::Start(0))?;
+        readers[0]
+            .read_exact(&mut primary_header)
+            .map_err(map_eof)?;
+        if u16::from_le_bytes([primary_header[0], primary_header[1]]) != 0xeffe
+            || primary_header[2] != 1
+        {
+            return Err(Error::InvalidMagic);
+        }
+        let primary_id = &primary_header[4..8];
+        let compression = primary_header[3];
+        for (index, reader) in readers.iter_mut().enumerate() {
+            let file_len = reader.seek(SeekFrom::End(0))?;
+            let skipped = if index == 0 { 0 } else { HEADER_SIZE };
+            if file_len < HEADER_SIZE {
+                return Err(Error::Truncated);
+            }
+            if index > 0 {
+                reader.seek(SeekFrom::Start(0))?;
+                let mut header = [0_u8; HEADER_SIZE as usize];
+                reader.read_exact(&mut header).map_err(map_eof)?;
+                if u16::from_le_bytes([header[0], header[1]]) != 0xeffe
+                    || header[2] != 9
+                    || header[3] != compression
+                    || &header[4..8] != primary_id
+                {
+                    return Err(Error::SpanMismatch);
+                }
+            }
+            let length = file_len - skipped;
+            starts.push(total);
+            lengths.push(length);
+            total = total.checked_add(length).ok_or(Error::InvalidRecord)?;
+        }
+        Ok(Self {
+            readers,
+            starts,
+            lengths,
+            position: 0,
+            total,
+        })
+    }
+
+    pub fn len(&self) -> u64 {
+        self.total
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+}
+
+impl<R: Read + Seek> Read for SpanReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let mut written = 0;
+        while written < output.len() && self.position < self.total {
+            let index = self
+                .starts
+                .partition_point(|start| *start <= self.position)
+                .saturating_sub(1);
+            let relative = self.position - self.starts[index];
+            let available = self.lengths[index] - relative;
+            let wanted = usize::try_from(available.min((output.len() - written) as u64))
+                .unwrap_or(output.len() - written);
+            let skipped = if index == 0 { 0 } else { HEADER_SIZE };
+            self.readers[index].seek(SeekFrom::Start(skipped + relative))?;
+            let count = self.readers[index].read(&mut output[written..written + wanted])?;
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "GHO span ended before its measured length",
+                ));
+            }
+            written += count;
+            self.position += count as u64;
+        }
+        Ok(written)
+    }
+}
+
+impl<R: Read + Seek> Seek for SpanReader<R> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let next = match position {
+            SeekFrom::Start(value) => i128::from(value),
+            SeekFrom::End(value) => i128::from(self.total) + i128::from(value),
+            SeekFrom::Current(value) => i128::from(self.position) + i128::from(value),
+        };
+        if !(0..=i128::from(self.total)).contains(&next) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid GHO span seek",
+            ));
+        }
+        self.position = next as u64;
+        Ok(self.position)
+    }
 }
 
 pub fn inspect<R: Read + Seek>(reader: &mut R) -> Result<ImageInfo, Error> {
@@ -86,10 +205,12 @@ pub fn decode_partition<R: Read + Seek, W: Write>(
     expanded_limit: u64,
 ) -> Result<(ImageInfo, u64), Error> {
     let (partitions, info) = parse(reader)?;
-    if source_partition != 1 {
+    if source_partition == 0 || source_partition > info.partition_count {
         return Err(Error::PartitionCount(info.partition_count));
     }
-    let partition = partitions.first().ok_or(Error::PartitionCount(0))?;
+    let partition = partitions
+        .get((source_partition - 1) as usize)
+        .ok_or(Error::PartitionCount(info.partition_count))?;
     let mut total = 0_u64;
     let mut compressed = vec![0_u8; MAX_STORED_LEN];
     let mut expanded = vec![0_u8; BLOCK_SIZE + 1024];
@@ -160,10 +281,10 @@ fn parse<R: Read + Seek>(reader: &mut R) -> Result<(Vec<Partition>, ImageInfo), 
     let compression = match header[3] {
         0 => Compression::None,
         2 => Compression::Fast,
-        // Ghost stores high-compression levels as the -Z level plus one:
-        // header tag 4 is Z3 and tag 10 is Z9. Tag 3 is Z2, which is outside
-        // EasyDeployMesh's initial Z3-Z9 compatibility profile.
-        value @ 4..=10 => Compression::High(value - 1),
+        value @ 3..=9 => Compression::High(value),
+        // Some Ghost 11/12 producers encode Z9 as tag 10. Decompression is
+        // still zlib; normalize the displayed level without rejecting it.
+        10 => Compression::High(9),
         value => return Err(Error::UnsupportedCompression(value)),
     };
     let mut partitions: Vec<Partition> = Vec::new();
@@ -223,7 +344,7 @@ fn parse<R: Read + Seek>(reader: &mut R) -> Result<(Vec<Partition>, ImageInfo), 
         }
     }
     let count = u32::try_from(partitions.len()).map_err(|_| Error::InvalidRecord)?;
-    if count != 1 {
+    if count == 0 {
         return Err(Error::PartitionCount(count));
     }
     Ok((
@@ -231,6 +352,8 @@ fn parse<R: Read + Seek>(reader: &mut R) -> Result<(Vec<Partition>, ImageInfo), 
         ImageInfo {
             compression,
             partition_count: count,
+            // Inspection describes the container. Callers must explicitly choose
+            // a one-based partition when more than one stream is present.
             source_partition: 1,
             encrypted: false,
             spanned: false,
@@ -434,11 +557,83 @@ mod tests {
         bytes
     }
 
+    fn multi_partition_image(first: &[u8], second: &[u8]) -> Vec<u8> {
+        let mut bytes = image(0, first);
+        bytes.truncate(bytes.len() - RECORD_HEADER_SIZE);
+        bytes.extend_from_slice(&0x0603_u32.to_le_bytes());
+        bytes.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&20_u16.to_le_bytes());
+        bytes.extend_from_slice(&[0; 20]);
+        let mut header = vec![0_u8; HEADER_SIZE as usize];
+        header[0..2].copy_from_slice(&0xeffe_u16.to_le_bytes());
+        bytes.extend(header);
+        bytes.extend_from_slice(&u16::try_from(second.len() + 2).unwrap().to_le_bytes());
+        bytes.extend_from_slice(second);
+        bytes.extend_from_slice(&0x23_u32.to_le_bytes());
+        bytes.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes
+    }
+
+    fn span(primary: &[u8], payload: &[u8], image_id: [u8; 4]) -> (Vec<u8>, Vec<u8>) {
+        let mut primary = primary.to_vec();
+        primary[4..8].copy_from_slice(&image_id);
+        let mut continuation = vec![0_u8; HEADER_SIZE as usize];
+        continuation[0..4].copy_from_slice(&[0xfe, 0xef, 9, primary[3]]);
+        continuation[4..8].copy_from_slice(&image_id);
+        continuation.extend_from_slice(payload);
+        (primary, continuation)
+    }
+
     #[test]
     fn decodes_uncompressed_partition() {
         let bytes = image(0, b"hello");
         let verified = verify(&mut Cursor::new(bytes), 100).unwrap();
         assert_eq!(verified.expanded_size_bytes, 5);
+    }
+
+    #[test]
+    fn decodes_an_explicit_partition_from_a_multi_partition_image() {
+        let bytes = multi_partition_image(b"first", b"second");
+        let info = inspect(&mut Cursor::new(&bytes)).unwrap();
+        assert_eq!(info.partition_count, 2);
+
+        let mut out = Vec::new();
+        decode_partition(&mut Cursor::new(bytes), 2, &mut out, 100).unwrap();
+        assert_eq!(out, b"second");
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_partition_selection() {
+        let bytes = multi_partition_image(b"first", b"second");
+        assert!(matches!(
+            decode_partition(&mut Cursor::new(bytes), 3, &mut Vec::new(), 100),
+            Err(Error::PartitionCount(2))
+        ));
+    }
+
+    #[test]
+    fn span_reader_skips_validated_continuation_headers() {
+        let primary = image(0, b"first");
+        let (primary, continuation) = span(&primary, b"second", [1, 2, 3, 4]);
+        let expected = [primary.as_slice(), b"second"].concat();
+        let mut reader = SpanReader::new(vec![Cursor::new(primary), Cursor::new(continuation)])
+            .expect("matching spans should form a virtual stream");
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(reader.len(), expected.len() as u64);
+    }
+
+    #[test]
+    fn span_reader_rejects_a_mismatched_image_id() {
+        let primary = image(0, b"first");
+        let (primary, mut continuation) = span(&primary, b"second", [1, 2, 3, 4]);
+        continuation[4] = 9;
+        assert!(matches!(
+            SpanReader::new(vec![Cursor::new(primary), Cursor::new(continuation)]),
+            Err(Error::SpanMismatch)
+        ));
     }
     #[test]
     fn rejects_encryption_spans_and_unknown_compression() {
@@ -479,18 +674,18 @@ mod tests {
         let mut block = vec![0, 0, 0, 0];
         block.extend(encoder.finish().unwrap());
         let mut out = Vec::new();
-        decode_partition(&mut Cursor::new(image(7, &block)), 1, &mut out, 100).unwrap();
+        decode_partition(&mut Cursor::new(image(3, &block)), 1, &mut out, 100).unwrap();
         assert_eq!(out, b"hello zlib");
     }
 
     #[test]
     fn maps_ghost_header_compression_tag_to_z_level() {
-        let z9 = inspect(&mut Cursor::new(image(10, b"unused"))).unwrap();
+        let z3 = inspect(&mut Cursor::new(image(3, b"unused"))).unwrap();
+        assert_eq!(z3.compression, Compression::High(3));
+        let z9 = inspect(&mut Cursor::new(image(9, b"unused"))).unwrap();
         assert_eq!(z9.compression, Compression::High(9));
-
-        assert!(matches!(
-            inspect(&mut Cursor::new(image(3, b"unused"))),
-            Err(Error::UnsupportedCompression(3))
-        ));
+        let legacy_z9 = inspect(&mut Cursor::new(image(10, b"unused"))).unwrap();
+        assert_eq!(legacy_z9.compression, Compression::High(9));
     }
+
 }

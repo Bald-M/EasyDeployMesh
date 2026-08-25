@@ -26,6 +26,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt},
     net::TcpListener,
     sync::{Mutex, oneshot},
     task::JoinHandle,
@@ -364,9 +365,12 @@ async fn claim_job(
                             Operation::DeployWim => images
                                 .revalidate_for_deployment(job.image_id, job.options.image_index)
                                 .is_ok(),
-                            Operation::DeployGho => {
-                                images.prepare_gho_deployment(job.image_id).is_ok()
-                            }
+                            Operation::DeployGho => images
+                                .prepare_gho_partition_deployment(
+                                    job.image_id,
+                                    job.options.image_index,
+                                )
+                                .is_ok(),
                             Operation::CaptureGho => false,
                         }
                     });
@@ -415,20 +419,17 @@ async fn claim_job(
     let expires_at = job
         .lease_expires_at
         .ok_or(ApiError::Conflict("leased job has no expiry".to_owned()))?;
-    let sha256 = image.sha256.clone().ok_or(ApiError::Conflict(
-        "deployment image has no checksum".to_owned(),
-    ))?;
     let download_url = format!(
         "/api/v1/agents/{device_id}/jobs/{}/image?leaseId={lease_id}",
         job.id
     );
-    let gho =
-        if job.operation == Operation::DeployGho {
-            let prepared = state
-                .images
-                .prepare_gho_deployment(job.image_id)
-                .map_err(ApiError::Images)?;
-            Some(AgentGhoDeployment {
+    let (gho, download_size_bytes, download_sha256) = if job.operation == Operation::DeployGho {
+        let prepared = state
+            .images
+            .prepare_gho_partition_deployment(job.image_id, job.options.image_index)
+            .map_err(ApiError::Images)?;
+        let metadata =
+            AgentGhoDeployment {
                 source_partition: prepared.capability.source_partition.ok_or_else(|| {
                     ApiError::Conflict("GHO source partition is missing".to_owned())
                 })?,
@@ -440,10 +441,21 @@ async fn claim_job(
                     ApiError::Conflict("GHO expanded checksum is missing".to_owned())
                 })?,
                 parser_version: prepared.capability.parser_version,
-            })
-        } else {
-            None
-        };
+            };
+        (
+            Some(metadata),
+            prepared.download_size_bytes,
+            prepared.download_sha256,
+        )
+    } else {
+        (
+            None,
+            image.size_bytes,
+            image.sha256.clone().ok_or(ApiError::Conflict(
+                "deployment image has no checksum".to_owned(),
+            ))?,
+        )
+    };
     Ok(Json(Some(AgentJobLease {
         job_id: job.id,
         lease_id,
@@ -453,8 +465,8 @@ async fn claim_job(
             id: image.id,
             name: image.name,
             format: image.format,
-            size_bytes: image.size_bytes,
-            sha256,
+            size_bytes: download_size_bytes,
+            sha256: download_sha256,
             download_url,
             index: job.options.image_index,
         },
@@ -584,12 +596,35 @@ async fn download_job_image(
         .get(job.image_id)
         .map_err(ApiError::Images)?
         .ok_or(ApiError::NotFound)?;
-    let path = PathBuf::from(&image.source_path);
-    let file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|_| ApiError::NotFound)?;
-    let length = file.metadata().await.map_err(|_| ApiError::NotFound)?.len();
-    let stream = tokio_util::io::ReaderStream::new(file);
+    let (reader, length): (Box<dyn AsyncRead + Unpin + Send>, u64) =
+        if job.operation == Operation::DeployGho {
+            let prepared = state
+                .images
+                .prepare_gho_partition_deployment(job.image_id, job.options.image_index)
+                .map_err(ApiError::Images)?;
+            let primary = tokio::fs::File::open(&prepared.image.primary.canonical_path)
+                .await
+                .map_err(|_| ApiError::NotFound)?;
+            let mut reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(primary);
+            for span in prepared.image.spans {
+                let mut file = tokio::fs::File::open(&span.canonical_path)
+                    .await
+                    .map_err(|_| ApiError::NotFound)?;
+                file.seek(std::io::SeekFrom::Start(512))
+                    .await
+                    .map_err(|_| ApiError::NotFound)?;
+                reader = Box::new(reader.chain(file));
+            }
+            (reader, prepared.download_size_bytes)
+        } else {
+            let path = PathBuf::from(&image.source_path);
+            let file = tokio::fs::File::open(&path)
+                .await
+                .map_err(|_| ApiError::NotFound)?;
+            let length = file.metadata().await.map_err(|_| ApiError::NotFound)?.len();
+            (Box::new(file), length)
+        };
+    let stream = tokio_util::io::ReaderStream::new(reader);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -749,7 +784,7 @@ mod tests {
     use easydeploymesh_core::{
         AgentJobCompletion, AgentJobLease, AgentJobProgress, Architecture, BootMode,
         CreateDeploymentJob, DeploymentOptions, DeploymentStage, DeploymentTarget, Disk, JobState,
-        Operation,
+        Operation, PartitionPlan,
     };
 
     fn disk() -> Disk {
@@ -791,6 +826,123 @@ mod tests {
         contents[44..48].copy_from_slice(&1_u32.to_le_bytes());
         contents.extend_from_slice(payload);
         contents
+    }
+
+    fn gho_fixture(partitions: &[&[u8]]) -> Vec<u8> {
+        let mut contents = vec![0_u8; 512];
+        contents[0..8].copy_from_slice(&[0xfe, 0xef, 1, 0, 1, 2, 3, 4]);
+        for partition in partitions {
+            contents.extend_from_slice(&0x0603_u32.to_le_bytes());
+            contents.extend_from_slice(&0x012f_18d8_u32.to_le_bytes());
+            contents.extend_from_slice(&20_u16.to_le_bytes());
+            contents.extend_from_slice(&[0; 20]);
+            let mut header = vec![0_u8; 512];
+            header[0..2].copy_from_slice(&0xeffe_u16.to_le_bytes());
+            contents.extend(header);
+            contents.extend_from_slice(&(partition.len() as u16 + 2).to_le_bytes());
+            contents.extend_from_slice(partition);
+        }
+        contents.extend_from_slice(&0x0023_u32.to_le_bytes());
+        contents.extend_from_slice(&0x012f_18d8_u32.to_le_bytes());
+        contents.extend_from_slice(&0_u16.to_le_bytes());
+        contents
+    }
+
+    #[tokio::test]
+    async fn gho_lease_and_download_bind_the_selected_partition_and_normalized_spans() {
+        use sha2::{Digest, Sha256};
+
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let registry = Arc::new(DeviceRegistry::open(temp.path()).expect("registry should open"));
+        let jobs =
+            Arc::new(JobRepository::open(temp.path().join("jobs")).expect("jobs should open"));
+        let images =
+            Arc::new(ImageLibrary::open(temp.path().join("images")).expect("images should open"));
+        let control_plane = ControlPlane::new(
+            Arc::clone(&registry),
+            Arc::clone(&jobs),
+            Arc::clone(&images),
+            Arc::new(ActivityRepository::open(temp.path().join("activities.json")).unwrap()),
+        );
+        let status = control_plane.start("127.0.0.1", 0).await.unwrap();
+        let endpoint = status.endpoint.unwrap();
+        let client = reqwest::Client::new();
+        let registration = client
+            .post(format!("{endpoint}/api/v1/agents/register"))
+            .bearer_auth(status.enrollment_token.unwrap())
+            .json(&inventory())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<AgentRegistration>()
+            .await
+            .unwrap();
+
+        let normalized = gho_fixture(&[b"\xebR\x90NTFS    reserved", b"\xebR\x90NTFS    windows"]);
+        let split_at = 700;
+        let primary = temp.path().join("disk.gho");
+        std::fs::write(&primary, &normalized[..split_at]).unwrap();
+        let mut span = vec![0_u8; 512];
+        span[0..8].copy_from_slice(&[0xfe, 0xef, 9, 0, 1, 2, 3, 4]);
+        span.extend_from_slice(&normalized[split_at..]);
+        std::fs::write(temp.path().join("disk001.ghs"), span).unwrap();
+        let image = images.import(&primary).expect("spanned GHO should import");
+        let job = jobs
+            .create(CreateDeploymentJob {
+                name: "Spanned Ghost deployment".to_owned(),
+                operation: Operation::DeployGho,
+                image_id: image.id,
+                targets: vec![DeploymentTarget {
+                    device_id: registration.device_id,
+                    target_disk_id: disk().id,
+                    target_disk_model: disk().model,
+                    target_disk_serial: disk().serial,
+                    target_disk_size_bytes: disk().size_bytes,
+                }],
+                options: DeploymentOptions {
+                    image_index: 2,
+                    partition_plan: PartitionPlan::uefi_gpt(),
+                },
+            })
+            .unwrap();
+        jobs.transition(job.id, JobState::Waiting).unwrap();
+        let lease = client
+            .post(format!(
+                "{endpoint}/api/v1/agents/{}/jobs/claim",
+                registration.device_id
+            ))
+            .bearer_auth(&registration.device_token)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<Option<AgentJobLease>>()
+            .await
+            .unwrap()
+            .expect("GHO job should lease");
+        assert_eq!(lease.gho.as_ref().unwrap().source_partition, 2);
+        assert_eq!(lease.image.size_bytes, normalized.len() as u64);
+        assert_eq!(
+            lease.image.sha256,
+            format!("{:x}", Sha256::digest(&normalized))
+        );
+
+        let downloaded = client
+            .get(format!("{endpoint}{}", lease.image.download_url))
+            .bearer_auth(&registration.device_token)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(downloaded.as_ref(), normalized);
+        control_plane.stop().await.unwrap();
     }
 
     #[tokio::test]

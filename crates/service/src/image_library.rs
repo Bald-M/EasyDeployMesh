@@ -1,4 +1,4 @@
-use easydeploymesh_core::{GhoImageCapability, ImageArtifact, ImageFormat};
+use easydeploymesh_core::{GhoImageCapability, GhoPartitionCapability, ImageArtifact, ImageFormat};
 use easydeploymesh_gho::{Compression as GhoCompression, PARSER_VERSION};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -141,6 +141,8 @@ pub struct PreparedGhoImageSet {
 pub struct PreparedGhoDeployment {
     pub image: PreparedGhoImageSet,
     pub capability: GhoImageCapability,
+    pub download_size_bytes: u64,
+    pub download_sha256: String,
 }
 
 impl ImageLibrary {
@@ -256,7 +258,7 @@ impl ImageLibrary {
         let staged = stage_managed_copy(&self.objects_dir, &canonical_path, &span_paths)?;
         let staged_paths = staged.all_paths();
         let gho_capability = (format == ImageFormat::Gho)
-            .then(|| inspect_native_gho(&staged.primary_path(), !span_paths.is_empty()));
+            .then(|| inspect_native_gho(&staged.primary_path(), &staged_paths[1..]));
         if matches!(format, ImageFormat::Wim | ImageFormat::Esd) {
             validate_wim_header(&staged.primary_path())?;
             validate_wim_with_dism(&staged.primary_path(), None)?;
@@ -423,7 +425,12 @@ impl ImageLibrary {
             ));
         }
         let managed = resolve_managed_file(id, &images[index].source_path, &self.objects_dir)?;
-        let capability = inspect_native_gho(&managed, !images[index].spans.is_empty());
+        let spans = images[index]
+            .spans
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        let capability = inspect_native_gho(&managed, &spans);
         let mut updated = images[index].clone();
         updated.verified = capability.deployable;
         updated.gho_capability = Some(capability);
@@ -516,13 +523,20 @@ impl ImageLibrary {
         &self,
         id: Uuid,
     ) -> Result<PreparedGhoDeployment, ImageLibraryError> {
+        let source_partition = self
+            .get(id)?
+            .and_then(|artifact| artifact.gho_capability)
+            .and_then(|capability| capability.source_partition)
+            .ok_or(ImageLibraryError::ImageNotVerified { id })?;
+        self.prepare_gho_partition_deployment(id, source_partition)
+    }
+
+    pub fn prepare_gho_partition_deployment(
+        &self,
+        id: Uuid,
+        source_partition: u32,
+    ) -> Result<PreparedGhoDeployment, ImageLibraryError> {
         let image = self.prepare_gho_readiness(id)?;
-        if !image.spans.is_empty() {
-            return Err(ImageLibraryError::InvalidSpanSet {
-                path: image.primary.canonical_path.display().to_string(),
-                reason: "spanned GHO deployment is not supported".to_owned(),
-            });
-        }
         let artifact = self
             .get(id)?
             .ok_or(ImageLibraryError::ImageNotFound { id })?;
@@ -530,22 +544,38 @@ impl ImageLibrary {
             .gho_capability
             .filter(|value| value.deployable)
             .ok_or(ImageLibraryError::ImageNotVerified { id })?;
-        let actual = inspect_native_gho(&image.primary.canonical_path, false);
-        if !actual.deployable
-            || actual.expanded_size_bytes != expected.expanded_size_bytes
-            || actual.expanded_sha256 != expected.expanded_sha256
-        {
+        let span_paths = image
+            .spans
+            .iter()
+            .map(|span| span.canonical_path.clone())
+            .collect::<Vec<_>>();
+        let actual = inspect_native_gho(&image.primary.canonical_path, &span_paths);
+        if !actual.deployable || actual.partitions != expected.partitions {
             return Err(ImageLibraryError::ManagedHashMismatch {
                 id,
-                expected: expected.expanded_sha256.unwrap_or_default(),
-                actual: actual
-                    .expanded_sha256
-                    .unwrap_or_else(|| actual.blocked_reason.unwrap_or_default()),
+                expected: format!("{:?}", expected.partitions),
+                actual: format!("{:?}", actual.partitions),
             });
         }
+        let selected = actual
+            .partitions
+            .iter()
+            .find(|partition| partition.source_partition == source_partition)
+            .cloned()
+            .ok_or(ImageLibraryError::UnsupportedFormat(format!(
+                "GHO source partition {source_partition} is not a verified NTFS partition"
+            )))?;
+        let mut capability = actual;
+        capability.source_partition = Some(selected.source_partition);
+        capability.expanded_size_bytes = Some(selected.expanded_size_bytes);
+        capability.expanded_sha256 = Some(selected.expanded_sha256);
+        let (download_size_bytes, download_sha256) =
+            hash_gho_deployment_stream(&image.primary.canonical_path, &span_paths)?;
         Ok(PreparedGhoDeployment {
             image,
-            capability: actual,
+            capability,
+            download_size_bytes,
+            download_sha256,
         })
     }
 
@@ -1508,6 +1538,40 @@ fn hash_files(paths: &[PathBuf]) -> Result<String, ImageLibraryError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn hash_gho_deployment_stream(
+    primary: &Path,
+    spans: &[PathBuf],
+) -> Result<(u64, String), ImageLibraryError> {
+    let paths = std::iter::once(primary)
+        .chain(spans.iter().map(PathBuf::as_path))
+        .collect::<Vec<_>>();
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        files.push(File::open(path).map_err(|source| ImageLibraryError::Read {
+            path: path.display().to_string(),
+            source,
+        })?);
+    }
+    let mut reader = easydeploymesh_gho::SpanReader::new(files)
+        .map_err(|error| ImageLibraryError::UnsupportedFormat(error.to_string()))?;
+    let size = reader.len();
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|source| ImageLibraryError::Read {
+                path: primary.display().to_string(),
+                source,
+            })?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok((size, format!("{:x}", digest.finalize())))
+}
+
 struct GhoAnalysisSink {
     digest: Sha256,
     prefix: Vec<u8>,
@@ -1528,7 +1592,7 @@ impl Write for GhoAnalysisSink {
     }
 }
 
-fn inspect_native_gho(path: &Path, has_spans: bool) -> GhoImageCapability {
+fn inspect_native_gho(path: &Path, span_paths: &[PathBuf]) -> GhoImageCapability {
     let blocked = |reason: String| GhoImageCapability {
         deployable: false,
         compression: None,
@@ -1536,36 +1600,52 @@ fn inspect_native_gho(path: &Path, has_spans: bool) -> GhoImageCapability {
         expanded_sha256: None,
         partition_count: None,
         source_partition: None,
+        partitions: Vec::new(),
         parser_version: PARSER_VERSION,
         blocked_reason: Some(reason),
     };
-    if has_spans {
-        return blocked("spanned_image_unsupported".to_owned());
+    let mut files = Vec::with_capacity(span_paths.len() + 1);
+    for candidate in std::iter::once(path).chain(span_paths.iter().map(PathBuf::as_path)) {
+        match File::open(candidate) {
+            Ok(file) => files.push(file),
+            Err(_) => return blocked("image_unavailable".to_owned()),
+        }
     }
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => return blocked("image_unavailable".to_owned()),
+    let mut file = match easydeploymesh_gho::SpanReader::new(files) {
+        Ok(reader) => reader,
+        Err(error) => return blocked(native_gho_error_code(&error).to_owned()),
     };
     let info = match easydeploymesh_gho::inspect(&mut file) {
         Ok(info) => info,
         Err(error) => return blocked(native_gho_error_code(&error).to_owned()),
     };
-    let mut sink = GhoAnalysisSink {
-        digest: Sha256::new(),
-        prefix: Vec::new(),
-    };
-    let (_, expanded_size_bytes) = match easydeploymesh_gho::decode_partition(
-        &mut file,
-        info.source_partition,
-        &mut sink,
-        MAX_GHO_EXPANDED_BYTES,
-    ) {
-        Ok(result) => result,
-        Err(error) => return blocked(native_gho_error_code(&error).to_owned()),
-    };
-    if sink.prefix.get(3..11) != Some(b"NTFS    ") {
-        return blocked("non_ntfs_partition".to_owned());
+    let mut partitions = Vec::new();
+    for source_partition in 1..=info.partition_count {
+        let mut sink = GhoAnalysisSink {
+            digest: Sha256::new(),
+            prefix: Vec::new(),
+        };
+        let (_, expanded_size_bytes) = match easydeploymesh_gho::decode_partition(
+            &mut file,
+            source_partition,
+            &mut sink,
+            MAX_GHO_EXPANDED_BYTES,
+        ) {
+            Ok(result) => result,
+            Err(error) => return blocked(native_gho_error_code(&error).to_owned()),
+        };
+        if sink.prefix.get(3..11) == Some(b"NTFS    ") {
+            partitions.push(GhoPartitionCapability {
+                source_partition,
+                file_system: "ntfs".to_owned(),
+                expanded_size_bytes,
+                expanded_sha256: format!("{:x}", sink.digest.finalize()),
+            });
+        }
     }
+    let Some(selected) = partitions.first() else {
+        return blocked("non_ntfs_partition".to_owned());
+    };
     GhoImageCapability {
         deployable: true,
         compression: Some(match info.compression {
@@ -1573,10 +1653,11 @@ fn inspect_native_gho(path: &Path, has_spans: bool) -> GhoImageCapability {
             GhoCompression::Fast => "z1".to_owned(),
             GhoCompression::High(level) => format!("z{level}"),
         }),
-        expanded_size_bytes: Some(expanded_size_bytes),
-        expanded_sha256: Some(format!("{:x}", sink.digest.finalize())),
+        expanded_size_bytes: Some(selected.expanded_size_bytes),
+        expanded_sha256: Some(selected.expanded_sha256.clone()),
         partition_count: Some(info.partition_count),
-        source_partition: Some(info.source_partition),
+        source_partition: Some(selected.source_partition),
+        partitions,
         parser_version: PARSER_VERSION,
         blocked_reason: None,
     }
@@ -1585,6 +1666,7 @@ fn inspect_native_gho(path: &Path, has_spans: bool) -> GhoImageCapability {
 fn native_gho_error_code(error: &easydeploymesh_gho::Error) -> &'static str {
     match error {
         easydeploymesh_gho::Error::SpannedUnsupported => "spanned_image_unsupported",
+        easydeploymesh_gho::Error::SpanMismatch => "span_set_mismatch",
         easydeploymesh_gho::Error::EncryptedUnsupported => "encrypted_image_unsupported",
         easydeploymesh_gho::Error::UnsupportedCompression(_) => "compression_unsupported",
         easydeploymesh_gho::Error::PartitionCount(_) => "partition_scope_unsupported",
@@ -1603,6 +1685,189 @@ mod tests {
         let mut file = File::create(path).expect("fixture should be writable");
         file.write_all(contents)
             .expect("fixture contents should be writable");
+    }
+
+    fn create_multi_partition_gho(path: &Path, partitions: &[&[u8]]) {
+        let mut contents = vec![0_u8; 512];
+        contents[0..4].copy_from_slice(&[0xfe, 0xef, 1, 0]);
+        for partition in partitions {
+            contents.extend_from_slice(&0x0603_u32.to_le_bytes());
+            contents.extend_from_slice(&0x012f_18d8_u32.to_le_bytes());
+            contents.extend_from_slice(&20_u16.to_le_bytes());
+            contents.extend_from_slice(&[0; 20]);
+            let mut partition_header = vec![0_u8; 512];
+            partition_header[0..2].copy_from_slice(&0xeffe_u16.to_le_bytes());
+            contents.extend(partition_header);
+            contents.extend_from_slice(
+                &u16::try_from(partition.len() + 2)
+                    .expect("fixture partition should fit in one block")
+                    .to_le_bytes(),
+            );
+            contents.extend_from_slice(partition);
+        }
+        contents.extend_from_slice(&0x0023_u32.to_le_bytes());
+        contents.extend_from_slice(&0x012f_18d8_u32.to_le_bytes());
+        contents.extend_from_slice(&0_u16.to_le_bytes());
+        create_image(path, &contents);
+    }
+
+    #[test]
+    fn native_gho_selects_the_only_ntfs_stream_from_a_multi_partition_image() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let path = temp.path().join("disk.gho");
+        create_multi_partition_gho(&path, &[b"boot-data", b"\xebR\x90NTFS    windows"]);
+
+        let capability = inspect_native_gho(&path, &[]);
+
+        assert!(capability.deployable);
+        assert_eq!(capability.partition_count, Some(2));
+        assert_eq!(capability.source_partition, Some(2));
+        assert_eq!(capability.expanded_size_bytes, Some(18));
+        assert_eq!(capability.parser_version, PARSER_VERSION);
+
+        let library = ImageLibrary::open(temp.path().join("library")).expect("library should open");
+        let artifact = library.import(&path).expect("GHO should import");
+        assert!(
+            library
+                .prepare_gho_partition_deployment(artifact.id, 1)
+                .is_err(),
+            "a non-NTFS source partition must not be restorable"
+        );
+        assert!(
+            library
+                .prepare_gho_partition_deployment(artifact.id, 2)
+                .is_ok(),
+            "the verified NTFS source partition should be restorable"
+        );
+    }
+
+    #[test]
+    fn native_gho_exposes_each_ntfs_stream_for_explicit_selection() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let path = temp.path().join("disk.gho");
+        create_multi_partition_gho(
+            &path,
+            &[b"\xebR\x90NTFS    first", b"\xebR\x90NTFS    second"],
+        );
+
+        let capability = inspect_native_gho(&path, &[]);
+
+        assert!(capability.deployable);
+        assert_eq!(
+            capability
+                .partitions
+                .iter()
+                .map(|partition| partition.source_partition)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let library = ImageLibrary::open(temp.path().join("library")).expect("library should open");
+        let artifact = library.import(&path).expect("GHO should import");
+        let prepared = library
+            .prepare_gho_partition_deployment(artifact.id, 2)
+            .expect("the explicitly selected NTFS partition should prepare");
+        assert_eq!(prepared.capability.source_partition, Some(2));
+    }
+
+    #[test]
+    fn native_gho_verifies_and_prepares_an_ordered_span_set() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let complete = temp.path().join("complete.gho");
+        create_multi_partition_gho(&complete, &[b"\xebR\x90NTFS    windows payload"]);
+        let mut bytes = fs::read(&complete).expect("complete fixture should read");
+        bytes[4..8].copy_from_slice(&[1, 2, 3, 4]);
+        let split_at = 700;
+        let primary = temp.path().join("disk.gho");
+        create_image(&primary, &bytes[..split_at]);
+        let mut span = vec![0_u8; 512];
+        span[0..4].copy_from_slice(&[0xfe, 0xef, 9, bytes[3]]);
+        span[4..8].copy_from_slice(&bytes[4..8]);
+        span.extend_from_slice(&bytes[split_at..]);
+        create_image(&temp.path().join("disk001.ghs"), &span);
+
+        let library = ImageLibrary::open(temp.path().join("library")).expect("library should open");
+        let artifact = library.import(&primary).expect("spanned GHO should import");
+        assert!(artifact.verified);
+        assert_eq!(artifact.spans.len(), 1);
+        let prepared = library
+            .prepare_gho_partition_deployment(artifact.id, 1)
+            .expect("spanned GHO should prepare for deployment");
+        assert_eq!(prepared.image.spans.len(), 1);
+        assert_eq!(prepared.capability.source_partition, Some(1));
+    }
+
+    #[test]
+    fn native_gho_rejects_a_span_from_a_different_image() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let complete = temp.path().join("complete.gho");
+        create_multi_partition_gho(&complete, &[b"\xebR\x90NTFS    windows payload"]);
+        let mut bytes = fs::read(&complete).unwrap();
+        bytes[4..8].copy_from_slice(&[1, 2, 3, 4]);
+        let primary = temp.path().join("disk.gho");
+        std::fs::write(&primary, &bytes[..700]).unwrap();
+        let mut span = vec![0_u8; 512];
+        span[0..8].copy_from_slice(&[0xfe, 0xef, 9, 0, 9, 9, 9, 9]);
+        span.extend_from_slice(&bytes[700..]);
+        std::fs::write(temp.path().join("disk001.ghs"), span).unwrap();
+
+        let library = ImageLibrary::open(temp.path().join("library")).unwrap();
+        let artifact = library
+            .import(&primary)
+            .expect("invalid set remains catalogable");
+        assert!(!artifact.verified);
+        assert_eq!(
+            artifact
+                .gho_capability
+                .as_ref()
+                .and_then(|capability| capability.blocked_reason.as_deref()),
+            Some("span_set_mismatch")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires EASYDEPLOYMESH_GHO_PATH to point to a real Ghost GHO image"]
+    fn imports_and_revalidates_a_real_ghost_image_sample() {
+        let source = std::env::var_os("EASYDEPLOYMESH_GHO_PATH")
+            .map(PathBuf::from)
+            .expect("EASYDEPLOYMESH_GHO_PATH must point to a real GHO image");
+        let source = fs::canonicalize(&source).expect("real GHO sample should canonicalize");
+        assert!(source.is_file(), "real GHO sample must be a regular file");
+
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let library = ImageLibrary::open(temp.path().join("library")).expect("library should open");
+        let artifact = library
+            .import(&source)
+            .expect("real GHO sample should import");
+        let capability = artifact
+            .gho_capability
+            .as_ref()
+            .expect("real GHO sample should have capability metadata");
+        assert!(
+            capability.deployable,
+            "real GHO sample was blocked: {:?}",
+            capability.blocked_reason
+        );
+        assert!(
+            !capability.partitions.is_empty(),
+            "real GHO sample should expose at least one NTFS source partition"
+        );
+
+        for partition in &capability.partitions {
+            let prepared = library
+                .prepare_gho_partition_deployment(artifact.id, partition.source_partition)
+                .expect("every advertised source partition must revalidate for deployment");
+            assert_eq!(
+                prepared.capability.expanded_size_bytes,
+                Some(partition.expanded_size_bytes)
+            );
+            assert_eq!(
+                prepared.capability.expanded_sha256.as_deref(),
+                Some(partition.expanded_sha256.as_str())
+            );
+            assert!(prepared.download_size_bytes > 512);
+            assert_eq!(prepared.download_sha256.len(), 64);
+        }
     }
 
     fn create_wim(path: &Path, image_count: u32, payload: &[u8]) -> Vec<u8> {
