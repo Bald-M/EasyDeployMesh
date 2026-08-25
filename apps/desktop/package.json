@@ -19,12 +19,14 @@
     "@pinia/nuxt": "^1.0.1",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.4.0",
+    "@tauri-apps/plugin-opener": "^2.5.4",
     "nuxt": "^4.5.0",
     "pinia": "^4.0.2",
     "vue": "^3.5.40"
   },
   "devDependencies": {
     "@iconify-json/lucide": "^1.2.118",
+    "@iconify-json/simple-icons": "^1.2.93",
     "@nuxt/test-utils": "^4.0.3",
     "@tauri-apps/cli": "^2.11.4",
     "@vue/test-utils": "^2.4.11",

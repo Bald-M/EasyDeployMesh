@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Public project documentation and contribution guidelines.
+- A GitHub repository shortcut in the desktop header, using the official GitHub
+  mark and opening the project page in the system browser.
 - A host-aware `pnpm build` entry point for building all supported native and
   cross-compiled Windows installers, with optional platform and target selectors.
 

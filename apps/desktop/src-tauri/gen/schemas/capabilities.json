@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Core permissions for the EasyDeployMesh desktop window","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open"]}}
+{"default":{"identifier":"default","description":"Core permissions for the EasyDeployMesh desktop window","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open",{"identifier":"opener:allow-open-url","allow":[{"url":"https://github.com/Bald-M/EasyDeployMesh"}]}]}}
