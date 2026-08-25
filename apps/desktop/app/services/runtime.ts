@@ -8,6 +8,7 @@ import type {
   PxeServiceStatus,
   RuntimeStatus
 } from '~/types/runtime'
+import type { WinpeImportCapability } from '~/types/runtime'
 import type { ActivityEvent, ActivityQuery } from '~/types/runtime'
 
 const browserRuntime: RuntimeStatus = {
@@ -54,6 +55,13 @@ export async function getRuntimeStatus(): Promise<RuntimeStatus> {
   }
 
   return invoke<RuntimeStatus>('runtime_status')
+}
+
+export async function getWinpeImportCapability(): Promise<WinpeImportCapability> {
+  if (!isTauriRuntime()) {
+    return { supported: false, backend: null, reason: 'native_runtime_required', version: null }
+  }
+  return invoke<WinpeImportCapability>('winpe_import_capability')
 }
 
 export async function getNetworkInterfaces(): Promise<NetworkInterfaceSummary[]> {

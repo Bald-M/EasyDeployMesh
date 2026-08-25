@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { isTauriRuntime } from '~/services/runtime'
-import { importPxeBootPackage, importPxeMedia, loadPxeConfig, savePxeConfig } from '~/services/runtime'
+import { getWinpeImportCapability, importPxeBootPackage, importPxeMedia, loadPxeConfig, savePxeConfig } from '~/services/runtime'
 import { open } from '@tauri-apps/plugin-dialog'
-import type { PxeConfig, PxeMode } from '~/types/runtime'
+import type { PxeConfig, PxeMode, WinpeImportCapability } from '~/types/runtime'
 import { preferredIpv4Interface, suggestedPxeNetwork } from '~/utils/network'
 import { controlStartNeedsPe, isUnsupportedWepeSource, parseSettingsDraft, pxeSourceDisplayName, settingsDraftStorageKey, type SettingsDraft } from '~/utils/settings'
 
@@ -57,6 +57,9 @@ const isRunning = computed(
   () => runtimeStore.controlStatus.state === 'running'
 )
 const isPxeRunning = computed(() => runtimeStore.pxeStatus.state === 'running')
+const winpeCapability = ref<WinpeImportCapability>({ supported: false, backend: null, reason: null, version: null })
+const pxeMediaImportSupported = computed(() => winpeCapability.value.supported)
+const pxeMediaImportUnavailableReason = computed(() => winpeCapability.value.reason || t('settings.pxeImportWindowsOnlyHint'))
 const pxeConfig = computed<PxeConfig>(() => ({
   mode: pxeMode.value,
   bindAddress: bindAddress.value,
@@ -139,6 +142,7 @@ watch(settingsDraft, (draft) => {
 }, { deep: true })
 
 onMounted(async () => {
+  winpeCapability.value = await getWinpeImportCapability().catch(() => ({ supported: false, backend: null, reason: 'capability_check_failed', version: null }))
   const draft = parseSettingsDraft(localStorage.getItem(settingsDraftStorageKey))
   const saved = draft ? null : await loadPxeConfig()
   if (draft) {
@@ -178,6 +182,10 @@ onMounted(async () => {
 })
 
 async function handleImportBootPackage() {
+  if (!pxeMediaImportSupported.value) {
+    toast.add({ title: t('settings.pxeImportWindowsOnly'), description: pxeMediaImportUnavailableReason.value, color: 'warning', icon: 'i-lucide-monitor-cog' })
+    return
+  }
   const source = await open({ directory: true, multiple: false })
   if (!source || Array.isArray(source)) return
   try {
@@ -192,6 +200,10 @@ async function handleImportBootPackage() {
 
 async function handleImportMedia() {
   if (isImportingPxeMedia.value) return
+  if (!pxeMediaImportSupported.value) {
+    toast.add({ title: t('settings.pxeImportWindowsOnly'), description: pxeMediaImportUnavailableReason.value, color: 'warning', icon: 'i-lucide-monitor-cog' })
+    return
+  }
   const source = await open({ multiple: false, filters: [{ name: 'PE boot media', extensions: ['iso', 'img'] }] })
   if (!source || Array.isArray(source)) return
   if (isUnsupportedWepeSource(source)) {
@@ -601,13 +613,14 @@ async function copyAgentCommand() {
           <UFormField :label="$t('settings.biosBootFile')"><UInput v-model="biosBootFile" :disabled="isPxeRunning" /></UFormField>
           <UFormField :label="$t('settings.uefiBootFile')"><UInput v-model="uefiX64BootFile" :disabled="isPxeRunning" /></UFormField>
           <UAlert v-if="tftpRoot && !biosBootFile" color="warning" variant="subtle" :title="$t('settings.pxeBiosUnavailable')" />
+          <UAlert v-if="!pxeMediaImportSupported" color="warning" variant="subtle" icon="i-lucide-monitor-cog" :title="$t('settings.pxeImportWindowsOnly')" :description="pxeMediaImportUnavailableReason" />
           <div v-if="tftpRoot" class="rounded-lg border border-default bg-default/70 px-3 py-2.5">
             <p class="text-[11px] font-medium text-muted">{{ $t('settings.managedPackagePath') }}</p>
             <p class="mt-1 break-all font-mono text-[11px] text-dimmed">{{ tftpRoot }}</p>
           </div>
           <div class="flex flex-wrap gap-2">
-            <UButton icon="i-lucide-folder-input" color="neutral" variant="outline" size="sm" :disabled="isPxeRunning || isImportingPxeMedia" :label="$t(tftpRoot ? 'settings.replacePxePackage' : 'settings.importPxePackage')" @click="handleImportBootPackage" />
-            <UButton data-pe-import icon="i-lucide-disc-3" :color="peSetupError ? 'error' : 'neutral'" :variant="peSetupError ? 'solid' : 'outline'" size="sm" :loading="isImportingPxeMedia" :disabled="isPxeRunning || isImportingPxeMedia" :label="$t(tftpRoot ? 'settings.replacePxeMedia' : 'settings.importPxeMedia')" @click="handleImportMedia" />
+            <UButton icon="i-lucide-folder-input" color="neutral" variant="outline" size="sm" :disabled="isPxeRunning || isImportingPxeMedia || !pxeMediaImportSupported" :label="$t(tftpRoot ? 'settings.replacePxePackage' : 'settings.importPxePackage')" @click="handleImportBootPackage" />
+            <UButton data-pe-import icon="i-lucide-disc-3" :color="peSetupError ? 'error' : 'neutral'" :variant="peSetupError ? 'solid' : 'outline'" size="sm" :loading="isImportingPxeMedia" :disabled="isPxeRunning || isImportingPxeMedia || !pxeMediaImportSupported" :label="$t(tftpRoot ? 'settings.replacePxeMedia' : 'settings.importPxeMedia')" @click="handleImportMedia" />
           </div>
           <div v-if="isPxeRunning" class="text-xs text-muted">
             DHCP: {{ runtimeStore.pxeStatus.dhcpPort || runtimeStore.pxeStatus.proxyDhcpPort }} · TFTP: {{ runtimeStore.pxeStatus.tftpPort }} · {{ $t('settings.activeLeases') }}: {{ runtimeStore.pxeStatus.activeLeases }}
