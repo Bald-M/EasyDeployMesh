@@ -19,7 +19,7 @@ import type {
 
 const initialStatus: RuntimeStatus = {
   serviceState: 'idle',
-  version: '0.2.4',
+  version: '0.2.6',
   platform: 'unknown',
   activeInterface: null,
   connectedDevices: 0,

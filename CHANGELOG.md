@@ -1,22 +1,13 @@
 # Changelog
 
-## Unreleased
-
-- Reject partition plans that cannot fit the selected target disk before job
-  creation, with per-device capacity details for batch deployment, while
-  retaining the Agent's pre-destructive capacity check.
-- Use an MBR extended partition for three-volume templates so the temporary
-  image cache does not exceed the four-primary-partition limit during restore.
-- Calculate custom-template limits and remaining-space previews from actual disk
-  bytes and deployment reserves, and include bounded command output when a
-  Windows deployment tool fails.
-
 All notable changes to EasyDeployMesh will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.2.6] - 2026-08-26
 
 ### Added
 
@@ -30,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SHA-256 capability checks.
 - A bounded, platform-independent Rust REGF module for generating canonical
   WinPE BCD stores and updating the restricted `SYSTEM\Setup\CmdLine` fallback.
+- Device operational-status classification and selection safeguards in the
+  desktop application, with matching Simplified Chinese and English messages.
 
 ### Changed
 
@@ -39,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supported for Agent-based deployment, while WePE 2.2 is unsupported because
   its vendor intentionally omits the Windows network module. Source PE media is
   never modified in place.
+- Removed GHO/GHS import and restore support. Norton Ghost is no longer
+  maintained, its proprietary image variants cannot be restored safely without
+  a supported official engine, and users must convert existing images to WIM or
+  ESD in an isolated environment before import.
+- Recorded successful full-workflow field tests for FirPE v2.1.1 and HotPE
+  v2.8.251018. USM v5F is documented as partial compatibility: it can reach the
+  PE desktop, but its external tool package is unavailable through managed PXE.
 
 ### Fixed
 
@@ -70,6 +70,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for automated deployment because its Windows network stack is absent.
 - Selected the matching cargo-xwin SDK architecture for every Windows desktop
   target so cross-building the x86 installer includes the required x86 libraries.
+- Reject partition plans that cannot fit the selected target disk before job
+  creation, with per-device capacity details for batch deployment, while
+  retaining the Agent's pre-destructive capacity check.
+- Use an MBR extended partition for three-volume templates so the temporary
+  image cache does not exceed the four-primary-partition limit during restore.
+- Calculate custom-template limits and remaining-space previews from actual disk
+  bytes and deployment reserves, and include bounded command output when a
+  Windows deployment tool fails.
+- Import USM v5F only when its selected WIM and renamed Windows Boot Manager
+  generation match. Preserve its `SC6`, `nointegritychecks`, and `testsigning`
+  boot requirements without weakening the standard WinPE path.
 
 ## [0.2.4] - 2026-08-18
 
@@ -116,5 +127,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The HTTP control channel is intended only for trusted, isolated local networks
   until TLS and certificate pinning are implemented.
 
-[Unreleased]: https://github.com/Bald-M/EasyDeployMesh/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/Bald-M/EasyDeployMesh/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/Bald-M/EasyDeployMesh/releases/tag/v0.2.6
 [0.2.4]: https://github.com/Bald-M/EasyDeployMesh/releases/tag/v0.2.4

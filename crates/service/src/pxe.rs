@@ -1355,7 +1355,7 @@ mod tests {
 
     #[test]
     fn clean_winpe_bcd_targets_the_managed_ramdisk_image() {
-        let commands = winpe_bcd_commands(WINPE_STANDARD_LOADER_PATH)
+        let commands = winpe_bcd_commands(WINPE_STANDARD_LOADER_PATH, WinpeBcdPolicy::Standard)
             .into_iter()
             .map(|command| command.join(" "))
             .collect::<Vec<_>>()
@@ -1368,6 +1368,8 @@ mod tests {
         assert!(commands.contains("winpe Yes"));
         assert!(commands.contains(&format!("default {WINPE_LOADER_ID}")));
         assert!(!commands.to_ascii_lowercase().contains("grldr"));
+        assert!(!commands.contains("nointegritychecks"));
+        assert!(!commands.contains("testsigning"));
     }
 
     #[test]
@@ -1467,7 +1469,8 @@ mod tests {
             winpe_loader_path_from_listing(listing),
             Some(WINPE_SYSTEM32_BOOT_LOADER_PATH)
         );
-        let commands = winpe_bcd_commands(WINPE_SYSTEM32_BOOT_LOADER_PATH);
+        let commands =
+            winpe_bcd_commands(WINPE_SYSTEM32_BOOT_LOADER_PATH, WinpeBcdPolicy::Standard);
         assert!(commands.iter().any(|command| {
             command
                 == &[
@@ -1576,6 +1579,81 @@ mod tests {
     }
 
     #[test]
+    fn usm_package_uses_the_boot_manager_matching_the_selected_wim() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("BOOT")).unwrap();
+        std::fs::write(
+            source.path().join("BOOT/USM1PE6F.WIM"),
+            br"\Windows\System32\Boot\winload.exe",
+        )
+        .unwrap();
+        std::fs::write(source.path().join("BOOT/boot.sdi"), b"sdi").unwrap();
+        std::fs::write(source.path().join("GRLDR"), b"grldr").unwrap();
+        let mut matching_bootmgr = vec![0_u8; 64 * 1024];
+        let marker = b"BOOTMGR image is corrupt.  The system cannot boot.\0The Windows Boot Manager is incompatible with this system.";
+        matching_bootmgr[..marker.len()].copy_from_slice(marker);
+        std::fs::write(source.path().join("BOOT/USM6MGR"), &matching_bootmgr).unwrap();
+        std::fs::write(
+            source.path().join("BOOT/USM8MGR"),
+            b"MZ\0different Windows Boot Manager",
+        )
+        .unwrap();
+        let parent = tempfile::tempdir().unwrap();
+
+        let package =
+            build_winpe_package(source.path(), &parent.path().join("managed"), None).unwrap();
+
+        assert_eq!(
+            std::fs::read(Path::new(&package.root).join("boot/bootmgr")).unwrap(),
+            matching_bootmgr
+        );
+        let script = std::fs::read_to_string(Path::new(&package.root).join("boot.ipxe")).unwrap();
+        assert!(script.contains("initrd --name SC6 boot/easydeploymesh.bcd SC6"));
+        let bcd = std::fs::read_to_string(Path::new(&package.root).join("boot/BCD")).unwrap();
+        assert!(bcd.contains("{bootmgr} nointegritychecks Yes"));
+        assert!(bcd.contains(&format!("{WINPE_LOADER_ID} testsigning Yes")));
+        assert!(
+            Path::new(&package.root)
+                .join(USM_MANAGED_LAYOUT_MARKER)
+                .is_file()
+        );
+
+        BootPackage::ensure_managed_network_boot(&package.root).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&package.root).join("boot.ipxe")).unwrap(),
+            USM_MANAGED_IPXE_SCRIPT
+        );
+        let refreshed_bcd =
+            std::fs::read_to_string(Path::new(&package.root).join("boot/easydeploymesh.bcd"))
+                .unwrap();
+        assert!(refreshed_bcd.contains("{bootmgr} nointegritychecks Yes"));
+        assert!(refreshed_bcd.contains(&format!("{WINPE_LOADER_ID} testsigning Yes")));
+    }
+
+    #[test]
+    fn usm_package_rejects_a_boot_manager_for_a_different_wim_generation() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("BOOT")).unwrap();
+        std::fs::write(
+            source.path().join("BOOT/USM1PE6F.WIM"),
+            br"\Windows\System32\Boot\winload.exe",
+        )
+        .unwrap();
+        std::fs::write(source.path().join("BOOT/boot.sdi"), b"sdi").unwrap();
+        std::fs::write(source.path().join("GRLDR"), b"grldr").unwrap();
+        let mut mismatched_bootmgr = vec![0_u8; 64 * 1024];
+        let marker = b"BOOTMGR image is corrupt.  The system cannot boot.\0The Windows Boot Manager is incompatible with this system.";
+        mismatched_bootmgr[..marker.len()].copy_from_slice(marker);
+        std::fs::write(source.path().join("BOOT/USM8MGR"), mismatched_bootmgr).unwrap();
+        let parent = tempfile::tempdir().unwrap();
+
+        let error = build_winpe_package(source.path(), &parent.path().join("managed"), None)
+            .expect_err("a mismatched USM boot manager must fail closed");
+
+        assert!(error.to_string().contains("no matching Windows bootmgr"));
+    }
+
+    #[test]
     fn ipxe_and_wimboot_are_configured_for_bios_and_uefi() {
         let source = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(source.path().join("boot/grub")).unwrap();
@@ -1658,6 +1736,35 @@ mod tests {
                 .lines()
                 .any(|line| line == "initrd --name bootmgr boot/bootmgr bootmgr"),
             "EasyU's WIM has no embedded bootmgr.exe, so wimboot must receive the source bootmgr"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires EASYDEPLOYMESH_USM_ISO to point to USM v5F"]
+    fn imports_real_usm_v5f_with_its_matching_renamed_boot_manager() {
+        let source = std::env::var("EASYDEPLOYMESH_USM_ISO")
+            .expect("EASYDEPLOYMESH_USM_ISO must point to the external ISO sample");
+        let parent = tempfile::tempdir().unwrap();
+
+        let package = BootPackage::import_media(&source, parent.path().join("managed")).unwrap();
+        let root = Path::new(&package.root);
+        let bootmgr = std::fs::read(root.join("boot/bootmgr")).unwrap();
+
+        assert!(root.join("boot/boot.wim").is_file());
+        assert!(root.join("boot/BCD").is_file());
+        assert!(is_windows_boot_manager(&root.join("boot/bootmgr")));
+        let bcd = std::fs::read_to_string(root.join("boot/BCD")).unwrap();
+        assert!(bcd.contains("{bootmgr} nointegritychecks Yes"));
+        assert!(bcd.contains(&format!("{WINPE_LOADER_ID} testsigning Yes")));
+        assert!(
+            std::fs::read_to_string(root.join("boot.ipxe"))
+                .unwrap()
+                .contains("initrd --name SC6 boot/easydeploymesh.bcd SC6")
+        );
+        assert!(
+            bootmgr
+                .windows(b"BOOTMGR image is corrupt".len())
+                .any(|window| window == b"BOOTMGR image is corrupt")
         );
     }
 
@@ -1915,8 +2022,11 @@ use axum::{
     routing::get,
 };
 use chrono::{DateTime, Duration, Utc};
+use easydeploymesh_bcd::WinpeBcdPolicy;
 #[cfg(all(target_os = "macos", not(test)))]
-use easydeploymesh_bcd::{create_winpe_bcd, replace_setup_cmdline, validate_winpe_bcd};
+use easydeploymesh_bcd::{
+    create_winpe_bcd_with_policy, replace_setup_cmdline, validate_winpe_bcd_with_policy,
+};
 use easydeploymesh_core::{
     ActivitySeverity, ActivitySource, ActivitySubject, Architecture, PxeClientStage, PxeConfig,
     PxeDiscoveredClient, PxeMode, PxeServiceStatus,
@@ -1969,6 +2079,7 @@ const V4_MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v4";
 const V5_MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v5";
 const MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v6";
 const EDGELESS_MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-edgeless-pxe";
+const USM_MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-usm-pxe";
 const LEGACY_NATIVE_ISO_LAYOUT_MARKER: &str = ".easydeploymesh-native-iso-layout-v1";
 const NATIVE_ISO_LAYOUT_MARKER: &str = ".easydeploymesh-native-iso-layout-v2";
 const NATIVE_ISO_PATH: &str = "boot/native.iso";
@@ -1979,6 +2090,7 @@ const BROKEN_NAMED_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\nini
 const V3_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name bootmgr boot/bootmgr bootmgr\ninitrd --name BCD boot/BCD BCD\ninitrd --name boot.sdi boot/boot.sdi boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim boot.wim\nboot\n";
 const V4_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name bootmgr boot/bootmgr bootmgr\ninitrd --name BCD boot/easydeploymesh.bcd BCD\ninitrd --name boot.sdi boot/boot.sdi boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim boot.wim\nboot\n";
 const V5_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name BCD boot/easydeploymesh.bcd BCD\ninitrd --name boot.sdi boot/boot.sdi boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim boot.wim\nboot\n";
+const USM_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name bootmgr boot/bootmgr bootmgr\ninitrd --name BCD boot/easydeploymesh.bcd BCD\ninitrd --name SC6 boot/easydeploymesh.bcd SC6\ninitrd --name boot.sdi boot/boot.sdi boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim boot.wim\nboot\n";
 const MANAGED_IPXE_SCRIPT: &str = V4_MANAGED_IPXE_SCRIPT;
 const EDGELESS_MANAGED_IPXE_SCRIPT: &str = V5_MANAGED_IPXE_SCRIPT;
 const DHCP_SERVER_PORT: u16 = 67;
@@ -2093,6 +2205,7 @@ impl BootPackage {
                 || bytes == V4_MANAGED_IPXE_SCRIPT.as_bytes()
                 || bytes == V5_MANAGED_IPXE_SCRIPT.as_bytes()
                 || bytes == EDGELESS_MANAGED_IPXE_SCRIPT.as_bytes()
+                || bytes == USM_MANAGED_IPXE_SCRIPT.as_bytes()
         ) || ![
             "boot/boot.sdi",
             "boot/boot.wim",
@@ -2108,7 +2221,12 @@ impl BootPackage {
         let replacement = root
             .join("boot")
             .join(format!(".BCD-{}", uuid::Uuid::new_v4()));
-        if let Err(error) = write_clean_winpe_bcd(&replacement, loader_path) {
+        let bcd_policy = if root.join(USM_MANAGED_LAYOUT_MARKER).is_file() {
+            WinpeBcdPolicy::UsmLegacy
+        } else {
+            WinpeBcdPolicy::Standard
+        };
+        if let Err(error) = write_clean_winpe_bcd(&replacement, loader_path, bcd_policy) {
             let _ = fs::remove_file(replacement);
             return Err(error);
         }
@@ -2136,6 +2254,8 @@ impl BootPackage {
         fs::write(root.join("boot/wimboot"), EMBEDDED_WIMBOOT)?;
         let script = if root.join(EDGELESS_MANAGED_LAYOUT_MARKER).is_file() {
             EDGELESS_MANAGED_IPXE_SCRIPT
+        } else if root.join(USM_MANAGED_LAYOUT_MARKER).is_file() {
+            USM_MANAGED_IPXE_SCRIPT
         } else {
             MANAGED_IPXE_SCRIPT
         };
@@ -2943,10 +3063,15 @@ fn build_winpe_package_with_native_iso(
         }
     };
     let loader_path = detect_winpe_loader_path(wim)?;
-    let bootmgr = find_named(&files, "bootmgr").ok_or_else(|| {
+    let named_bootmgr = find_named(&files, "bootmgr");
+    let usm_bootmgr = named_bootmgr
+        .is_none()
+        .then(|| find_usm_bootmgr_for_wim(extracted, &files, wim))
+        .flatten();
+    let bootmgr = named_bootmgr.or(usm_bootmgr).ok_or_else(|| {
         if find_named(&files, "grldr").is_some() {
             PxeServiceError::InvalidConfig(
-                "this EasyU media contains GRLDR but no Windows bootmgr; GRLDR cannot safely replace bootmgr for the managed BIOS/UEFI wimboot package".into(),
+                "this WinPE media contains GRLDR but no matching Windows bootmgr; GRLDR cannot safely replace bootmgr for the managed BIOS/UEFI wimboot package".into(),
             )
         } else {
             PxeServiceError::MissingBootFile("bootmgr".into())
@@ -2963,7 +3088,12 @@ fn build_winpe_package_with_native_iso(
     let populate = (|| -> Result<(), PxeServiceError> {
         fs::create_dir_all(staging.join("boot"))?;
         let bios_bcd = staging.join("boot/BCD");
-        write_clean_winpe_bcd(&bios_bcd, loader_path)?;
+        let bcd_policy = if usm_bootmgr.is_some() {
+            WinpeBcdPolicy::UsmLegacy
+        } else {
+            WinpeBcdPolicy::Standard
+        };
+        write_clean_winpe_bcd(&bios_bcd, loader_path, bcd_policy)?;
         fs::copy(&bios_bcd, staging.join("boot/easydeploymesh.bcd"))?;
         let staged_wim = staging.join("boot/boot.wim");
         fs::copy(wim, &staged_wim)?;
@@ -2983,6 +3113,9 @@ fn build_winpe_package_with_native_iso(
             let script = if edgeless_payload.is_some() {
                 fs::write(staging.join(EDGELESS_MANAGED_LAYOUT_MARKER), b"1\n")?;
                 EDGELESS_MANAGED_IPXE_SCRIPT
+            } else if usm_bootmgr.is_some() {
+                fs::write(staging.join(USM_MANAGED_LAYOUT_MARKER), b"1\n")?;
+                USM_MANAGED_IPXE_SCRIPT
             } else {
                 MANAGED_IPXE_SCRIPT
             };
@@ -3879,8 +4012,8 @@ fn detect_winpe_loader_path(_wim: &Path) -> Result<&'static str, PxeServiceError
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn winpe_bcd_commands(loader_path: &'static str) -> Vec<Vec<&'static str>> {
-    vec![
+fn winpe_bcd_commands(loader_path: &'static str, policy: WinpeBcdPolicy) -> Vec<Vec<&'static str>> {
+    let mut commands = vec![
         vec![
             "/create",
             "{ramdiskoptions}",
@@ -3912,13 +4045,22 @@ fn winpe_bcd_commands(loader_path: &'static str) -> Vec<Vec<&'static str>> {
         vec!["/set", "{bootmgr}", "timeout", "0"],
         vec!["/set", "{bootmgr}", "default", WINPE_LOADER_ID],
         vec!["/displayorder", WINPE_LOADER_ID, "/addlast"],
-    ]
+    ];
+    if policy == WinpeBcdPolicy::UsmLegacy {
+        commands.push(vec!["/set", "{bootmgr}", "nointegritychecks", "Yes"]);
+        commands.push(vec!["/set", WINPE_LOADER_ID, "testsigning", "Yes"]);
+    }
+    commands
 }
 
 #[cfg(all(target_os = "windows", not(test)))]
-fn write_clean_winpe_bcd(path: &Path, loader_path: &'static str) -> Result<(), PxeServiceError> {
+fn write_clean_winpe_bcd(
+    path: &Path,
+    loader_path: &'static str,
+    policy: WinpeBcdPolicy,
+) -> Result<(), PxeServiceError> {
     run_bcdedit(path, &["/createstore"])?;
-    for command in winpe_bcd_commands(loader_path) {
+    for command in winpe_bcd_commands(loader_path, policy) {
         run_bcdedit(path, &command)?;
     }
     if fs::metadata(path)
@@ -3952,11 +4094,15 @@ fn write_clean_winpe_bcd(path: &Path, loader_path: &'static str) -> Result<(), P
 }
 
 #[cfg(all(target_os = "macos", not(test)))]
-fn write_clean_winpe_bcd(path: &Path, loader_path: &'static str) -> Result<(), PxeServiceError> {
-    let bytes = create_winpe_bcd(loader_path).map_err(|error| {
+fn write_clean_winpe_bcd(
+    path: &Path,
+    loader_path: &'static str,
+    policy: WinpeBcdPolicy,
+) -> Result<(), PxeServiceError> {
+    let bytes = create_winpe_bcd_with_policy(loader_path, policy).map_err(|error| {
         PxeServiceError::InvalidConfig(format!("could not create WinPE BCD: {error}"))
     })?;
-    validate_winpe_bcd(&bytes, loader_path).map_err(|error| {
+    validate_winpe_bcd_with_policy(&bytes, loader_path, policy).map_err(|error| {
         PxeServiceError::InvalidConfig(format!("could not validate WinPE BCD: {error}"))
     })?;
     let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
@@ -4035,8 +4181,12 @@ fn command_output_text(output: &[u8]) -> String {
 }
 
 #[cfg(test)]
-fn write_clean_winpe_bcd(path: &Path, loader_path: &'static str) -> Result<(), PxeServiceError> {
-    let commands = winpe_bcd_commands(loader_path)
+fn write_clean_winpe_bcd(
+    path: &Path,
+    loader_path: &'static str,
+    policy: WinpeBcdPolicy,
+) -> Result<(), PxeServiceError> {
+    let commands = winpe_bcd_commands(loader_path, policy)
         .into_iter()
         .map(|command| command.join(" "))
         .collect::<Vec<_>>()
@@ -4046,7 +4196,11 @@ fn write_clean_winpe_bcd(path: &Path, loader_path: &'static str) -> Result<(), P
 }
 
 #[cfg(all(not(any(target_os = "windows", target_os = "macos")), not(test)))]
-fn write_clean_winpe_bcd(_path: &Path, _loader_path: &'static str) -> Result<(), PxeServiceError> {
+fn write_clean_winpe_bcd(
+    _path: &Path,
+    _loader_path: &'static str,
+    _policy: WinpeBcdPolicy,
+) -> Result<(), PxeServiceError> {
     Err(PxeServiceError::InvalidConfig(
         "creating a Legacy BIOS WinPE package requires Windows bcdedit.exe".into(),
     ))
@@ -4088,6 +4242,65 @@ fn find_named<'a>(files: &'a [PathBuf], name: &str) -> Option<&'a PathBuf> {
                 .is_some_and(|value| value.eq_ignore_ascii_case(name))
         })
         .min_by_key(|path| path.components().count())
+}
+
+fn find_usm_bootmgr_for_wim<'a>(
+    extracted: &Path,
+    files: &'a [PathBuf],
+    wim: &Path,
+) -> Option<&'a PathBuf> {
+    let relative_wim = wim.strip_prefix(extracted).ok()?;
+    let parent = relative_wim.parent()?;
+    if !path_components_eq_ascii_case_insensitive(parent, &["boot"]) {
+        return None;
+    }
+    let stem = relative_wim.file_stem()?.to_str()?.to_ascii_uppercase();
+    if !stem.starts_with("USM") {
+        return None;
+    }
+    let generation = stem
+        .split_once("PE")?
+        .1
+        .chars()
+        .next()
+        .filter(|value| matches!(value, '6' | '8'))?;
+    let expected_name = format!("USM{generation}MGR");
+    let candidate = files.iter().find(|path| {
+        path.strip_prefix(extracted).is_ok_and(|relative| {
+            relative
+                .parent()
+                .is_some_and(|parent| path_components_eq_ascii_case_insensitive(parent, &["boot"]))
+                && relative
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case(&expected_name))
+        })
+    })?;
+    is_windows_boot_manager(candidate).then_some(candidate)
+}
+
+fn is_windows_boot_manager(path: &Path) -> bool {
+    const MIN_BOOT_MANAGER_BYTES: u64 = 64 * 1024;
+    const MAX_BOOT_MANAGER_BYTES: u64 = 2 * 1024 * 1024;
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() < MIN_BOOT_MANAGER_BYTES || metadata.len() > MAX_BOOT_MANAGER_BYTES {
+        return false;
+    }
+    let Ok(contents) = fs::read(path) else {
+        return false;
+    };
+    [
+        b"BOOTMGR image is corrupt".as_slice(),
+        b"The Windows Boot Manager is incompatible with this system".as_slice(),
+    ]
+    .iter()
+    .all(|marker| {
+        contents
+            .windows(marker.len())
+            .any(|window| window == *marker)
+    })
 }
 
 fn is_private_wepe_layout(extracted: &Path) -> bool {

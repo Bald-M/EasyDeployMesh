@@ -13,7 +13,7 @@ import type { ActivityEvent, ActivityQuery } from '~/types/runtime'
 
 const browserRuntime: RuntimeStatus = {
   serviceState: 'idle',
-  version: '0.2.4',
+  version: '0.2.6',
   platform: 'browser',
   activeInterface: null,
   connectedDevices: 0,
