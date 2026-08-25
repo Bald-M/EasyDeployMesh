@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { openExternalUrl } from '~/services/external'
+
 const route = useRoute()
 const { t } = useI18n()
 const { currentLocale, changeLocale } = useAppLocale()
@@ -7,6 +9,7 @@ const imageStore = useImageStore()
 const jobStore = useJobStore()
 const deviceStore = useDeviceStore()
 let refreshTimer: ReturnType<typeof setInterval> | undefined
+const repositoryUrl = 'https://github.com/Bald-M/EasyDeployMesh'
 
 const globalRefreshLoading = computed(() =>
   runtimeStore.loading
@@ -173,6 +176,13 @@ onBeforeUnmount(() => {
             aria-label="Language"
           />
           <UColorModeButton color="neutral" variant="ghost" />
+          <UButton
+            icon="i-simple-icons-github"
+            color="neutral"
+            variant="ghost"
+            aria-label="GitHub"
+            @click="openExternalUrl(repositoryUrl)"
+          />
           <UButton
             icon="i-lucide-refresh-cw"
             color="neutral"

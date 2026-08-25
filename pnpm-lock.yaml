@@ -25,6 +25,9 @@ importers:
       '@tauri-apps/plugin-dialog':
         specifier: ^2.4.0
         version: 2.7.2
+      '@tauri-apps/plugin-opener':
+        specifier: ^2.5.4
+        version: 2.5.4
       nuxt:
         specifier: ^4.5.0
         version: 4.5.0(@babel/plugin-syntax-jsx@7.29.7(@babel/core@7.29.7))(@babel/plugin-syntax-typescript@7.29.7(@babel/core@7.29.7))(@types/node@26.1.1)(@vue/compiler-sfc@3.5.40)(db0@0.3.4)(esbuild@0.28.1)(eslint@10.7.0(jiti@2.7.0))(ioredis@5.11.1)(lightningcss@1.33.0)(magicast@0.5.3)(optionator@0.9.4)(oxc-parser@0.140.0)(pinia@4.0.2(@vue/devtools-api@8.1.5)(typescript@6.0.3)(vue@3.5.40(typescript@6.0.3)))(rollup-plugin-visualizer@7.0.1(rolldown@1.2.0)(rollup@4.62.2))(rollup@4.62.2)(srvx@0.11.22)(terser@5.49.0)(typescript@6.0.3)(vite@8.1.5(@types/node@26.1.1)(esbuild@0.28.1)(jiti@2.7.0)(terser@5.49.0)(yaml@2.9.0))(vue-tsc@3.3.8(typescript@6.0.3))(yaml@2.9.0)
@@ -38,6 +41,9 @@ importers:
       '@iconify-json/lucide':
         specifier: ^1.2.118
         version: 1.2.118
+      '@iconify-json/simple-icons':
+        specifier: ^1.2.93
+        version: 1.2.93
       '@nuxt/test-utils':
         specifier: ^4.0.3
         version: 4.0.3(@vue/test-utils@2.4.11(@vue/compiler-dom@3.5.40)(@vue/server-renderer@3.5.40)(vue@3.5.40(typescript@6.0.3)))(crossws@0.4.10(srvx@0.11.22))(esbuild@0.28.1)(happy-dom@20.11.0)(magicast@0.5.3)(rolldown@1.2.0)(rollup@4.62.2)(typescript@6.0.3)(vite@8.1.5(@types/node@26.1.1)(esbuild@0.28.1)(jiti@2.7.0)(terser@5.49.0)(yaml@2.9.0))(vitest@4.1.10(@types/node@26.1.1)(happy-dom@20.11.0)(vite@8.1.5(@types/node@26.1.1)(esbuild@0.28.1)(jiti@2.7.0)(terser@5.49.0)(yaml@2.9.0)))
@@ -814,6 +820,9 @@ packages:
 
   '@iconify-json/lucide@1.2.118':
     resolution: {integrity: sha512-JBnK4YOq6K/lA0JP//27QxFxJ4120TjvfXAzGZZIGjCcXcRRRFxl1rcV7+IWdcVCe90KXdqVaAwLaLf6G3HELw==}
+
+  '@iconify-json/simple-icons@1.2.93':
+    resolution: {integrity: sha512-/XhANjfGYOuqvSR3TmUnkQkINvQ4GVjVuukvymRbxtVFBvIq/yiXJqCDycKcQPT401OYT9H2vIY6ihAlz1QIAw==}
 
   '@iconify/collections@1.0.713':
     resolution: {integrity: sha512-IRuFajJYQ/DfU+Dj5ZJwOXmP41UEjao7H77Kn398v6geqqaYGo0DqvatwChssN90Si9V5O/B824r6QHN2MojVQ==}
@@ -2103,6 +2112,9 @@ packages:
 
   '@tauri-apps/plugin-dialog@2.7.2':
     resolution: {integrity: sha512-pX0IGm1I3I6wc+zeKYcq1GSqogK6okCNX5fOdaNU5ab1AjGS6l1E5wFNjEb7meg7ZFSp0JUs+0jQGQNyOvLrsg==}
+
+  '@tauri-apps/plugin-opener@2.5.4':
+    resolution: {integrity: sha512-1HnPkb+AmgO29HBazm4uPLKB+r7zzcTBW1d0fyYp1uP+jwtpoiNDGKMMzz58SFp49nOIrxdE3aUJtT57lfO9CQ==}
 
   '@tiptap/core@3.28.0':
     resolution: {integrity: sha512-gUuD5WAYfbDxNSSJya/emh2KSzXZXLUYKW4fEnc1AQ5FE2twzh4LJ9UlKFIawigrUCAksWI5Fy1hRbv+5m4ZdQ==}
@@ -6162,6 +6174,10 @@ snapshots:
     dependencies:
       '@iconify/types': 2.0.0
 
+  '@iconify-json/simple-icons@1.2.93':
+    dependencies:
+      '@iconify/types': 2.0.0
+
   '@iconify/collections@1.0.713':
     dependencies:
       '@iconify/types': 2.0.0
@@ -7641,6 +7657,10 @@ snapshots:
       '@tauri-apps/cli-win32-x64-msvc': 2.11.4
 
   '@tauri-apps/plugin-dialog@2.7.2':
+    dependencies:
+      '@tauri-apps/api': 2.11.1
+
+  '@tauri-apps/plugin-opener@2.5.4':
     dependencies:
       '@tauri-apps/api': 2.11.1
 
