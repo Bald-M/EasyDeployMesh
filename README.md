@@ -265,16 +265,18 @@ issue. Follow the private-reporting guidance in [CONTRIBUTING.md](CONTRIBUTING.m
 ## WinPE field acceptance
 
 <details>
-<summary><strong>Windows / EasyU WinPE field acceptance procedure</strong></summary>
+<summary><strong>Windows / third-party WinPE field acceptance procedure</strong></summary>
 
 When the control service starts, EasyDeployMesh uses SHA-256 markers for the
 Agent and complete WinPE runtime to check and refresh an imported `boot.wim`.
-After upgrading from an older release, reimport the EasyU PE media once to
-eliminate uncertainty caused by stale packages, boot chains, or incomplete
-imports.
+After upgrading from an older release, reimport the selected PE media once to
+eliminate uncertainty caused by stale packages, boot chains, media-specific
+Boot Manager policies, or incomplete imports. In particular, EasyU 3.6 needs
+its source `bootmgr`, while Edgeless Beta 4.1.0 must use the compatible Boot
+Manager embedded in its WIM.
 
 1. Keep the control service running in **Settings**, stop **only the PXE
-   service**, and reimport the EasyU PE media from the PXE page.
+   service**, and reimport the EasyU or Edgeless PE media from the PXE page.
 2. Leave PXE stopped and run the package verifier from the repository root in
    an elevated PowerShell session:
 

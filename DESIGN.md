@@ -265,10 +265,14 @@ UDF filesystem fails with a compatibility error instead of being mistaken for
 ISO media without a WinPE WIM. Import occurs in a temporary directory and
 replaces the managed boot tree only after the new package is complete. Standard
 media uses bundled iPXE chainloaders for both BIOS and UEFI x64; both paths then
-load the same `boot.ipxe`, wimboot, generated BCD, WIM, and SDI. WIMboot selects
-the matching BIOS or UEFI Boot Manager embedded in the WIM instead of receiving
-a potentially vendor-patched `bootmgr` from the source media. Vendor EFI
-executables and vendor-specific BCD references are not retained in that
+load the same `boot.ipxe`, wimboot, generated BCD, WIM, and SDI. Standard media,
+including EasyU 3.6, supplies its source `bootmgr` because some customized WIMs
+do not embed `bootmgr.exe`. Edgeless Beta 4.1.0 is identified from its required
+external resource layout and instead lets wimboot select the matching BIOS or
+UEFI Boot Manager embedded in the WIM; its vendor-patched source `bootmgr`
+requires a nonstandard `\Boot\BCF` store. This per-media policy is persisted in
+the managed package and retained when network loaders are refreshed. Vendor EFI
+executables and vendor-specific BCD references are not retained in either
 normalized boot chain. The managed BCD is regenerated and
 validated before each PXE service start; the layout marker records the package
 revision but is not trusted as a substitute for validating current BCD content.

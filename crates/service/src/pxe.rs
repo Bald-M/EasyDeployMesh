@@ -1035,7 +1035,7 @@ mod tests {
             .lines()
             .filter(|line| line.starts_with("initrd "))
             .collect::<Vec<_>>();
-        assert_eq!(initrds.len(), 4);
+        assert_eq!(initrds.len(), 5);
         for line in initrds {
             let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
             assert_eq!(fields.len(), 5, "invalid dual-mode initrd line: {line}");
@@ -1045,12 +1045,13 @@ mod tests {
             assert!(!fields[2].contains('/'));
         }
         assert!(MANAGED_IPXE_SCRIPT.contains("initrd --name BCD boot/easydeploymesh.bcd BCD"));
+        assert!(MANAGED_IPXE_SCRIPT.contains("initrd --name bootmgr boot/bootmgr bootmgr"));
         assert!(!MANAGED_IPXE_SCRIPT.contains("--name BCD boot/BCD BCD"));
     }
 
     #[test]
-    fn managed_ipxe_lets_wimboot_select_the_boot_manager_from_the_wim() {
-        assert!(!MANAGED_IPXE_SCRIPT.lines().any(|line| {
+    fn edgeless_ipxe_lets_wimboot_select_the_boot_manager_from_the_wim() {
+        assert!(!EDGELESS_MANAGED_IPXE_SCRIPT.lines().any(|line| {
             line.starts_with("initrd ")
                 && line.split_ascii_whitespace().any(|field| {
                     matches!(
@@ -1059,9 +1060,15 @@ mod tests {
                     )
                 })
         }));
-        assert!(MANAGED_IPXE_SCRIPT.contains("initrd --name BCD boot/easydeploymesh.bcd BCD"));
-        assert!(MANAGED_IPXE_SCRIPT.contains("initrd --name boot.sdi boot/boot.sdi boot.sdi"));
-        assert!(MANAGED_IPXE_SCRIPT.contains("initrd --name boot.wim boot/boot.wim boot.wim"));
+        assert!(
+            EDGELESS_MANAGED_IPXE_SCRIPT.contains("initrd --name BCD boot/easydeploymesh.bcd BCD")
+        );
+        assert!(
+            EDGELESS_MANAGED_IPXE_SCRIPT.contains("initrd --name boot.sdi boot/boot.sdi boot.sdi")
+        );
+        assert!(
+            EDGELESS_MANAGED_IPXE_SCRIPT.contains("initrd --name boot.wim boot/boot.wim boot.wim")
+        );
     }
 
     #[test]
@@ -1100,7 +1107,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_package_stops_loading_the_vendor_boot_manager() {
+    fn v4_package_is_upgraded_to_supply_the_source_boot_manager() {
         let package = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(package.path().join("boot")).unwrap();
         for (path, bytes) in [
@@ -1121,11 +1128,64 @@ mod tests {
             std::fs::read_to_string(package.path().join("boot.ipxe")).unwrap(),
             MANAGED_IPXE_SCRIPT
         );
+        assert!(MANAGED_IPXE_SCRIPT.contains("initrd --name bootmgr boot/bootmgr bootmgr"));
         assert!(!package.path().join(V4_MANAGED_LAYOUT_MARKER).exists());
         assert_eq!(
             std::fs::read_to_string(package.path().join(MANAGED_LAYOUT_MARKER)).unwrap(),
-            "5\n"
+            "6\n"
         );
+    }
+
+    #[test]
+    fn ambiguous_v5_package_requires_reimport_instead_of_guessing_its_boot_manager_policy() {
+        let package = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(package.path().join("boot")).unwrap();
+        for (path, bytes) in [
+            ("boot/boot.sdi", b"sdi".as_slice()),
+            ("boot/boot.wim", br"\Windows\System32\winload.exe"),
+            ("boot/bootmgr", b"unknown-vendor-bootmgr"),
+            ("boot/wimboot", b"wimboot"),
+        ] {
+            std::fs::write(package.path().join(path), bytes).unwrap();
+        }
+        std::fs::write(package.path().join("boot.ipxe"), V5_MANAGED_IPXE_SCRIPT).unwrap();
+        std::fs::write(package.path().join(V5_MANAGED_LAYOUT_MARKER), b"5\n").unwrap();
+
+        let error = BootPackage::ensure_managed_network_boot(package.path()).unwrap_err();
+
+        assert!(error.to_string().contains(
+            "managed PXE package version 5 cannot identify whether its source boot manager is safe"
+        ));
+    }
+
+    #[test]
+    fn current_edgeless_package_keeps_its_embedded_boot_manager_policy_on_refresh() {
+        let package = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(package.path().join("boot")).unwrap();
+        for (path, bytes) in [
+            ("boot/BCD", b"bcd".as_slice()),
+            ("boot/boot.sdi", b"sdi"),
+            ("boot/boot.wim", br"\Windows\System32\boot\winload.exe"),
+            ("boot/bootmgr", b"edgeless-vendor-bootmgr"),
+            ("boot/wimboot", b"wimboot"),
+        ] {
+            std::fs::write(package.path().join(path), bytes).unwrap();
+        }
+        std::fs::write(
+            package.path().join("boot.ipxe"),
+            EDGELESS_MANAGED_IPXE_SCRIPT,
+        )
+        .unwrap();
+        std::fs::write(package.path().join(MANAGED_LAYOUT_MARKER), b"6\n").unwrap();
+        std::fs::write(package.path().join(EDGELESS_MANAGED_LAYOUT_MARKER), b"1\n").unwrap();
+
+        assert!(BootPackage::ensure_managed_network_boot(package.path()).unwrap());
+
+        assert_eq!(
+            std::fs::read_to_string(package.path().join("boot.ipxe")).unwrap(),
+            EDGELESS_MANAGED_IPXE_SCRIPT
+        );
+        assert!(!EDGELESS_MANAGED_IPXE_SCRIPT.contains("boot/bootmgr"));
     }
 
     #[test]
@@ -1582,6 +1642,26 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires EASYDEPLOYMESH_EASYU_ISO to point to EasyU 3.6"]
+    fn real_easyu_package_supplies_bootmgr_when_the_wim_does_not_embed_it() {
+        let source = std::env::var("EASYDEPLOYMESH_EASYU_ISO")
+            .expect("EASYDEPLOYMESH_EASYU_ISO must point to the external ISO sample");
+        let parent = tempfile::tempdir().unwrap();
+
+        let package = BootPackage::import_media(&source, parent.path().join("managed")).unwrap();
+        let root = Path::new(&package.root);
+        let script = std::fs::read_to_string(root.join("boot.ipxe")).unwrap();
+
+        assert!(root.join("boot/bootmgr").is_file());
+        assert!(
+            script
+                .lines()
+                .any(|line| line == "initrd --name bootmgr boot/bootmgr bootmgr"),
+            "EasyU's WIM has no embedded bootmgr.exe, so wimboot must receive the source bootmgr"
+        );
+    }
+
+    #[test]
     #[ignore = "requires EASYDEPLOYMESH_EDGELESS_ISO to point to Edgeless Beta 4.1.0"]
     fn imports_real_edgeless_beta_4_1_0_from_its_udf_view() {
         let source = std::env::var("EASYDEPLOYMESH_EDGELESS_ISO")
@@ -1608,11 +1688,13 @@ mod tests {
         assert!(root.join("ipxe.efi").is_file());
         let script = std::fs::read_to_string(root.join("boot.ipxe")).unwrap();
         assert!(!script.lines().any(|line| line.contains("boot/bootmgr")));
+        assert_eq!(script, EDGELESS_MANAGED_IPXE_SCRIPT);
         assert!(script.contains("boot/easydeploymesh.bcd BCD"));
         assert_eq!(
             std::fs::read_to_string(root.join(MANAGED_LAYOUT_MARKER)).unwrap(),
-            "5\n"
+            "6\n"
         );
+        assert!(root.join(EDGELESS_MANAGED_LAYOUT_MARKER).is_file());
     }
 
     #[test]
@@ -1879,7 +1961,9 @@ const EMBEDDED_IPXE_EFI: &[u8] = include_bytes!("../assets/ipxe/ipxe.efi");
 const LEGACY_MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v2";
 const V3_MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v3";
 const V4_MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v4";
-const MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v5";
+const V5_MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v5";
+const MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-pxe-layout-v6";
+const EDGELESS_MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-edgeless-pxe";
 const LEGACY_NATIVE_ISO_LAYOUT_MARKER: &str = ".easydeploymesh-native-iso-layout-v1";
 const NATIVE_ISO_LAYOUT_MARKER: &str = ".easydeploymesh-native-iso-layout-v2";
 const NATIVE_ISO_PATH: &str = "boot/native.iso";
@@ -1889,7 +1973,9 @@ const LEGACY_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd bo
 const BROKEN_NAMED_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name bootmgr boot/bootmgr\ninitrd --name BCD boot/BCD\ninitrd --name boot.sdi boot/boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim\nboot\n";
 const V3_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name bootmgr boot/bootmgr bootmgr\ninitrd --name BCD boot/BCD BCD\ninitrd --name boot.sdi boot/boot.sdi boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim boot.wim\nboot\n";
 const V4_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name bootmgr boot/bootmgr bootmgr\ninitrd --name BCD boot/easydeploymesh.bcd BCD\ninitrd --name boot.sdi boot/boot.sdi boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim boot.wim\nboot\n";
-const MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name BCD boot/easydeploymesh.bcd BCD\ninitrd --name boot.sdi boot/boot.sdi boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim boot.wim\nboot\n";
+const V5_MANAGED_IPXE_SCRIPT: &str = "#!ipxe\nkernel boot/wimboot\ninitrd --name BCD boot/easydeploymesh.bcd BCD\ninitrd --name boot.sdi boot/boot.sdi boot.sdi\ninitrd --name easydeploymesh-bootstrap.json boot/easydeploymesh-bootstrap.json easydeploymesh-bootstrap.json\ninitrd --name boot.wim boot/boot.wim boot.wim\nboot\n";
+const MANAGED_IPXE_SCRIPT: &str = V4_MANAGED_IPXE_SCRIPT;
+const EDGELESS_MANAGED_IPXE_SCRIPT: &str = V5_MANAGED_IPXE_SCRIPT;
 const DHCP_SERVER_PORT: u16 = 67;
 const DHCP_CLIENT_PORT: u16 = 68;
 const TFTP_PORT: u16 = 69;
@@ -1988,6 +2074,12 @@ impl BootPackage {
             fs::write(root.join("boot.ipxe"), NATIVE_ISO_PLACEHOLDER_SCRIPT)?;
             return Ok(true);
         }
+        if root.join(V5_MANAGED_LAYOUT_MARKER).is_file() {
+            return Err(PxeServiceError::InvalidConfig(
+                "managed PXE package version 5 cannot identify whether its source boot manager is safe; reimport the original PE media"
+                    .into(),
+            ));
+        }
         let script = fs::read(root.join("boot.ipxe")).ok();
         if !matches!(
             script.as_deref(),
@@ -1996,6 +2088,8 @@ impl BootPackage {
                 || bytes == BROKEN_NAMED_MANAGED_IPXE_SCRIPT.as_bytes()
                 || bytes == V3_MANAGED_IPXE_SCRIPT.as_bytes()
                 || bytes == V4_MANAGED_IPXE_SCRIPT.as_bytes()
+                || bytes == V5_MANAGED_IPXE_SCRIPT.as_bytes()
+                || bytes == EDGELESS_MANAGED_IPXE_SCRIPT.as_bytes()
         ) || ![
             "boot/boot.sdi",
             "boot/boot.wim",
@@ -2037,11 +2131,17 @@ impl BootPackage {
         fs::write(root.join("undionly.kpxe"), EMBEDDED_UNDIONLY)?;
         fs::write(root.join("ipxe.efi"), EMBEDDED_IPXE_EFI)?;
         fs::write(root.join("boot/wimboot"), EMBEDDED_WIMBOOT)?;
-        fs::write(root.join("boot.ipxe"), MANAGED_IPXE_SCRIPT)?;
-        fs::write(root.join(MANAGED_LAYOUT_MARKER), b"5\n")?;
+        let script = if root.join(EDGELESS_MANAGED_LAYOUT_MARKER).is_file() {
+            EDGELESS_MANAGED_IPXE_SCRIPT
+        } else {
+            MANAGED_IPXE_SCRIPT
+        };
+        fs::write(root.join("boot.ipxe"), script)?;
+        fs::write(root.join(MANAGED_LAYOUT_MARKER), b"6\n")?;
         let _ = fs::remove_file(root.join(LEGACY_MANAGED_LAYOUT_MARKER));
         let _ = fs::remove_file(root.join(V3_MANAGED_LAYOUT_MARKER));
         let _ = fs::remove_file(root.join(V4_MANAGED_LAYOUT_MARKER));
+        let _ = fs::remove_file(root.join(V5_MANAGED_LAYOUT_MARKER));
         Ok(true)
     }
 
@@ -2870,8 +2970,14 @@ fn build_winpe_package_with_native_iso(
             fs::write(staging.join("boot.ipxe"), NATIVE_ISO_PLACEHOLDER_SCRIPT)?;
             fs::write(staging.join(NATIVE_ISO_LAYOUT_MARKER), b"2\n")?;
         } else {
-            fs::write(staging.join("boot.ipxe"), MANAGED_IPXE_SCRIPT)?;
-            fs::write(staging.join(MANAGED_LAYOUT_MARKER), b"5\n")?;
+            let script = if edgeless_payload.is_some() {
+                fs::write(staging.join(EDGELESS_MANAGED_LAYOUT_MARKER), b"1\n")?;
+                EDGELESS_MANAGED_IPXE_SCRIPT
+            } else {
+                MANAGED_IPXE_SCRIPT
+            };
+            fs::write(staging.join("boot.ipxe"), script)?;
+            fs::write(staging.join(MANAGED_LAYOUT_MARKER), b"6\n")?;
         }
         Ok(())
     })();
