@@ -9,12 +9,12 @@ pub use job::{
     IMAGE_CACHE_HEADROOM_MIB, JobState, JobTransitionError, MIB_BYTES, MINIMUM_DATA_MIB,
     MINIMUM_WINDOWS_MIB, PARTITION_ALIGNMENT_HEADROOM_MIB, PartitionCapacityError,
     PartitionFileSystem, PartitionPlan, PartitionPlanError, PartitionRole, PartitionSpec,
-    PartitionTable,
+    PartitionTable, WindowsPayloadCapacityError,
 };
 pub use models::{
     ActivityEvent, ActivitySeverity, ActivitySource, ActivitySubject, AgentHeartbeat,
     AgentHeartbeatAck, AgentInventory, AgentRegistration, Architecture, BootMode,
-    ControlPlaneStatus, Device, Disk, GhoImageCapability, ImageArtifact, ImageFormat, Operation,
-    PxeClientStage, PxeConfig, PxeDiscoveredClient, PxeEvent, PxeMode, PxeServiceStatus,
-    RegisteredDevice, RuntimeStatus, SystemDetails,
+    ControlPlaneStatus, Device, Disk, GhoImageCapability, GhoPartitionCapability, ImageArtifact,
+    ImageFormat, Operation, PxeClientStage, PxeConfig, PxeDiscoveredClient, PxeEvent, PxeMode,
+    PxeServiceStatus, RegisteredDevice, RuntimeStatus, SystemDetails,
 };

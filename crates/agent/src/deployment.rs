@@ -117,7 +117,7 @@ pub fn execute(
                 .as_ref()
                 .ok_or("GHO deployment metadata is missing")?;
             await_running(&mut control_state)?;
-            restore_gho_partition(&layout.image_path, gho)?;
+            restore_gho_partition(&layout.image_path, gho, &mut control_state)?;
         } else {
             let mut image_argument = OsString::from("/ImageFile:");
             image_argument.push(layout.image_path.as_os_str());
@@ -203,6 +203,13 @@ fn prepare_layout(lease: &AgentJobLease, disk: &Disk) -> Result<PreparedLayout, 
     lease
         .partition_plan
         .validate_capacity(disk.size_bytes, lease.image.size_bytes)?;
+    if let Some(gho) = &lease.gho {
+        lease.partition_plan.validate_windows_payload_capacity(
+            disk.size_bytes,
+            lease.image.size_bytes,
+            gho.expanded_size_bytes,
+        )?;
+    }
 
     let disk_number = physical_drive_number(&disk.id)?;
     let fixed_mib = lease
@@ -443,15 +450,20 @@ fn verify_image(
 }
 
 #[cfg(target_os = "windows")]
-struct DigestWriter<W> {
+struct DigestWriter<'a, W, C> {
     inner: W,
     digest: Sha256,
     written: u64,
+    control_state: &'a mut C,
 }
 
 #[cfg(target_os = "windows")]
-impl<W: Write> Write for DigestWriter<W> {
+impl<W: Write, C> Write for DigestWriter<'_, W, C>
+where
+    C: FnMut() -> Result<JobState, Box<dyn Error>>,
+{
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        await_running(self.control_state).map_err(|error| io::Error::other(error.to_string()))?;
         let count = self.inner.write(bytes)?;
         self.digest.update(&bytes[..count]);
         self.written = self.written.saturating_add(count as u64);
@@ -467,6 +479,7 @@ impl<W: Write> Write for DigestWriter<W> {
 fn restore_gho_partition(
     image_path: &Path,
     metadata: &easydeploymesh_core::AgentGhoDeployment,
+    control_state: &mut impl FnMut() -> Result<JobState, Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
     use std::fs::OpenOptions;
 
@@ -480,6 +493,7 @@ fn restore_gho_partition(
         inner: volume,
         digest: Sha256::new(),
         written: 0,
+        control_state,
     };
     let (_, decoded) = easydeploymesh_gho::decode_partition(
         &mut image,
@@ -722,7 +736,9 @@ fn process_output(
 mod tests {
     use super::*;
     use chrono::{Duration, Utc};
-    use easydeploymesh_core::{AgentDeploymentImage, DeploymentTarget, PartitionPlan};
+    use easydeploymesh_core::{
+        AgentDeploymentImage, AgentGhoDeployment, DeploymentTarget, PartitionPlan,
+    };
     use uuid::Uuid;
 
     fn lease(plan: PartitionPlan) -> AgentJobLease {
@@ -775,6 +791,24 @@ mod tests {
         assert!(prepared.prepare_script.contains("assign letter=W"));
         assert!(prepared.prepare_script.contains("EasyDeployMesh Cache"));
         assert_eq!(prepared.firmware, "BIOS");
+    }
+
+    #[test]
+    fn oversized_gho_partition_fails_before_a_diskpart_script_is_available() {
+        let mut deployment = lease(PartitionPlan::uefi_gpt());
+        deployment.operation = Operation::DeployGho;
+        deployment.image.format = ImageFormat::Gho;
+        deployment.gho = Some(AgentGhoDeployment {
+            source_partition: 1,
+            expanded_size_bytes: 56 * 1024 * 1024 * 1024,
+            expanded_sha256: "11".repeat(32),
+            parser_version: easydeploymesh_gho::PARSER_VERSION,
+        });
+
+        let error = prepare_layout(&deployment, &disk())
+            .expect_err("raw GHO payload must fit before partitioning")
+            .to_string();
+        assert!(error.contains("raw Windows partition payload"));
     }
 
     #[test]

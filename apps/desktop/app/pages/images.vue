@@ -10,13 +10,19 @@ definePageMeta({ titleKey: 'nav.images' })
 
 const imageStore = useImageStore()
 const toast = useToast()
-const { locale, t } = useI18n()
+const { locale, t, te } = useI18n()
 const desktopRuntime = isTauriRuntime()
 
 const readinessDialogOpen = ref(false)
 const readinessImage = ref<ImageArtifact | null>(null)
 const assessingReadiness = ref(false)
 const readinessError = ref<string | null>(null)
+
+function ghoBlockedReason(reason: string | null | undefined) {
+  if (!reason) return undefined
+  const key = `images.ghoReadiness.blockedReasons.${reason}`
+  return te(key) ? t(key) : reason
+}
 
 const imageRows = computed(() => imageStore.images.map(image => ({
   image,
@@ -50,7 +56,7 @@ async function runReadinessAssessment() {
       title: verified.ghoCapability?.deployable
         ? t('images.ghoReadiness.verificationComplete')
         : t('images.ghoReadiness.verificationBlocked'),
-      description: verified.ghoCapability?.blockedReason ?? undefined,
+      description: ghoBlockedReason(verified.ghoCapability?.blockedReason),
       color: verified.ghoCapability?.deployable ? 'success' : 'warning',
       icon: verified.ghoCapability?.deployable
         ? 'i-lucide-badge-check'
@@ -340,7 +346,7 @@ async function handleRemove(image: ImageArtifact) {
 
           <div v-if="readinessImage?.ghoCapability" class="rounded-xl border border-default p-4">
             <dl class="grid gap-3 text-xs md:grid-cols-2">
-              <div><dt class="font-medium text-muted">{{ $t('common.status') }}</dt><dd class="mt-1">{{ readinessImage.ghoCapability.deployable ? $t('images.manualDeployment') : readinessImage.ghoCapability.blockedReason }}</dd></div>
+              <div><dt class="font-medium text-muted">{{ $t('common.status') }}</dt><dd class="mt-1">{{ readinessImage.ghoCapability.deployable ? $t('images.manualDeployment') : ghoBlockedReason(readinessImage.ghoCapability.blockedReason) }}</dd></div>
               <div v-if="readinessImage.ghoCapability.compression"><dt class="font-medium text-muted">{{ $t('images.ghoReadiness.compression') }}</dt><dd class="mt-1">{{ readinessImage.ghoCapability.compression.toUpperCase() }}</dd></div>
               <div v-if="readinessImage.ghoCapability.expandedSizeBytes">
                 <dt class="font-medium text-muted">{{ $t('images.ghoReadiness.expandedSize') }}</dt>
@@ -349,6 +355,10 @@ async function handleRemove(image: ImageArtifact) {
               <div v-if="readinessImage.ghoCapability.expandedSha256">
                 <dt class="font-medium text-muted">{{ $t('images.ghoReadiness.expandedHash') }}</dt>
                 <dd class="mt-1 break-all font-mono text-[10px]">{{ readinessImage.ghoCapability.expandedSha256 }}</dd>
+              </div>
+              <div v-for="partition in readinessImage.ghoCapability.partitions" :key="partition.sourcePartition">
+                <dt class="font-medium text-muted">{{ $t('images.ghoReadiness.partition', { index: partition.sourcePartition }) }}</dt>
+                <dd class="mt-1">NTFS · {{ formatBytes(partition.expandedSizeBytes, locale) }}</dd>
               </div>
             </dl>
           </div>

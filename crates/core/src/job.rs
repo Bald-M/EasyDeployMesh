@@ -347,6 +347,57 @@ impl PartitionPlan {
         }
         Ok(())
     }
+
+    /// Ensures a raw partition payload fits in the Windows volume before any
+    /// destructive partitioning begins.
+    pub fn validate_windows_payload_capacity(
+        &self,
+        disk_size_bytes: u64,
+        image_size_bytes: u64,
+        payload_size_bytes: u64,
+    ) -> Result<(), WindowsPayloadCapacityError> {
+        let windows = self
+            .partitions
+            .iter()
+            .find(|partition| partition.role == PartitionRole::Windows)
+            .ok_or(WindowsPayloadCapacityError {
+                required_bytes: payload_size_bytes,
+                available_bytes: 0,
+            })?;
+        let available_bytes = if let Some(size_mib) = windows.size_mib {
+            size_mib.saturating_mul(MIB_BYTES)
+        } else {
+            let fixed_mib = self
+                .partitions
+                .iter()
+                .filter_map(|partition| partition.size_mib)
+                .fold(0_u64, u64::saturating_add);
+            let cache_mib = image_size_bytes
+                .div_ceil(MIB_BYTES)
+                .saturating_add(IMAGE_CACHE_HEADROOM_MIB);
+            (disk_size_bytes / MIB_BYTES)
+                .saturating_sub(fixed_mib)
+                .saturating_sub(cache_mib)
+                .saturating_sub(PARTITION_ALIGNMENT_HEADROOM_MIB)
+                .saturating_mul(MIB_BYTES)
+        };
+        if available_bytes < payload_size_bytes {
+            return Err(WindowsPayloadCapacityError {
+                required_bytes: payload_size_bytes,
+                available_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error(
+    "raw Windows partition payload requires {required_bytes} bytes but the planned Windows volume provides {available_bytes} bytes"
+)]
+pub struct WindowsPayloadCapacityError {
+    pub required_bytes: u64,
+    pub available_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -659,5 +710,40 @@ mod tests {
             .expect_err("cache, alignment, and the remaining partition require extra capacity");
         assert!(error.required_mib > error.available_mib);
         assert_eq!(error.available_mib, 95_367);
+    }
+
+    #[test]
+    fn raw_gho_payload_must_fit_the_planned_windows_volume() {
+        let mut plan = PartitionPlan::uefi_gpt();
+        let windows = plan
+            .partitions
+            .iter_mut()
+            .find(|partition| partition.role == PartitionRole::Windows)
+            .unwrap();
+        windows.size_mib = Some(30 * 1024);
+        plan.partitions.push(PartitionSpec {
+            role: PartitionRole::Data,
+            size_mib: None,
+            file_system: Some(PartitionFileSystem::Ntfs),
+            label: "Data".to_owned(),
+            drive_letter: Some('D'),
+        });
+
+        assert!(
+            plan.validate_windows_payload_capacity(
+                128 * 1024 * MIB_BYTES,
+                8 * 1024 * MIB_BYTES,
+                31 * 1024 * MIB_BYTES,
+            )
+            .is_err()
+        );
+        assert!(
+            plan.validate_windows_payload_capacity(
+                128 * 1024 * MIB_BYTES,
+                8 * 1024 * MIB_BYTES,
+                30 * 1024 * MIB_BYTES,
+            )
+            .is_ok()
+        );
     }
 }

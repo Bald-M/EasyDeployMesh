@@ -65,6 +65,18 @@ describe('device deployment selection', () => {
     expect(deployableDeviceIds(entries)).toEqual(['ready'])
   })
 
+  it('honors operational blockers supplied by the client page', () => {
+    const entries = [device('ready'), device('deploying'), device('unknown')]
+    const blocked = new Set(['deploying', 'unknown'])
+    const available = (entry: RegisteredDevice) =>
+      entry.online && entry.device.disks.length > 0 && !blocked.has(entry.device.id)
+
+    expect(deployableDeviceIds(entries, available)).toEqual(['ready'])
+    expect(batchDeploymentTargets('all', [], entries, available)
+      .map(entry => entry.device.id)).toEqual(['ready'])
+    expect(reconcileDeviceSelection(['ready', 'deploying'], entries, available)).toEqual(['ready'])
+  })
+
   it('resolves selected deployment targets without including ineligible devices', () => {
     const entries = [
       device('one'),

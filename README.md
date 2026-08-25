@@ -65,10 +65,8 @@ partitioning.
 - Standalone DHCP or ProxyDHCP PXE service with TFTP and client discovery.
 - ISO, IMG, and existing boot-directory import; compatible network-enabled
   WinPE layouts receive automatic Agent injection into a managed `boot.wim`.
-- Persistent GHO, WIM, ESD, and SWM image catalog with SHA-256 verification.
+- Persistent WIM, ESD, and SWM image catalog with SHA-256 verification.
 - Unattended WIM/ESD deployment using DiskPart, DISM, and BCDBoot in WinPE.
-- Native streaming verification and restore for a deliberately limited GHO
-  compatibility profile—without bundling or executing Ghost software.
 - Guarded deployment state machine with pause, retry, cancellation, progress,
   activity history, and durable job storage.
 - Machine-readable WinPE diagnostics with token redaction and integrity checks.
@@ -116,19 +114,25 @@ used for automated deployment.
 | WIM | Yes | Yes | Verified on import and again before deployment |
 | ESD | Yes | Yes | Uses the WIM deployment operation and a selected image index |
 | SWM | Yes | No | Catalog-only in the current Agent |
-| GHO | Yes | Limited | Manual-only native restore for the supported profile below |
-| GHS | Yes | No | Split-image discovery only |
+| GHO | No | No | Unsupported; convert the image to WIM or ESD before import |
+| GHS | No | No | Unsupported Ghost span format |
 
-Native GHO support is limited to Ghost 11.x–12.x, single-file, password-free,
-partition-level Windows NTFS images using Z0, Z1, or Z3–Z9 compression.
-Whole-disk images, spans, encryption, other filesystems, image creation, and
-unsupported compression modes are rejected with a specific reason.
+### Why GHO is unsupported
 
-EasyDeployMesh implements its own bounds-checked streaming Rust decoder. Import
-verification records both the compressed file SHA-256 and expanded partition
-SHA-256 without producing a RAW cache. WinPE streams the partition into a locked
-and dismounted target volume, then checks the expanded size and digest before
-configuring boot files.
+EasyDeployMesh does not support importing, validating, or restoring Norton
+Ghost GHO/GHS images. The format is proprietary, has incompatible variants and
+compression layouts in real-world images, and no longer has a maintained
+official recovery engine that this project can safely redistribute or depend
+on. A parser accepting the file header is not sufficient evidence that a
+destructive restore will reproduce the original partition correctly, so the
+project fails closed instead of offering partial or experimental support.
+
+Existing GHO/GHS images must first be restored or converted in an isolated,
+disposable environment using software that the operator is licensed to use.
+Capture the resulting Windows partition as WIM or ESD, verify it, and import
+that supported image into EasyDeployMesh. Never test a conversion or legacy
+Ghost restore against the developer workstation or a disk containing valuable
+data.
 
 ## Quick start
 
@@ -256,7 +260,6 @@ Defense-in-depth measures include:
 - Repeated image integrity validation on the host and Agent.
 - Repeated physical-disk fingerprint checks before destructive work.
 - Guarded job transitions and one active job per device.
-- Bounded GHO parsing and expanded-output limits.
 - Sanitized diagnostics that do not echo enrollment tokens.
 
 Please do not disclose exploit details or sensitive deployment data in a public

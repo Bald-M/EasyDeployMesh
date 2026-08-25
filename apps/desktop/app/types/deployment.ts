@@ -20,8 +20,16 @@ export interface GhoImageCapability {
   expandedSha256: string | null
   partitionCount: number | null
   sourcePartition: number | null
+  partitions: GhoPartitionCapability[]
   parserVersion: number
   blockedReason: string | null
+}
+
+export interface GhoPartitionCapability {
+  sourcePartition: number
+  fileSystem: string
+  expandedSizeBytes: number
+  expandedSha256: string
 }
 
 

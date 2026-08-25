@@ -16,14 +16,17 @@ The project currently supports:
 
 - WIM and ESD deployment through Windows DISM.
 - A deliberately narrow native GHO restore profile: Ghost 11.x–12.x,
-  single-file, password-free, partition-level NTFS images using Z0, Z1, or
-  Z3–Z9 compression.
-- GHO, WIM, ESD, and SWM cataloging. GHS and SWM remain catalog-only.
+  password-free images containing one or more identifiable NTFS partition
+  streams, using Z0, Z1, or Z3–Z9 compression. Single-file images and validated
+  ordered GHS span sets are supported. The operator selects the source partition
+  explicitly when a disk image contains multiple NTFS streams; the original
+  disk layout is not restored.
+- GHO, GHS, WIM, ESD, and SWM cataloging. SWM remains catalog-only.
 - UEFI/GPT and legacy BIOS/MBR partition plans.
 - Standalone DHCP or ProxyDHCP PXE boot with TFTP.
 
-Capture, whole-disk GHO restore, encrypted GHO images, spanned GHO deployment,
-and recovery partitions are not implemented.
+Capture, raw whole-disk layout restoration, encrypted GHO images, and recovery
+partitions are not implemented.
 
 ## System context
 
@@ -171,8 +174,10 @@ the device token.
 7. The Agent hashes the downloaded bytes before applying them.
 
 For native GHO, import and preflight also decode the supported partition stream
-to obtain an expanded byte count and SHA-256. The Agent checks parser version,
-expanded byte count, and expanded SHA-256 while writing the locked volume.
+to obtain an expanded byte count and SHA-256 for every restorable NTFS stream.
+Job creation binds an explicit source partition, and the Agent checks parser
+version, expanded byte count, and expanded SHA-256 while writing the locked
+volume. The expanded partition must fit the planned Windows volume.
 
 ### Deployment scheduling and execution
 

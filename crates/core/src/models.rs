@@ -275,6 +275,15 @@ pub enum ImageFormat {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GhoPartitionCapability {
+    pub source_partition: u32,
+    pub file_system: String,
+    pub expanded_size_bytes: u64,
+    pub expanded_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GhoImageCapability {
     pub deployable: bool,
     pub compression: Option<String>,
@@ -282,6 +291,8 @@ pub struct GhoImageCapability {
     pub expanded_sha256: Option<String>,
     pub partition_count: Option<u32>,
     pub source_partition: Option<u32>,
+    #[serde(default)]
+    pub partitions: Vec<GhoPartitionCapability>,
     pub parser_version: u32,
     pub blocked_reason: Option<String>,
 }

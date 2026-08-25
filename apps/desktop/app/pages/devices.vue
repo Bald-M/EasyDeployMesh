@@ -7,7 +7,6 @@ import {
   deploymentLaunchBlocker,
   deployableDeviceIds,
   deviceSelectionState,
-  isDeployableDevice,
   reconcileDeviceSelection,
   updateDeviceSelection,
   type DeviceSelectionState
@@ -15,6 +14,11 @@ import {
 import { partitionPlanFor, type PartitionPreset } from '~/utils/partition-plans'
 import { partitionCapacity, partitionUserBudgets } from '~/utils/partition-capacity'
 import { templateDiskGroups } from '~/utils/template-disk-groups'
+import {
+  deviceOperationalStatus,
+  isDeviceDeploymentAvailable,
+  type DeviceOperationalStatus
+} from '~/utils/device-operational-status'
 import {
   clampFixedPartitionSizes,
   cloneCustomPartitionTemplate,
@@ -61,21 +65,33 @@ const sendProgress = ref({ completed: 0, total: 0 })
 const hardwareTarget = ref<RegisteredDevice | null>(null)
 const hardwareDialogOpen = ref(false)
 
+function operationalStatus(entry: RegisteredDevice) {
+  return deviceOperationalStatus(entry, jobStore.jobs)
+}
+
+function isEntryDeployable(entry: RegisteredDevice) {
+  return isDeviceDeploymentAvailable(entry, jobStore.jobs)
+}
+
+const ordinaryOnlineDevices = computed(() =>
+  deviceStore.devices.filter(entry => operationalStatus(entry) === 'online')
+)
+
 const verifiedImages = computed(() => imageStore.images.filter(image => image.verified && ['gho', 'wim', 'esd'].includes(image.format)))
 const imageItems = computed(() => verifiedImages.value.map(image => ({
   label: `${image.name} · ${image.format.toUpperCase()} · ${formatBytes(image.sizeBytes, locale.value)}`,
   value: image.id
 })))
-const eligibleDevices = computed(() => deviceStore.devices.filter(isDeployableDevice))
+const eligibleDevices = computed(() => deviceStore.devices.filter(isEntryDeployable))
 const selectedDeviceIdSet = computed(() => new Set(selectedDeviceIds.value))
-const selectedDevices = computed(() => batchDeploymentTargets('selected', selectedDeviceIds.value, deviceStore.devices))
+const selectedDevices = computed(() => batchDeploymentTargets('selected', selectedDeviceIds.value, deviceStore.devices, isEntryDeployable))
 const selectedDeviceCount = computed(() => selectedDevices.value.length)
 const canSendSelection = computed(() => selectedDeviceCount.value > 0 && verifiedImages.value.length > 0)
 const selectAllState = computed<DeviceSelectionState>({
-  get: () => deviceSelectionState(selectedDeviceIds.value, deviceStore.devices),
+  get: () => deviceSelectionState(selectedDeviceIds.value, deviceStore.devices, isEntryDeployable),
   set: (value) => {
     selectedDeviceIds.value = value === true
-      ? deployableDeviceIds(deviceStore.devices)
+      ? deployableDeviceIds(deviceStore.devices, isEntryDeployable)
       : []
   }
 })
@@ -89,12 +105,26 @@ const currentSendTarget = computed(() => {
     : null
 })
 const selectedImage = computed(() => verifiedImages.value.find(image => image.id === selectedImageId.value) ?? null)
+const selectedGhoPartitions = computed(() => selectedImage.value?.format === 'gho'
+  ? selectedImage.value.ghoCapability?.partitions ?? []
+  : [])
+const selectedImageIndexIsValid = computed(() => {
+  if (selectedImage.value?.format !== 'gho') return selectedImageIndex.value >= 1
+  return selectedGhoPartitions.value.some(partition => partition.sourcePartition === selectedImageIndex.value)
+})
+const ghoPartitionItems = computed(() => selectedGhoPartitions.value.map(partition => ({
+  label: t('devices.ghoPartitionOption', {
+    index: partition.sourcePartition,
+    size: formatBytes(partition.expandedSizeBytes, locale.value)
+  }),
+  value: partition.sourcePartition
+})))
 const sendTargets = computed(() => {
   const mode = sendMode.value
   if (mode === 'single') {
     return currentSendTarget.value ? [currentSendTarget.value] : []
   }
-  return batchDeploymentTargets(mode, selectedDeviceIds.value, deviceStore.devices)
+  return batchDeploymentTargets(mode, selectedDeviceIds.value, deviceStore.devices, isEntryDeployable)
 })
 const sendTargetCount = computed(() => sendTargets.value.length)
 const templateTargetDiskGroups = computed(() => templateDiskGroups(sendTargets.value, selectedDiskIds.value))
@@ -111,7 +141,7 @@ function templatePartitionBudgets(template: CustomPartitionTemplate) {
     total: budgets.map(budget => budget.totalGib)
   }
 }
-const sendTargetsAreDeployable = computed(() => sendTargets.value.every(isDeployableDevice))
+const sendTargetsAreDeployable = computed(() => sendTargets.value.every(isEntryDeployable))
 const sendDialogTitle = computed(() => {
   if (sendAll.value) return t('devices.sendAllTitle', { count: sendTargetCount.value })
   if (sendSelection.value) return t('devices.sendSelectedTitle', { count: sendTargetCount.value })
@@ -273,6 +303,7 @@ const deploymentConfirmation = computed({
 })
 const canSend = computed(() => Boolean(
   selectedImage.value
+  && selectedImageIndexIsValid.value
   && deploymentConfirmed.value
   && confirmedDeploymentKey.value === deploymentConfirmationKey.value
   && sendTargetCount.value > 0
@@ -326,8 +357,8 @@ function updateTargetDisk(entry: RegisteredDevice, value: string) {
 
 function openSendDialog(mode: SendMode, entry: RegisteredDevice | null = null) {
   const targets = mode === 'single'
-    ? (entry && isDeployableDevice(entry) ? [entry] : [])
-    : batchDeploymentTargets(mode, selectedDeviceIds.value, deviceStore.devices)
+    ? (entry && isEntryDeployable(entry) ? [entry] : [])
+    : batchDeploymentTargets(mode, selectedDeviceIds.value, deviceStore.devices, isEntryDeployable)
   const blocker = deploymentLaunchBlocker(targets.length, verifiedImages.value.length)
   if (blocker === 'targets') return
   if (blocker === 'images') {
@@ -356,7 +387,7 @@ function isDeviceSelected(entry: RegisteredDevice) {
 }
 
 function setDeviceSelected(entry: RegisteredDevice, value: boolean | 'indeterminate') {
-  if (!isDeployableDevice(entry)) return
+  if (!isEntryDeployable(entry)) return
   selectedDeviceIds.value = updateDeviceSelection(
     selectedDeviceIds.value,
     entry.device.id,
@@ -369,9 +400,48 @@ function clearDeviceSelection() {
 }
 
 function selectionHint(entry: RegisteredDevice) {
-  if (!entry.online) return t('devices.selectOfflineHint')
+  const status = operationalStatus(entry)
+  if (status !== 'online') return t(`devices.statusHints.${status}`)
   if (!entry.device.disks.length) return t('devices.selectNoDiskHint')
   return t('devices.selectDevice', { name: displayName(entry) })
+}
+
+function statusColor(status: DeviceOperationalStatus) {
+  return {
+    online: 'success',
+    offline: 'neutral',
+    deploying: 'info',
+    paused: 'warning',
+    unknown: 'warning'
+  }[status] as 'success' | 'neutral' | 'info' | 'warning'
+}
+
+function statusPanelClass(status: DeviceOperationalStatus) {
+  return {
+    online: 'bg-success/10 text-success ring-success/20',
+    offline: 'bg-elevated text-muted ring-default',
+    deploying: 'bg-info/10 text-info ring-info/20',
+    paused: 'bg-warning/10 text-warning ring-warning/20',
+    unknown: 'bg-warning/10 text-warning ring-warning/20'
+  }[status]
+}
+
+function statusDotClass(status: DeviceOperationalStatus) {
+  return {
+    online: 'bg-success',
+    offline: 'bg-neutral-400',
+    deploying: 'bg-info',
+    paused: 'bg-warning',
+    unknown: 'bg-warning'
+  }[status]
+}
+
+function sendHint(entry: RegisteredDevice) {
+  const status = operationalStatus(entry)
+  if (status !== 'online') return t(`devices.statusHints.${status}`)
+  if (!entry.device.disks.length) return t('devices.sendNoDiskHint')
+  if (!verifiedImages.value.length) return t('devices.sendNoImageHint')
+  return t('devices.send')
 }
 
 function bootModeSummary(bootModes: readonly BootMode[]) {
@@ -466,7 +536,7 @@ async function handleSend() {
 
     if (result.interrupted) {
       const notQueuedDeviceIds = [...result.failedDeviceIds, ...result.pendingDeviceIds]
-      const retryableDeviceIds = reconcileDeviceSelection(notQueuedDeviceIds, deviceStore.devices)
+      const retryableDeviceIds = reconcileDeviceSelection(notQueuedDeviceIds, deviceStore.devices, isEntryDeployable)
       if (activeSendMode !== 'single') {
         selectedDeviceIds.value = retryableDeviceIds
         sendMode.value = 'selected'
@@ -474,7 +544,8 @@ async function handleSend() {
         initializeTargetDisks(batchDeploymentTargets(
           'selected',
           retryableDeviceIds,
-          deviceStore.devices
+          deviceStore.devices,
+          isEntryDeployable
         ))
       }
       deploymentConfirmation.value = false
@@ -504,7 +575,7 @@ async function handleSend() {
     }
 
     sendDialogOpen.value = false
-    const retryableFailedDeviceIds = reconcileDeviceSelection(result.failedDeviceIds, deviceStore.devices)
+    const retryableFailedDeviceIds = reconcileDeviceSelection(result.failedDeviceIds, deviceStore.devices, isEntryDeployable)
     if (activeSendMode !== 'single') {
       selectedDeviceIds.value = retryableFailedDeviceIds
     }
@@ -667,9 +738,9 @@ function deleteTemplate() {
 }
 
 watch(
-  () => deviceStore.devices,
-  (entries) => {
-    const reconciled = reconcileDeviceSelection(selectedDeviceIds.value, entries)
+  [() => deviceStore.devices, () => jobStore.jobs],
+  ([entries]) => {
+    const reconciled = reconcileDeviceSelection(selectedDeviceIds.value, entries, isEntryDeployable)
     if (reconciled.length !== selectedDeviceIds.value.length
       || reconciled.some((id, index) => id !== selectedDeviceIds.value[index])) {
       selectedDeviceIds.value = reconciled
@@ -703,10 +774,23 @@ watch(() => [selectedImage.value?.sizeBytes, JSON.stringify(selectedDiskIds.valu
   if (templateDialogOpen.value) clampDraftPartitionSizes()
 })
 
+watch(selectedImageId, () => {
+  selectedImageIndex.value = selectedImage.value?.format === 'gho'
+    ? selectedGhoPartitions.value[0]?.sourcePartition ?? 1
+    : 1
+})
+
+async function refreshClients(verifyOnline = false) {
+  await Promise.all([
+    verifyOnline ? deviceStore.verifyOnline() : deviceStore.refresh(),
+    jobStore.refresh()
+  ])
+}
+
 onMounted(() => {
   customTemplates.value = parseCustomPartitionTemplates(localStorage.getItem(customPartitionTemplatesStorageKey))
-  deviceStore.refresh()
-  refreshTimer = setInterval(() => deviceStore.refresh(), 5_000)
+  void refreshClients()
+  refreshTimer = setInterval(() => void refreshClients(), 5_000)
 })
 
 onBeforeUnmount(() => {
@@ -750,7 +834,7 @@ onBeforeUnmount(() => {
           variant="outline"
           :label="$t('common.refresh')"
           :loading="deviceStore.loading"
-          @click="deviceStore.verifyOnline"
+          @click="refreshClients(true)"
         />
       </template>
     </PageHeader>
@@ -777,7 +861,7 @@ onBeforeUnmount(() => {
             </div>
             <div>
               <p class="text-2xl font-semibold">
-                {{ deviceStore.onlineDevices.length }}
+                {{ ordinaryOnlineDevices.length }}
               </p>
               <p class="text-xs text-muted">
                 {{ $t('devices.onlineNow') }}
@@ -869,7 +953,7 @@ onBeforeUnmount(() => {
             <div class="flex items-center" :title="selectionHint(entry)">
               <UCheckbox
                 :model-value="isDeviceSelected(entry)"
-                :disabled="!isDeployableDevice(entry)"
+                :disabled="!isEntryDeployable(entry)"
                 :aria-label="$t('devices.selectDevice', { name: displayName(entry) })"
                 @update:model-value="setDeviceSelected(entry, $event)"
               />
@@ -878,14 +962,12 @@ onBeforeUnmount(() => {
             <div class="flex min-w-0 items-center gap-3">
               <div
                 class="relative grid size-11 shrink-0 place-items-center rounded-xl ring-1"
-                :class="entry.online
-                  ? 'bg-success/10 text-success ring-success/20'
-                  : 'bg-elevated text-muted ring-default'"
+                :class="statusPanelClass(operationalStatus(entry))"
               >
                 <UIcon name="i-lucide-monitor" class="size-5" />
                 <span
                   class="absolute -bottom-0.5 -right-0.5 size-3 rounded-full border-2 border-default"
-                  :class="entry.online ? 'bg-success' : 'bg-neutral-400'"
+                  :class="statusDotClass(operationalStatus(entry))"
                 />
               </div>
               <div class="min-w-0">
@@ -893,13 +975,15 @@ onBeforeUnmount(() => {
                   <p class="truncate text-sm font-semibold">
                     {{ displayName(entry) }}
                   </p>
-                  <UBadge
-                    :color="entry.online ? 'success' : 'neutral'"
-                    variant="subtle"
-                    size="sm"
-                  >
-                    {{ $t(entry.online ? 'common.online' : 'common.offline') }}
-                  </UBadge>
+                  <UTooltip :text="$t(`devices.statusHints.${operationalStatus(entry)}`)">
+                    <UBadge
+                      :color="statusColor(operationalStatus(entry))"
+                      variant="subtle"
+                      size="sm"
+                    >
+                      {{ $t(`devices.statuses.${operationalStatus(entry)}`) }}
+                    </UBadge>
+                  </UTooltip>
                 </div>
                 <p class="mt-1 truncate font-mono text-[11px] text-dimmed">
                   {{ entry.device.macAddress }}
@@ -972,8 +1056,8 @@ onBeforeUnmount(() => {
 
             <div class="flex justify-end gap-1">
               <UButton icon="i-lucide-info" color="neutral" variant="ghost" size="sm" :aria-label="$t('devices.hardwareDetails')" @click="openHardwareDialog(entry)" />
-              <UTooltip :text="!entry.online ? $t('devices.sendOfflineHint') : !entry.device.disks.length ? $t('devices.sendNoDiskHint') : !verifiedImages.length ? $t('devices.sendNoImageHint') : $t('devices.send')">
-                <UButton icon="i-lucide-send" variant="soft" size="sm" :disabled="!entry.online || !entry.device.disks.length" :aria-label="$t('devices.send')" @click="openSendDialog('single', entry)" />
+              <UTooltip :text="sendHint(entry)">
+                <UButton icon="i-lucide-send" variant="soft" size="sm" :disabled="!isEntryDeployable(entry)" :aria-label="$t('devices.send')" @click="openSendDialog('single', entry)" />
               </UTooltip>
               <UButton icon="i-lucide-trash-2" color="error" variant="ghost" size="sm" :aria-label="$t('common.delete')" @click="handleRemove(entry)" />
             </div>
@@ -1026,8 +1110,19 @@ onBeforeUnmount(() => {
           <UFormField :label="$t('devices.selectImage')">
             <USelect v-model="selectedImageId" :items="imageItems" value-key="value" class="w-full" :disabled="sending" />
           </UFormField>
-          <UFormField :label="$t('devices.imageIndex')" :description="$t('devices.imageIndexHint')">
-            <UInputNumber v-model="selectedImageIndex" :min="1" :max="999" class="w-full" :disabled="sending" />
+          <UFormField
+            :label="selectedImage?.format === 'gho' ? $t('devices.ghoPartition') : $t('devices.imageIndex')"
+            :description="selectedImage?.format === 'gho' ? $t('devices.ghoPartitionHint') : $t('devices.imageIndexHint')"
+          >
+            <USelect
+              v-if="selectedImage?.format === 'gho'"
+              v-model="selectedImageIndex"
+              :items="ghoPartitionItems"
+              value-key="value"
+              class="w-full"
+              :disabled="sending"
+            />
+            <UInputNumber v-else v-model="selectedImageIndex" :min="1" :max="999" class="w-full" :disabled="sending" />
           </UFormField>
           <template v-if="sendMode === 'single' && currentSendTarget">
             <UFormField :label="$t('devices.targetDisk')">
@@ -1036,12 +1131,12 @@ onBeforeUnmount(() => {
                 :items="targetDiskItems(currentSendTarget)"
                 value-key="value"
                 class="w-full"
-                :disabled="sending || !isDeployableDevice(currentSendTarget)"
+                :disabled="sending || !isEntryDeployable(currentSendTarget)"
                 @update:model-value="updateTargetDisk(currentSendTarget, $event)"
               />
             </UFormField>
             <UAlert
-              v-if="!isDeployableDevice(currentSendTarget)"
+              v-if="!isEntryDeployable(currentSendTarget)"
               color="error"
               variant="subtle"
               icon="i-lucide-monitor-x"

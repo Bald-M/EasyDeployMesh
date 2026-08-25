@@ -497,11 +497,13 @@ impl DeploymentMutationCoordinator {
         let image_id = request.image_id;
         let image_index = request.options.image_index;
         let operation = request.operation;
-        tokio::task::spawn_blocking(move || match operation {
+        let gho_payload_size = tokio::task::spawn_blocking(move || match operation {
             Operation::DeployWim => images
                 .revalidate_for_deployment(image_id, image_index)
-                .map(|_| ()),
-            Operation::DeployGho => images.prepare_gho_deployment(image_id).map(|_| ()),
+                .map(|_| None),
+            Operation::DeployGho => images
+                .prepare_gho_partition_deployment(image_id, image_index)
+                .map(|prepared| prepared.capability.expanded_size_bytes),
             Operation::CaptureGho => Err(
                 easydeploymesh_service::ImageLibraryError::UnsupportedFormat(
                     "GHO capture is not supported".to_owned(),
@@ -511,6 +513,24 @@ impl DeploymentMutationCoordinator {
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| format!("deployment image preflight failed: {error}"))?;
+        if let Some(payload_size) = gho_payload_size {
+            for target in &request.targets {
+                request
+                    .options
+                    .partition_plan
+                    .validate_windows_payload_capacity(
+                        target.target_disk_size_bytes,
+                        image.size_bytes,
+                        payload_size,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "target Windows partition is too small for {} ({}): {error}",
+                            target.target_disk_model, target.target_disk_id
+                        )
+                    })?;
+            }
+        }
 
         self.jobs
             .enqueue(request)
