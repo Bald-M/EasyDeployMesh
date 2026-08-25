@@ -20,7 +20,7 @@
 
   <p>
     <a href="LICENSE"><img src="docs/assets/badges/license-apache-2.0.svg" alt="许可证：Apache 2.0"></a>
-    <a href="https://github.com/Bald-M/EasyDeployMesh/releases/latest"><img src="docs/assets/badges/release-v0.2.4.svg" alt="发布版本：v0.2.4"></a>
+    <a href="https://github.com/Bald-M/EasyDeployMesh/releases/latest"><img src="docs/assets/badges/release-v0.2.6.svg" alt="发布版本：v0.2.6"></a>
     <a href="#项目状态"><img src="docs/assets/badges/status-active.svg" alt="项目状态：活跃开发"></a>
   </p>
   <p>
@@ -60,9 +60,8 @@ Rust Agent 负责实际部署。
 - 支持独立 DHCP 或 ProxyDHCP 的 PXE 服务、TFTP 和客户端发现。
 - 支持导入 ISO、IMG 和现有启动目录；兼容且具备网络功能的标准 WinPE 布局会在
   受管 `boot.wim` 中自动注入 Agent。
-- 持久化 GHO、WIM、ESD 和 SWM 镜像目录，并进行 SHA-256 校验。
+- 持久化 WIM、ESD 和 SWM 镜像目录，并进行 SHA-256 校验。
 - 在 WinPE 中使用 DiskPart、DISM 和 BCDBoot 执行无人值守 WIM/ESD 部署。
-- 针对明确限定的 GHO 兼容范围提供原生流式验证和还原，不捆绑或执行 Ghost 软件。
 - 具有暂停、重试、取消、进度、活动历史和持久化存储的受控部署状态机。
 - 提供机器可读的 WinPE 诊断，并进行令牌脱敏和完整性检查。
 
@@ -89,31 +88,44 @@ flowchart LR
 | --- | :---: | :---: | :---: | --- |
 | EasyU 3.6 | 是 | 是 | 是 | 当前已验证可用 |
 | Edgeless Beta 4.1.0 | 是 | 是 | 是 | 已在 Legacy BIOS 和 UEFI x64 下完成 PXE 与自动部署全流程验证 |
+| FirPE v2.1.1 | 是 | 是 | 是 | 已完成全流程现场验证 |
+| HotPE v2.8.251018 | 是 | 是 | 是 | 已完成全流程现场验证 |
+| USM v5F | 是 | 未验证 | 未验证 | 仅部分兼容：可以进入 PE 桌面，但托管 PXE 路径无法提供其外置工具包 |
 | 具备网络功能的标准 WinPE | 预期支持 | 预期支持 | 预期支持 | 取决于 Windows 版本和网卡驱动，使用前必须验证 |
 | WePE 2.2 | 仅能通过原生 ISO 启动 | 否 | 否 | 不支持：官方明确裁剪了 Windows 网络模块 |
 
-EasyU 3.6 和 Edgeless Beta 4.1.0 是目前完成完整自动部署流程验证的 PE 运行环境。
-Edgeless 已在 Legacy BIOS 和 UEFI x64 模式下通过托管 PXE 启动、Agent 注册和自动
-部署验证，其外置运行资源会嵌入托管 WIM。WePE 2.2 可以通过原生 ISO 路径进入桌面，
-但其官方版本不提供网络模块，因此 EasyDeployMesh Agent 无法注册或下载部署镜像。
-更换 VMware 网卡型号或只注入网卡驱动，无法恢复已经缺失的 TCP/IP 和 DHCP 网络栈。
-EasyDeployMesh 不会修改用户选择的源 ISO；不支持的离线 PE 不得用于自动部署。
+EasyU 3.6、Edgeless Beta 4.1.0、FirPE v2.1.1 和 HotPE v2.8.251018 已通过托管
+PXE 启动、Agent 注册和自动部署全流程验证。Edgeless 还分别通过了 Legacy BIOS 和
+UEFI x64 模式验证，其外置运行资源会嵌入托管 WIM。
+
+USM v5F 在保留媒体专用 Boot Manager 和 BCD 策略后可以进入 PE 桌面，但源媒体将约
+5.6 GiB 的工具保存在 `USM_TOOL`，并在 `CEO` 中保存其他资源。托管 wimboot 启动包
+不会把源 ISO 暴露为 USM 所预期的移动磁盘，因此其外置工具加载器会等待磁盘初始化并
+最终失败。USM v5F 因而不属于完整支持的自动部署环境。
+
+WePE 2.2 可以通过原生 ISO 路径进入桌面，但其官方版本不提供网络模块，因此
+EasyDeployMesh Agent 无法注册或下载部署镜像。更换 VMware 网卡型号或只注入网卡
+驱动，无法恢复已经缺失的 TCP/IP 和 DHCP 网络栈。EasyDeployMesh 不会修改用户选择
+的源 ISO；部分兼容或离线 PE 不得用于自动部署。
 
 | 格式 | 可编目 | 可部署 | 说明 |
 | --- | :---: | :---: | --- |
 | WIM | 是 | 是 | 导入时验证，部署前再次验证 |
 | ESD | 是 | 是 | 使用 WIM 部署操作和指定的镜像索引 |
 | SWM | 是 | 否 | 当前 Agent 仅支持编目 |
-| GHO | 是 | 有限支持 | 仅针对下述兼容范围提供手动原生还原 |
-| GHS | 是 | 否 | 仅支持分卷发现 |
+| GHO | 否 | 否 | 不支持；请在导入前将镜像转换为 WIM 或 ESD |
+| GHS | 否 | 否 | 不支持 Ghost 分卷格式 |
 
-原生 GHO 支持仅涵盖 Ghost 11.x–12.x 创建的单文件、无密码、分区级 Windows NTFS
-镜像，并支持 Z0、Z1 或 Z3–Z9 压缩。整盘镜像、分卷、加密、其他文件系统、镜像创建
-和不受支持的压缩模式都会被拒绝，并返回明确原因。
+### 为什么不支持 GHO
 
-EasyDeployMesh 实现了自己的边界检查流式 Rust 解码器，不会生成 RAW 缓存。导入验证
-会同时记录压缩文件 SHA-256 和展开后分区 SHA-256。WinPE 将分区流式写入已锁定并卸载
-的目标卷，并在配置启动文件前核对展开后的大小和摘要。
+EasyDeployMesh 不支持导入、验证或还原 Norton Ghost GHO/GHS 镜像。该格式为私有格式，
+真实镜像中存在互不兼容的变体和压缩布局，同时已没有本项目能够安全再分发或依赖的、
+仍在维护的官方恢复引擎。仅能识别文件头不足以证明破坏性还原能够准确重建原始分区，
+因此项目选择失败关闭，不提供不完整或实验性的支持。
+
+现有 GHO/GHS 镜像必须先在隔离、可随时销毁的环境中，使用操作员拥有合法使用权的
+软件完成还原或转换。随后将得到的 Windows 分区捕获为 WIM 或 ESD，完成验证后再导入
+EasyDeployMesh。切勿在开发工作站或包含重要数据的磁盘上测试转换或旧版 Ghost 还原。
 
 ## 快速开始
 
@@ -229,7 +241,6 @@ EasyDeployMesh 假定桌面端主机和部署局域网均由操作员控制。�
 - 在主机端和 Agent 端重复执行镜像完整性验证。
 - 在破坏性操作前重复核对物理磁盘指纹。
 - 受控任务状态转换，每台设备最多只能有一个活动任务。
-- 有界 GHO 解析和展开输出限制。
 - 不回显 enrollment token 的脱敏诊断工具。
 
 请勿在公开 Issue 中披露漏洞利用细节或敏感部署数据。请按照
@@ -244,10 +255,13 @@ EasyDeployMesh 假定桌面端主机和部署局域网均由操作员控制。�
 检查并刷新已经导入的 `boot.wim`。从旧版本升级后，应重新导入一次所选 PE 媒体，以
 排除旧包、旧启动链、媒体专用 Boot Manager 策略或不完整导入留下的不确定状态。
 EasyU 3.6 必须加载源媒体 `bootmgr`，而 Edgeless Beta 4.1.0 必须使用 WIM 内嵌的兼容
-Boot Manager。
+Boot Manager。USM v5F 可使用与其 BCD 所选 WIM 相匹配的改名 Boot Manager 进入桌面。
+托管启动脚本还会将重新生成的 BCD 映射到厂商要求的 `SC6` 虚拟文件名。仅这条
+经过严格识别的 USM 路径会保留源媒体 BCD 的 `nointegritychecks` 和
+`testsigning` 兼容标志；标准 PE 启动包仍保持正常的签名强制检查。
 
 1. 在 **Settings** 中保持控制服务运行，**只停止 PXE 服务**，然后从 PXE 页面重新导入
-   EasyU 或 Edgeless PE 媒体。
+   受支持的 PE 媒体。USM v5F 因无法提供外置工具盘，仅属于可启动的部分兼容状态。
 2. 保持 PXE 停止，在管理员 PowerShell 中从仓库根目录运行包验证程序：
 
    ```powershell

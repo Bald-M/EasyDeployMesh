@@ -20,7 +20,7 @@
 
   <p>
     <a href="LICENSE"><img src="docs/assets/badges/license-apache-2.0.svg" alt="License: Apache 2.0"></a>
-    <a href="https://github.com/Bald-M/EasyDeployMesh/releases/latest"><img src="docs/assets/badges/release-v0.2.4.svg" alt="Release: v0.2.4"></a>
+    <a href="https://github.com/Bald-M/EasyDeployMesh/releases/latest"><img src="docs/assets/badges/release-v0.2.6.svg" alt="Release: v0.2.6"></a>
     <a href="#project-status"><img src="docs/assets/badges/status-active.svg" alt="Status: Active"></a>
   </p>
   <p>
@@ -95,19 +95,31 @@ see [DESIGN.md](DESIGN.md).
 | --- | :---: | :---: | :---: | --- |
 | EasyU 3.6 | Yes | Yes | Yes | Currently verified |
 | Edgeless Beta 4.1.0 | Yes | Yes | Yes | Complete PXE and automated deployment flow verified with Legacy BIOS and UEFI x64 |
+| FirPE v2.1.1 | Yes | Yes | Yes | Complete workflow field-tested |
+| HotPE v2.8.251018 | Yes | Yes | Yes | Complete workflow field-tested |
+| USM v5F | Yes | Not verified | Not verified | Partial compatibility only: reaches the PE desktop, but its external tool package is unavailable over the managed PXE path |
 | Standard network-enabled WinPE | Expected | Expected | Expected | Depends on the Windows build and NIC drivers; validate before use |
 | WePE 2.2 | Native ISO boot only | No | No | Unsupported: the vendor intentionally omits the Windows network module |
 
-EasyU 3.6 and Edgeless Beta 4.1.0 are currently verified for the complete
-automated deployment flow. Edgeless has passed managed PXE boot, Agent
-registration, and automated deployment in both Legacy BIOS and UEFI x64 modes;
-its external runtime resources are embedded in the managed WIM. WePE 2.2 can
-reach its desktop through the native ISO boot path, but it has no supported
-network module, so the EasyDeployMesh Agent cannot register or download
-deployment images. Changing the VMware adapter or injecting only a NIC driver
-does not restore the missing TCP/IP and DHCP stack. EasyDeployMesh does not
-modify the user-selected source ISO; unsupported offline PE media must not be
-used for automated deployment.
+EasyU 3.6, Edgeless Beta 4.1.0, FirPE v2.1.1, and HotPE v2.8.251018 have passed
+the complete managed PXE, Agent registration, and automated deployment flow.
+Edgeless has additionally passed both Legacy BIOS and UEFI x64 modes; its
+external runtime resources are embedded in the managed WIM.
+
+USM v5F can reach its PE desktop after its media-specific Boot Manager and BCD
+policy are preserved. However, the original media keeps approximately 5.6 GiB
+of tools under `USM_TOOL` and additional resources under `CEO`. A managed
+wimboot package does not expose the source ISO as the removable disk expected
+by USM, so its external-tool loader waits for disk initialization and then
+fails. USM v5F is therefore not considered fully supported for automated
+deployment.
+
+WePE 2.2 can reach its desktop through the native ISO boot path, but it has no
+supported network module, so the EasyDeployMesh Agent cannot register or
+download deployment images. Changing the VMware adapter or injecting only a
+NIC driver does not restore the missing TCP/IP and DHCP stack.
+EasyDeployMesh does not modify the user-selected source ISO; partially
+compatible or offline PE media must not be used for automated deployment.
 
 | Format | Catalog | Deploy | Notes |
 | --- | :---: | :---: | --- |
@@ -276,10 +288,16 @@ After upgrading from an older release, reimport the selected PE media once to
 eliminate uncertainty caused by stale packages, boot chains, media-specific
 Boot Manager policies, or incomplete imports. In particular, EasyU 3.6 needs
 its source `bootmgr`, while Edgeless Beta 4.1.0 must use the compatible Boot
-Manager embedded in its WIM.
+Manager embedded in its WIM. USM v5F can reach its desktop using the renamed
+Boot Manager that matches the WIM selected by its BCD and maps the generated
+managed BCD to the vendor's required `SC6` virtual name. Only this strictly
+identified USM path preserves the source media's `nointegritychecks` and
+`testsigning` BCD compatibility flags; standard PE packages keep normal
+signature enforcement.
 
 1. Keep the control service running in **Settings**, stop **only the PXE
-   service**, and reimport the EasyU or Edgeless PE media from the PXE page.
+   service**, and reimport the supported PE media from the PXE page. USM v5F is
+   boot-only partial compatibility because its external tool disk is absent.
 2. Leave PXE stopped and run the package verifier from the repository root in
    an elevated PowerShell session:
 

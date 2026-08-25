@@ -10,6 +10,14 @@ pub const STANDARD_LOADER_PATH: &str = r"\windows\system32\winload.exe";
 pub const SYSTEM32_LOADER_PATH: &str = r"\windows\system32\boot\winload.exe";
 pub const AGENT_SHELL: &str = r"X:\EasyDeployMesh\easydeploymesh-shell.exe";
 
+/// Signature policy applied to the generated WinPE boot entries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WinpeBcdPolicy {
+    Standard,
+    /// Preserves the compatibility flags present in supported USM v5F media.
+    UsmLegacy,
+}
+
 const MAX_HIVE_BYTES: usize = 64 * 1024 * 1024;
 const REGF_HEADER_BYTES: usize = 4096;
 
@@ -131,6 +139,14 @@ fn ramdisk_device_blob() -> Result<Vec<u8>, BcdError> {
 
 /// Creates a fresh deterministic BCD store for the managed PXE package.
 pub fn create_winpe_bcd(loader_path: &str) -> Result<Vec<u8>, BcdError> {
+    create_winpe_bcd_with_policy(loader_path, WinpeBcdPolicy::Standard)
+}
+
+/// Creates a fresh deterministic BCD store with an explicit media policy.
+pub fn create_winpe_bcd_with_policy(
+    loader_path: &str,
+    policy: WinpeBcdPolicy,
+) -> Result<Vec<u8>, BcdError> {
     validate_loader(loader_path)?;
     let mut root = KeyTreeNode::new("BCD00000001");
     root.get_or_create_path("Description").values.extend([
@@ -165,6 +181,14 @@ pub fn create_winpe_bcd(loader_path: &str) -> Result<Vec<u8>, BcdError> {
         DataType::Binary,
         0_u64.to_le_bytes().to_vec(),
     );
+    if policy == WinpeBcdPolicy::UsmLegacy {
+        put(
+            &mut root,
+            &object_path(BOOT_MANAGER_ID, "Elements\\16000048"),
+            DataType::Binary,
+            vec![1],
+        );
+    }
 
     describe(&mut root, RAMDISK_OPTIONS_ID, 0x3000_0000);
     put(
@@ -225,11 +249,19 @@ pub fn create_winpe_bcd(loader_path: &str) -> Result<Vec<u8>, BcdError> {
         DataType::Binary,
         vec![1],
     );
+    if policy == WinpeBcdPolicy::UsmLegacy {
+        put(
+            &mut root,
+            &object_path(WINPE_LOADER_ID, "Elements\\16000049"),
+            DataType::Binary,
+            vec![1],
+        );
+    }
 
     let bytes = HiveBuilder::from_tree(root)
         .build()
         .map_err(registry_error)?;
-    validate_winpe_bcd(&bytes, loader_path)?;
+    validate_winpe_bcd_with_policy(&bytes, loader_path, policy)?;
     Ok(bytes)
 }
 
@@ -253,6 +285,15 @@ fn expect(
 
 /// Validates every boot-critical value before a generated BCD is published.
 pub fn validate_winpe_bcd(bytes: &[u8], loader_path: &str) -> Result<(), BcdError> {
+    validate_winpe_bcd_with_policy(bytes, loader_path, WinpeBcdPolicy::Standard)
+}
+
+/// Validates every boot-critical value, including media-specific policy flags.
+pub fn validate_winpe_bcd_with_policy(
+    bytes: &[u8],
+    loader_path: &str,
+    policy: WinpeBcdPolicy,
+) -> Result<(), BcdError> {
     validate_loader(loader_path)?;
     let hive = checked_hive(bytes)?;
     expect(
@@ -320,6 +361,26 @@ pub fn validate_winpe_bcd(bytes: &[u8], loader_path: &str) -> Result<(), BcdErro
             ramdisk_device_blob()?,
             "ramdisk device",
         )?;
+    }
+    for (id, element, label) in [
+        (BOOT_MANAGER_ID, "16000048", "no-integrity-check policy"),
+        (WINPE_LOADER_ID, "16000049", "test-signing policy"),
+    ] {
+        let actual = raw_value(
+            &hive,
+            &object_path(id, &format!("Elements\\{element}")),
+            "Element",
+        )
+        .ok();
+        match policy {
+            WinpeBcdPolicy::Standard if actual.is_some() => {
+                return Err(BcdError::InvalidBcd(label));
+            }
+            WinpeBcdPolicy::UsmLegacy if actual.as_deref() != Some(&[1]) => {
+                return Err(BcdError::InvalidBcd(label));
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -465,6 +526,27 @@ mod tests {
             create_winpe_bcd(r"\WEPE\B64"),
             Err(BcdError::UnsupportedLoader(_))
         ));
+    }
+
+    #[test]
+    fn usm_legacy_policy_is_explicit_and_does_not_leak_into_standard_bcd() {
+        let standard = create_winpe_bcd(STANDARD_LOADER_PATH).unwrap();
+        validate_winpe_bcd_with_policy(&standard, STANDARD_LOADER_PATH, WinpeBcdPolicy::Standard)
+            .unwrap();
+        assert!(
+            validate_winpe_bcd_with_policy(
+                &standard,
+                STANDARD_LOADER_PATH,
+                WinpeBcdPolicy::UsmLegacy,
+            )
+            .is_err()
+        );
+
+        let usm =
+            create_winpe_bcd_with_policy(SYSTEM32_LOADER_PATH, WinpeBcdPolicy::UsmLegacy).unwrap();
+        validate_winpe_bcd_with_policy(&usm, SYSTEM32_LOADER_PATH, WinpeBcdPolicy::UsmLegacy)
+            .unwrap();
+        assert!(validate_winpe_bcd(&usm, SYSTEM32_LOADER_PATH).is_err());
     }
 
     #[test]

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="174" height="28" role="img" aria-label="Release: v0.2.6">
+  <title>Release: v0.2.6</title>
+  <clipPath id="r"><rect width="174" height="28" rx="3"/></clipPath>
+  <g clip-path="url(#r)">
+    <rect width="88" height="28" fill="#555"/>
+    <rect x="88" width="86" height="28" fill="#0284c7"/>
+  </g>
+  <g fill="#fff" font-family="Verdana,DejaVu Sans,sans-serif" font-size="10" font-weight="700" letter-spacing="1">
+    <text x="44" y="18" text-anchor="middle">RELEASE</text>
+    <text x="131" y="18" text-anchor="middle">V0.2.6</text>
+  </g>
+</svg>

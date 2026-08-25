@@ -687,5 +687,4 @@ mod tests {
         let legacy_z9 = inspect(&mut Cursor::new(image(10, b"unused"))).unwrap();
         assert_eq!(legacy_z9.compression, Compression::High(9));
     }
-
 }

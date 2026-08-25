@@ -272,7 +272,17 @@ replaces the managed boot tree only after the new package is complete. Standard
 media uses bundled iPXE chainloaders for both BIOS and UEFI x64; both paths then
 load the same `boot.ipxe`, wimboot, generated BCD, WIM, and SDI. Standard media,
 including EasyU 3.6, supplies its source `bootmgr` because some customized WIMs
-do not embed `bootmgr.exe`. Edgeless Beta 4.1.0 is identified from its required
+do not embed `bootmgr.exe`. USM v5F uses generation-specific renamed Boot
+Managers; import accepts one only when the BCD-selected WIM has a recognized
+USM generation, the matching `BOOT/USM6MGR` or `BOOT/USM8MGR` exists, and the
+bounded candidate contains Windows Boot Manager identity markers. A standard
+named `bootmgr` always takes precedence, and unmatched or malformed aliases
+fail closed. Because the accepted USM Boot Manager loads `\Boot\SC6`, its
+persisted media policy maps the same generated managed BCD to both virtual
+names `BCD` and `SC6`; refresh preserves that mapping and never restores the
+vendor BCD. That USM-only BCD policy also preserves the source store's
+`nointegritychecks` and `testsigning` compatibility flags; all standard media
+continue to use a BCD without either override. Edgeless Beta 4.1.0 is identified from its required
 external resource layout and instead lets wimboot select the matching BIOS or
 UEFI Boot Manager embedded in the WIM; its vendor-patched source `bootmgr`
 requires a nonstandard `\Boot\BCF` store. This per-media policy is persisted in
