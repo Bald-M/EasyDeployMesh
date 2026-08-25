@@ -238,14 +238,16 @@ EasyDeployMesh 假定桌面端主机和部署局域网均由操作员控制。�
 ## WinPE 现场验收
 
 <details>
-<summary><strong>Windows / EasyU WinPE 现场验收步骤</strong></summary>
+<summary><strong>Windows / 第三方 WinPE 现场验收步骤</strong></summary>
 
 控制服务启动时，EasyDeployMesh 会使用 Agent 和完整 WinPE runtime 的 SHA-256 标记
-检查并刷新已经导入的 `boot.wim`。从旧版本升级后，建议重新导入一次 EasyU PE 媒体，
-以排除旧包、旧启动链或不完整导入留下的不确定状态。
+检查并刷新已经导入的 `boot.wim`。从旧版本升级后，应重新导入一次所选 PE 媒体，以
+排除旧包、旧启动链、媒体专用 Boot Manager 策略或不完整导入留下的不确定状态。
+EasyU 3.6 必须加载源媒体 `bootmgr`，而 Edgeless Beta 4.1.0 必须使用 WIM 内嵌的兼容
+Boot Manager。
 
 1. 在 **Settings** 中保持控制服务运行，**只停止 PXE 服务**，然后从 PXE 页面重新导入
-   EasyU PE 媒体。
+   EasyU 或 Edgeless PE 媒体。
 2. 保持 PXE 停止，在管理员 PowerShell 中从仓库根目录运行包验证程序：
 
    ```powershell
