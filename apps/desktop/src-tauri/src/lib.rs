@@ -1,7 +1,8 @@
 use easydeploymesh_core::{
-    ActivityEvent, ActivitySeverity, ActivitySource, ActivitySubject, ControlPlaneStatus,
-    CreateDeploymentJob, DeploymentJob, ImageArtifact, ImageFormat, JobState, Operation, PxeConfig,
-    PxeDiscoveredClient, PxeServiceStatus, RegisteredDevice, RuntimeStatus,
+    ActivityEvent, ActivitySeverity, ActivitySource, ActivitySubject, Architecture, BootMode,
+    ControlPlaneStatus, CreateDeploymentJob, DeploymentJob, DeploymentTarget, ImageArtifact,
+    ImageFormat, JobState, Operation, PxeConfig, PxeDiscoveredClient, PxeServiceStatus,
+    RegisteredDevice, RuntimeStatus,
 };
 use easydeploymesh_service::{
     ActivityQuery, ActivityRepository, BootPackage, ControlPlane, DeviceRegistry, ImageLibrary,
@@ -126,6 +127,26 @@ async fn sync_agent_bootstrap(status: &ControlPlaneStatus, state: &AppState) -> 
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| format!("could not place the Agent bootstrap inside WinPE: {error}"))?;
+    }
+    let dispatcher_ready =
+        BootPackage::configure_control_dispatcher(&state.pxe_boot_root, endpoint).map_err(
+            |error| format!("could not configure the installer boot dispatcher: {error}"),
+        )?;
+    if !dispatcher_ready
+        && state
+            .jobs
+            .list()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|job| {
+                job.operation == Operation::InstallLinux
+                    && matches!(job.state, JobState::Waiting | JobState::Running)
+            })
+    {
+        return Err(
+            "the active PXE package cannot dispatch Linux installers; import a managed WinPE package"
+                .to_owned(),
+        );
     }
     Ok(())
 }
@@ -303,8 +324,16 @@ fn inject_saved_agent_bootstrap(pxe_boot_root: &std::path::Path) -> Result<bool,
         return Ok(false);
     }
     let bootstrap = fs::read(&bootstrap_path).map_err(|error| error.to_string())?;
+    let bootstrap_config: serde_json::Value =
+        serde_json::from_slice(&bootstrap).map_err(|error| error.to_string())?;
+    let endpoint = bootstrap_config
+        .get("server")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("saved PXE bootstrap has no control endpoint")?;
     BootPackage::inject_agent_bootstrap(pxe_boot_root.join("boot/boot.wim"), &bootstrap)
         .map_err(|error| format!("could not place the Agent bootstrap inside WinPE: {error}"))?;
+    BootPackage::configure_control_dispatcher(pxe_boot_root, endpoint)
+        .map_err(|error| format!("could not configure the installer boot dispatcher: {error}"))?;
     Ok(true)
 }
 
@@ -447,16 +476,25 @@ async fn verify_gho_image(id: String, state: State<'_, AppState>) -> Result<Imag
 /// otherwise a concurrent delete can invalidate the successful preflight before the reference is
 /// persisted. Read-only list operations remain outside this boundary.
 struct DeploymentMutationCoordinator {
+    devices: Arc<DeviceRegistry>,
     images: Arc<ImageLibrary>,
     jobs: Arc<JobRepository>,
+    pxe_boot_root: PathBuf,
     mutation_lock: tokio::sync::Mutex<()>,
 }
 
 impl DeploymentMutationCoordinator {
-    fn new(images: Arc<ImageLibrary>, jobs: Arc<JobRepository>) -> Self {
+    fn new(
+        devices: Arc<DeviceRegistry>,
+        images: Arc<ImageLibrary>,
+        jobs: Arc<JobRepository>,
+        pxe_boot_root: PathBuf,
+    ) -> Self {
         Self {
+            devices,
             images,
             jobs,
+            pxe_boot_root,
             mutation_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -473,7 +511,7 @@ impl DeploymentMutationCoordinator {
         self.images.remove(id).map_err(|error| error.to_string())
     }
 
-    async fn create_job(&self, request: CreateDeploymentJob) -> Result<DeploymentJob, String> {
+    async fn create_job(&self, mut request: CreateDeploymentJob) -> Result<DeploymentJob, String> {
         let _mutation = self.mutation_lock.lock().await;
         let image = self
             .images
@@ -481,6 +519,56 @@ impl DeploymentMutationCoordinator {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("deployment image was not found: {}", request.image_id))?;
         validate_deployment_compatibility(request.operation, &image)?;
+        if request.operation == Operation::InstallLinux {
+            if request.targets.len() != 1 {
+                return Err("a Linux installer job requires exactly one target".to_owned());
+            }
+            if !BootPackage::has_control_dispatcher(&self.pxe_boot_root) {
+                return Err(
+                    "start the managed PXE and control services before queuing a Linux installer job"
+                        .to_owned(),
+                );
+            }
+            let install = request
+                .options
+                .linux_install
+                .as_ref()
+                .ok_or("Linux installer options are required")?;
+            install.validate().map_err(|error| error.to_string())?;
+            let capability = image
+                .installer_capability
+                .as_ref()
+                .filter(|capability| capability.is_supported_ubuntu_server_v1())
+                .ok_or("the ISO has no supported Ubuntu Server installer capability")?;
+            let requested_target = &request.targets[0];
+            let registered = self
+                .devices
+                .list()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|registered| registered.device.id == requested_target.device_id)
+                .ok_or_else(|| {
+                    format!(
+                        "deployment device was not found: {}",
+                        requested_target.device_id
+                    )
+                })?;
+            request.targets[0] =
+                resolve_linux_deployment_target(requested_target, &registered, capability)?;
+            let images = Arc::clone(&self.images);
+            let image_id = request.image_id;
+            tokio::task::spawn_blocking(move || images.prepare_linux_iso(image_id))
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| format!("Linux installer ISO preflight failed: {error}"))?;
+            return self
+                .jobs
+                .enqueue(request)
+                .map_err(|error| error.to_string());
+        }
+        if request.options.linux_install.is_some() {
+            return Err("Linux installer options cannot be used with a Windows job".to_owned());
+        }
         for target in &request.targets {
             request
                 .options
@@ -509,6 +597,7 @@ impl DeploymentMutationCoordinator {
                     "GHO capture is not supported".to_owned(),
                 ),
             ),
+            Operation::InstallLinux => unreachable!("Linux jobs return after ISO preflight"),
         })
         .await
         .map_err(|error| error.to_string())?
@@ -541,6 +630,72 @@ impl DeploymentMutationCoordinator {
         let _mutation = self.mutation_lock.lock().await;
         self.jobs.remove(id).map_err(|error| error.to_string())
     }
+}
+
+fn resolve_linux_deployment_target(
+    requested: &DeploymentTarget,
+    registered: &RegisteredDevice,
+    capability: &easydeploymesh_core::InstallerCapability,
+) -> Result<DeploymentTarget, String> {
+    if !registered.online {
+        return Err("the Linux deployment target must have a recent inventory".to_owned());
+    }
+    if registered.device.architecture != Architecture::X86_64
+        || registered.device.boot_mode != BootMode::Uefi
+    {
+        return Err("Linux ISO deployment currently requires x86_64 UEFI targets".to_owned());
+    }
+    if registered.device.memory_bytes < capability.minimum_memory_bytes {
+        return Err(format!(
+            "target memory is below the installer minimum of {} bytes",
+            capability.minimum_memory_bytes
+        ));
+    }
+    let selected = registered
+        .device
+        .disks
+        .iter()
+        .find(|disk| disk.id.eq_ignore_ascii_case(&requested.target_disk_id))
+        .ok_or_else(|| "the selected disk is absent from the current inventory".to_owned())?;
+    let serial = selected
+        .serial
+        .as_deref()
+        .map(str::trim)
+        .filter(|serial| !serial.is_empty())
+        .ok_or("Linux ISO deployment requires a target disk with a stable serial")?;
+    let matching_fingerprints = registered
+        .device
+        .disks
+        .iter()
+        .filter(|disk| {
+            disk.model
+                .trim()
+                .eq_ignore_ascii_case(selected.model.trim())
+                && disk.size_bytes.abs_diff(selected.size_bytes) <= 1024 * 1024
+                && disk
+                    .serial
+                    .as_deref()
+                    .is_some_and(|actual| actual.trim().eq_ignore_ascii_case(serial))
+        })
+        .count();
+    if matching_fingerprints != 1 {
+        return Err(
+            "the selected disk does not have a unique stable hardware fingerprint".to_owned(),
+        );
+    }
+    if selected.size_bytes < capability.minimum_disk_bytes {
+        return Err(format!(
+            "target disk is below the installer minimum of {} bytes",
+            capability.minimum_disk_bytes
+        ));
+    }
+    Ok(DeploymentTarget {
+        device_id: registered.device.id,
+        target_disk_id: selected.id.clone(),
+        target_disk_model: selected.model.trim().to_owned(),
+        target_disk_serial: Some(serial.to_owned()),
+        target_disk_size_bytes: selected.size_bytes,
+    })
 }
 
 #[tauri::command]
@@ -592,6 +747,18 @@ fn validate_deployment_compatibility(
     }
 
     match image.format {
+        ImageFormat::Iso
+            if operation == Operation::InstallLinux
+                && image
+                    .installer_capability
+                    .as_ref()
+                    .is_some_and(|capability| capability.is_supported_ubuntu_server_v1()) =>
+        {
+            Ok(())
+        }
+        ImageFormat::Iso => Err(
+            "the ISO is not a supported, verified Ubuntu Server 24.04 amd64 installer".to_owned(),
+        ),
         ImageFormat::Gho if operation == Operation::DeployGho => Ok(()),
         ImageFormat::Gho => Err(format!(
             "deployment operation {operation:?} does not match a GHO image"
@@ -615,6 +782,22 @@ fn transition_job(
     state: State<'_, AppState>,
 ) -> Result<DeploymentJob, String> {
     let id = Uuid::parse_str(&id).map_err(|error| error.to_string())?;
+    let current = state
+        .jobs
+        .list()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|job| job.id == id)
+        .ok_or_else(|| format!("deployment job was not found: {id}"))?;
+    if current.operation == Operation::InstallLinux
+        && current.state == JobState::Running
+        && matches!(next_state, JobState::Paused | JobState::Cancelled)
+    {
+        return Err(
+            "a Linux installer cannot be safely paused or cancelled after disk authorization"
+                .to_owned(),
+        );
+    }
     let updated = state
         .jobs
         .transition(id, next_state)
@@ -789,9 +972,12 @@ pub fn run() {
             let activities = Arc::new(ActivityRepository::open(
                 app_data_dir.join("activities.json"),
             )?);
+            let pxe_boot_root = app_data_dir.join("pxe-boot");
             let deployment_mutations = Arc::new(DeploymentMutationCoordinator::new(
+                Arc::clone(&devices),
                 Arc::clone(&images),
                 Arc::clone(&jobs),
+                pxe_boot_root.clone(),
             ));
             app.manage(AppState {
                 activities: Arc::clone(&activities),
@@ -810,7 +996,7 @@ pub fn run() {
                     activities,
                 )?),
                 pxe_config_path: app_data_dir.join("pxe-config.json"),
-                pxe_boot_root: app_data_dir.join("pxe-boot"),
+                pxe_boot_root,
                 agent_binary_path,
                 offline_devices: Mutex::new(HashSet::new()),
             });
@@ -852,7 +1038,9 @@ pub fn run() {
 mod tests {
     use super::*;
     use easydeploymesh_core::{
-        DeploymentOptions, DeploymentTarget, ImageFormat, Operation, PartitionPlan,
+        DeploymentOptions, DeploymentTarget, Device, Disk, ImageFormat, InstallerBootAsset,
+        InstallerCapability, InstallerDistribution, InstallerProfile, Operation, PartitionPlan,
+        SystemDetails,
     };
 
     #[test]
@@ -938,6 +1126,89 @@ mod tests {
         }
     }
 
+    fn linux_capability() -> InstallerCapability {
+        let asset = |path: &str| InstallerBootAsset {
+            path: path.to_owned(),
+            size_bytes: 1024,
+            sha256: "ab".repeat(32),
+        };
+        InstallerCapability {
+            deployable: true,
+            distribution: InstallerDistribution::Ubuntu,
+            release: "24.04".to_owned(),
+            architecture: Architecture::X86_64,
+            profile: InstallerProfile::UbuntuAutoinstall,
+            profile_version: easydeploymesh_core::UBUNTU_AUTOINSTALL_PROFILE_VERSION,
+            kernel: asset("installer/casper/vmlinuz"),
+            initrd: asset("installer/casper/initrd"),
+            minimum_memory_bytes: easydeploymesh_core::UBUNTU_MINIMUM_MEMORY_BYTES,
+            minimum_disk_bytes: easydeploymesh_core::UBUNTU_MINIMUM_DISK_BYTES,
+            blocked_reason: None,
+        }
+    }
+
+    fn linux_registered_device(disks: Vec<Disk>) -> RegisteredDevice {
+        let now = chrono::Utc::now();
+        RegisteredDevice {
+            device: Device {
+                id: Uuid::new_v4(),
+                hostname: Some("installer-target".to_owned()),
+                mac_address: "02:00:00:00:00:01".to_owned(),
+                ip_address: "192.0.2.20".to_owned(),
+                model: None,
+                serial: None,
+                cpu_model: None,
+                physical_core_count: None,
+                logical_processor_count: 4,
+                memory_bytes: 4 * 1024 * 1024 * 1024,
+                system_details: SystemDetails::default(),
+                architecture: Architecture::X86_64,
+                boot_mode: BootMode::Uefi,
+                disks,
+                last_seen_at: now,
+            },
+            agent_version: "0.2.6".to_owned(),
+            first_seen_at: now,
+            online: true,
+        }
+    }
+
+    #[test]
+    fn linux_target_resolution_uses_authoritative_inventory_and_requires_unique_serial() {
+        let disk = Disk {
+            id: r"\\.\PhysicalDrive2".to_owned(),
+            model: "Safe NVMe".to_owned(),
+            serial: Some("SERIAL-002".to_owned()),
+            size_bytes: 64 * 1024 * 1024 * 1024,
+            is_system: false,
+        };
+        let registered = linux_registered_device(vec![disk.clone()]);
+        let requested = DeploymentTarget {
+            device_id: registered.device.id,
+            target_disk_id: disk.id.clone(),
+            target_disk_model: "untrusted UI model".to_owned(),
+            target_disk_serial: None,
+            target_disk_size_bytes: 1,
+        };
+
+        let resolved =
+            resolve_linux_deployment_target(&requested, &registered, &linux_capability())
+                .expect("a unique strong disk fingerprint should resolve");
+
+        assert_eq!(resolved.target_disk_model, disk.model.clone());
+        assert_eq!(resolved.target_disk_serial, disk.serial.clone());
+        assert_eq!(resolved.target_disk_size_bytes, disk.size_bytes);
+
+        let mut ambiguous = registered;
+        ambiguous.device.disks.push(Disk {
+            id: r"\\.\PhysicalDrive3".to_owned(),
+            ..disk
+        });
+        let error = resolve_linux_deployment_target(&requested, &ambiguous, &linux_capability())
+            .expect_err("a repeated hardware fingerprint must fail closed");
+        assert!(error.contains("unique stable hardware fingerprint"));
+    }
+
     #[tokio::test]
     async fn job_creation_and_image_removal_preserve_the_reference_invariant() {
         let temp = tempfile::tempdir().expect("temporary directory should be available");
@@ -947,9 +1218,14 @@ mod tests {
         let jobs = Arc::new(
             JobRepository::open(temp.path().join("jobs")).expect("job repository should open"),
         );
+        let devices = Arc::new(
+            DeviceRegistry::open(temp.path().join("devices")).expect("device registry should open"),
+        );
         let coordinator = Arc::new(DeploymentMutationCoordinator::new(
+            devices,
             Arc::clone(&images),
             Arc::clone(&jobs),
+            temp.path().join("pxe"),
         ));
 
         let source = temp.path().join("windows.wim");
@@ -970,6 +1246,7 @@ mod tests {
             options: DeploymentOptions {
                 image_index: 1,
                 partition_plan: PartitionPlan::uefi_gpt(),
+                linux_install: None,
             },
         };
 
@@ -1021,7 +1298,15 @@ mod tests {
         let jobs = Arc::new(
             JobRepository::open(temp.path().join("jobs")).expect("job repository should open"),
         );
-        let coordinator = DeploymentMutationCoordinator::new(Arc::clone(&images), jobs);
+        let devices = Arc::new(
+            DeviceRegistry::open(temp.path().join("devices")).expect("device registry should open"),
+        );
+        let coordinator = DeploymentMutationCoordinator::new(
+            devices,
+            Arc::clone(&images),
+            jobs,
+            temp.path().join("pxe"),
+        );
         let source = temp.path().join("windows.wim");
         fs::write(&source, wim_fixture(b"capacity-preflight")).expect("WIM fixture should write");
         let image = images.import(&source).expect("WIM fixture should import");
@@ -1056,6 +1341,7 @@ mod tests {
             options: DeploymentOptions {
                 image_index: 1,
                 partition_plan: plan,
+                linux_install: None,
             },
         };
 
@@ -1097,8 +1383,10 @@ mod tests {
             activities,
             control_plane: Arc::clone(&control_plane),
             deployment_mutations: Arc::new(DeploymentMutationCoordinator::new(
+                Arc::clone(&devices),
                 Arc::clone(&images),
                 Arc::clone(&jobs),
+                temp.path().join("replaced-pxe-package"),
             )),
             devices,
             images,

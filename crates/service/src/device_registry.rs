@@ -133,6 +133,22 @@ impl DeviceRegistry {
         Ok(inspect(&current.device))
     }
 
+    /// Resolves PXE identity through the same canonical MAC representation used at registration.
+    pub(crate) fn find_by_mac(
+        &self,
+        mac_address: &str,
+    ) -> Result<Option<Device>, DeviceRegistryError> {
+        let mac_address = normalize_mac_address(mac_address)?;
+        let devices = self
+            .devices
+            .read()
+            .map_err(|_| DeviceRegistryError::LockPoisoned)?;
+        Ok(devices
+            .iter()
+            .find(|record| record.device.mac_address == mac_address)
+            .map(|record| record.device.clone()))
+    }
+
     pub fn connected_count(&self) -> Result<u32, DeviceRegistryError> {
         let count = self.list()?.iter().filter(|device| device.online).count();
         Ok(u32::try_from(count).unwrap_or(u32::MAX))
@@ -566,5 +582,30 @@ mod tests {
             second_registration.device_token
         );
         assert_eq!(registry.list().expect("devices should list").len(), 1);
+    }
+
+    #[test]
+    fn pxe_lookup_normalizes_mac_and_rejects_malformed_identity() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let registry = DeviceRegistry::open(temp.path()).expect("registry should open");
+        let (registered, _) = registry
+            .register(
+                inventory("AA:BB:CC:DD:EE:FF"),
+                "192.168.10.20".parse().expect("IP should parse"),
+            )
+            .expect("device should register");
+
+        assert_eq!(
+            registry
+                .find_by_mac("aa-bb-cc-dd-ee-ff")
+                .expect("lookup should succeed")
+                .expect("device should exist")
+                .id,
+            registered.device.id
+        );
+        assert!(matches!(
+            registry.find_by_mac("not-a-mac"),
+            Err(DeviceRegistryError::InvalidMacAddress(_))
+        ));
     }
 }

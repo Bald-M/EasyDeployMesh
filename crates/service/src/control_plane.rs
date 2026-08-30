@@ -1,3 +1,6 @@
+#[path = "installer_deployment.rs"]
+mod installer_deployment;
+
 use crate::device_registry::{digest_secret, generate_secret, secret_matches};
 use crate::{
     ActivityRepository, DeviceRegistry, DeviceRegistryError, ImageLibrary, ImageLibraryError,
@@ -6,7 +9,7 @@ use crate::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{ConnectInfo, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -14,7 +17,12 @@ use axum::{
 use easydeploymesh_core::{
     ActivitySeverity, ActivitySource, ActivitySubject, AgentDeploymentImage, AgentGhoDeployment,
     AgentHeartbeat, AgentHeartbeatAck, AgentInventory, AgentJobCompletion, AgentJobLease,
-    AgentJobProgress, AgentRegistration, ControlPlaneStatus, JobState, Operation,
+    AgentJobProgress, AgentRegistration, ControlPlaneStatus, JobState, LinuxInstallerGuardRequest,
+    Operation,
+};
+use installer_deployment::{
+    BootOutcome, FirstBootRequest, InstallerDeployment, InstallerDeploymentError,
+    InstallerEventRequest, InstallerMediaKind, render_boot_script,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -34,6 +42,7 @@ use tokio::{
 use uuid::Uuid;
 
 const JOB_LEASE_MINUTES: i64 = 120;
+const INSTALLER_BODY_LIMIT_BYTES: usize = 512 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ControlPlaneError {
@@ -62,6 +71,8 @@ struct ApiState {
     images: Arc<ImageLibrary>,
     enrollment_token_digest: String,
     activities: Arc<ActivityRepository>,
+    installer: Arc<InstallerDeployment>,
+    installer_base_url: String,
 }
 
 struct RunningServer {
@@ -138,6 +149,12 @@ impl ControlPlane {
             images: Arc::clone(&self.images),
             enrollment_token_digest: digest_secret(&enrollment_token),
             activities: Arc::clone(&self.activities),
+            installer: Arc::new(InstallerDeployment::new(
+                Arc::clone(&self.registry),
+                Arc::clone(&self.jobs),
+                Arc::clone(&self.images),
+            )),
+            installer_base_url: format!("http://{local_address}"),
         };
         let router = Router::new()
             .route("/health", get(health))
@@ -163,6 +180,40 @@ impl ControlPlane {
                 "/api/v1/agents/{device_id}/jobs/{job_id}/image",
                 get(download_job_image),
             )
+            .route("/api/v1/install/boot.ipxe", get(installer_boot_script))
+            .route(
+                "/api/v1/install/sessions/{session_id}/seed/{token}/user-data",
+                get(installer_user_data),
+            )
+            .route(
+                "/api/v1/install/sessions/{session_id}/seed/{token}/meta-data",
+                get(installer_meta_data),
+            )
+            .route(
+                "/api/v1/install/sessions/{session_id}/guard",
+                post(installer_guard),
+            )
+            .route(
+                "/api/v1/install/sessions/{session_id}/kernel",
+                get(installer_kernel),
+            )
+            .route(
+                "/api/v1/install/sessions/{session_id}/initrd",
+                get(installer_initrd),
+            )
+            .route(
+                "/api/v1/install/sessions/{session_id}/iso",
+                get(installer_iso),
+            )
+            .route(
+                "/api/v1/install/sessions/{session_id}/events",
+                post(installer_event),
+            )
+            .route(
+                "/api/v1/install/sessions/{session_id}/first-boot",
+                post(installer_first_boot),
+            )
+            .layer(DefaultBodyLimit::max(INSTALLER_BODY_LIMIT_BYTES))
             .with_state(api_state);
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -371,7 +422,7 @@ async fn claim_job(
                                     job.options.image_index,
                                 )
                                 .is_ok(),
-                            Operation::CaptureGho => false,
+                            Operation::CaptureGho | Operation::InstallLinux => false,
                         }
                     });
                 eligible.then_some(job.id)
@@ -646,7 +697,326 @@ fn image_format_extension(format: easydeploymesh_core::ImageFormat) -> &'static 
         easydeploymesh_core::ImageFormat::Wim => "wim",
         easydeploymesh_core::ImageFormat::Esd => "esd",
         easydeploymesh_core::ImageFormat::Swm => "swm",
+        easydeploymesh_core::ImageFormat::Iso => "iso",
     }
+}
+
+#[derive(Deserialize)]
+struct InstallerBootQuery {
+    mac: String,
+    arch: String,
+    platform: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallerSessionQuery {
+    token: String,
+}
+
+async fn installer_boot_script(
+    State(state): State<ApiState>,
+    Query(query): Query<InstallerBootQuery>,
+) -> Response {
+    let base_url = state.installer_base_url.clone();
+    let installer = Arc::clone(&state.installer);
+    let outcome = tokio::task::spawn_blocking(move || {
+        installer.discover(&query.mac, &query.arch, &query.platform, &base_url)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or(BootOutcome::Denied);
+    ipxe_response(render_boot_script(outcome))
+}
+
+async fn installer_user_data(
+    State(state): State<ApiState>,
+    Path((session_id, token)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let session_id = installer_session_id(&session_id)?;
+    let installer = Arc::clone(&state.installer);
+    let user_data =
+        run_installer_blocking(move || installer.initial_user_data(session_id, &token)).await?;
+    text_body_response("text/cloud-config; charset=utf-8", user_data)
+}
+
+async fn installer_meta_data(
+    State(state): State<ApiState>,
+    Path((session_id, token)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let session_id = installer_session_id(&session_id)?;
+    let installer = Arc::clone(&state.installer);
+    let meta_data =
+        run_installer_blocking(move || installer.initial_meta_data(session_id, &token)).await?;
+    text_body_response("text/plain; charset=utf-8", meta_data)
+}
+
+async fn installer_guard(
+    State(state): State<ApiState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<LinuxInstallerGuardRequest>,
+) -> Result<Response, ApiError> {
+    let session_id = installer_session_id(&session_id)?;
+    let token = installer_bearer_token(&headers)?.to_owned();
+    let installer = Arc::clone(&state.installer);
+    let authorization =
+        run_installer_blocking(move || installer.authorize_guard(session_id, &token, request))
+            .await?;
+    record_job_activity(
+        &state,
+        &authorization.job,
+        "linux_installer_handoff",
+        ActivitySeverity::Info,
+        None,
+    );
+    text_body_response(
+        "text/cloud-config; charset=utf-8",
+        authorization.autoinstall,
+    )
+}
+
+async fn installer_kernel(
+    State(state): State<ApiState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<InstallerSessionQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    installer_media_response(
+        state,
+        session_id,
+        query.token,
+        headers,
+        InstallerMediaKind::Kernel,
+    )
+    .await
+}
+
+async fn installer_initrd(
+    State(state): State<ApiState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<InstallerSessionQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    installer_media_response(
+        state,
+        session_id,
+        query.token,
+        headers,
+        InstallerMediaKind::Initrd,
+    )
+    .await
+}
+
+async fn installer_iso(
+    State(state): State<ApiState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<InstallerSessionQuery>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    installer_media_response(
+        state,
+        session_id,
+        query.token,
+        headers,
+        InstallerMediaKind::Iso,
+    )
+    .await
+}
+
+async fn installer_media_response(
+    state: ApiState,
+    session_id: String,
+    token: String,
+    headers: HeaderMap,
+    kind: InstallerMediaKind,
+) -> Result<Response, ApiError> {
+    let session_id = installer_session_id(&session_id)?;
+    let installer = Arc::clone(&state.installer);
+    let media = run_installer_blocking(move || installer.media(session_id, &token, kind)).await?;
+    let requested_range = parse_single_range(headers.get(header::RANGE), media.size_bytes)?;
+    let mut file = tokio::fs::File::open(&media.canonical_path)
+        .await
+        .map_err(|_| ApiError::Installer(InstallerDeploymentError::MediaIntegrity))?;
+    let actual_size = file
+        .metadata()
+        .await
+        .map_err(|_| ApiError::Installer(InstallerDeploymentError::MediaIntegrity))?
+        .len();
+    if actual_size != media.size_bytes {
+        return Err(ApiError::Installer(
+            InstallerDeploymentError::MediaIntegrity,
+        ));
+    }
+    let (status, start, end) = requested_range
+        .map_or((StatusCode::OK, 0, media.size_bytes - 1), |(start, end)| {
+            (StatusCode::PARTIAL_CONTENT, start, end)
+        });
+    if start != 0 {
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|_| ApiError::Installer(InstallerDeploymentError::MediaIntegrity))?;
+    }
+    let length = end - start + 1;
+    let stream = tokio_util::io::ReaderStream::new(file.take(length));
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, media.content_type)
+        .header(header::CONTENT_LENGTH, length)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::ETAG, format!("\"{}\"", media.sha256))
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", media.file_name),
+        );
+    if status == StatusCode::PARTIAL_CONTENT {
+        response = response.header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{}", media.size_bytes),
+        );
+    }
+    response
+        .body(Body::from_stream(stream))
+        .map_err(|_| ApiError::InstallerTask)
+}
+
+async fn installer_event(
+    State(state): State<ApiState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<InstallerEventRequest>,
+) -> Result<StatusCode, ApiError> {
+    let session_id = installer_session_id(&session_id)?;
+    let token = installer_bearer_token(&headers)?.to_owned();
+    let installer = Arc::clone(&state.installer);
+    let updated =
+        run_installer_blocking(move || installer.report_event(session_id, &token, request)).await?;
+    record_job_activity(
+        &state,
+        &updated,
+        if updated.state == JobState::Failed {
+            "linux_installer_failed"
+        } else {
+            "linux_installer_event"
+        },
+        if updated.state == JobState::Failed {
+            ActivitySeverity::Error
+        } else {
+            ActivitySeverity::Info
+        },
+        updated.error_message.clone(),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn installer_first_boot(
+    State(state): State<ApiState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<FirstBootRequest>,
+) -> Result<StatusCode, ApiError> {
+    let session_id = installer_session_id(&session_id)?;
+    let token = installer_bearer_token(&headers)?.to_owned();
+    let installer = Arc::clone(&state.installer);
+    let updated = run_installer_blocking(move || {
+        installer.complete_first_boot(session_id, &token, request.attempt_id)
+    })
+    .await?;
+    if let Some(updated) = updated {
+        record_job_activity(
+            &state,
+            &updated,
+            "job_succeeded",
+            ActivitySeverity::Success,
+            None,
+        );
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn run_installer_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, InstallerDeploymentError> + Send + 'static,
+) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| ApiError::InstallerTask)?
+        .map_err(ApiError::Installer)
+}
+
+fn installer_session_id(value: &str) -> Result<Uuid, ApiError> {
+    Uuid::parse_str(value).map_err(|_| ApiError::NotFound)
+}
+
+fn installer_bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
+    bearer_token(headers).ok_or(ApiError::Installer(InstallerDeploymentError::Unauthorized))
+}
+
+fn ipxe_response(script: String) -> Response {
+    text_body_response("text/plain; charset=utf-8", script)
+        .unwrap_or_else(|error| error.into_response())
+}
+
+fn text_body_response(content_type: &'static str, body: String) -> Result<Response, ApiError> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(body))
+        .map_err(|_| ApiError::InstallerTask)
+}
+
+fn parse_single_range(
+    header_value: Option<&axum::http::HeaderValue>,
+    total_length: u64,
+) -> Result<Option<(u64, u64)>, ApiError> {
+    let Some(header_value) = header_value else {
+        return Ok(None);
+    };
+    let value = header_value
+        .to_str()
+        .ok()
+        .filter(|value| value.len() <= 128)
+        .and_then(|value| value.strip_prefix("bytes="))
+        .filter(|value| !value.contains(','))
+        .ok_or(ApiError::RangeNotSatisfiable(total_length))?;
+    let (start, end) = value
+        .split_once('-')
+        .ok_or(ApiError::RangeNotSatisfiable(total_length))?;
+    if start.is_empty() {
+        let suffix_length =
+            parse_range_number(end).ok_or(ApiError::RangeNotSatisfiable(total_length))?;
+        if suffix_length == 0 || total_length == 0 {
+            return Err(ApiError::RangeNotSatisfiable(total_length));
+        }
+        return Ok(Some((
+            total_length.saturating_sub(suffix_length.min(total_length)),
+            total_length - 1,
+        )));
+    }
+    let start = parse_range_number(start).ok_or(ApiError::RangeNotSatisfiable(total_length))?;
+    if start >= total_length {
+        return Err(ApiError::RangeNotSatisfiable(total_length));
+    }
+    let end = if end.is_empty() {
+        total_length - 1
+    } else {
+        parse_range_number(end)
+            .ok_or(ApiError::RangeNotSatisfiable(total_length))?
+            .min(total_length - 1)
+    };
+    if end < start {
+        return Err(ApiError::RangeNotSatisfiable(total_length));
+    }
+    Ok(Some((start, end)))
+}
+
+fn parse_range_number(value: &str) -> Option<u64> {
+    if value.is_empty() || value.len() > 20 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
 }
 
 fn authenticated_device(
@@ -743,10 +1113,17 @@ enum ApiError {
     Jobs(JobRepositoryError),
     Images(ImageLibraryError),
     Conflict(String),
+    Installer(InstallerDeploymentError),
+    InstallerTask,
+    RangeNotSatisfiable(u64),
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let unsatisfied_length = match &self {
+            Self::RangeNotSatisfiable(length) => Some(*length),
+            _ => None,
+        };
         let (status, message) = match self {
             Self::Unauthorized | Self::Registry(DeviceRegistryError::Unauthorized) => {
                 (StatusCode::UNAUTHORIZED, "authentication failed".to_owned())
@@ -767,6 +1144,46 @@ impl IntoResponse for ApiError {
             Self::Images(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
             Self::Conflict(message) => (StatusCode::CONFLICT, message),
             Self::Registry(error) => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+            Self::Installer(InstallerDeploymentError::Unauthorized) => (
+                StatusCode::UNAUTHORIZED,
+                "installer session authentication failed".to_owned(),
+            ),
+            Self::Installer(InstallerDeploymentError::Expired) => {
+                (StatusCode::GONE, "installer session expired".to_owned())
+            }
+            Self::Installer(
+                InstallerDeploymentError::AuthorizationInProgress
+                | InstallerDeploymentError::InvalidSessionState,
+            ) => (
+                StatusCode::CONFLICT,
+                "installer session is not ready for this request".to_owned(),
+            ),
+            Self::Installer(
+                InstallerDeploymentError::InvalidRequest
+                | InstallerDeploymentError::TargetDiskMismatch,
+            ) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "installer safety validation failed".to_owned(),
+            ),
+            Self::Installer(InstallerDeploymentError::MediaIntegrity) => (
+                StatusCode::CONFLICT,
+                "installer media integrity validation failed".to_owned(),
+            ),
+            Self::Installer(
+                InstallerDeploymentError::SessionCapacity
+                | InstallerDeploymentError::SessionState
+                | InstallerDeploymentError::Registry(_)
+                | InstallerDeploymentError::Jobs(_)
+                | InstallerDeploymentError::Configuration,
+            )
+            | Self::InstallerTask => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "installer service is unavailable".to_owned(),
+            ),
+            Self::RangeNotSatisfiable(_) => (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "requested byte range is not satisfiable".to_owned(),
+            ),
         };
 
         #[derive(Serialize)]
@@ -774,7 +1191,13 @@ impl IntoResponse for ApiError {
             error: String,
         }
 
-        (status, Json(ErrorBody { error: message })).into_response()
+        let mut response = (status, Json(ErrorBody { error: message })).into_response();
+        if let Some(length) = unsatisfied_length {
+            if let Ok(value) = format!("bytes */{length}").parse() {
+                response.headers_mut().insert(header::CONTENT_RANGE, value);
+            }
+        }
+        response
     }
 }
 
@@ -784,7 +1207,16 @@ mod tests {
     use easydeploymesh_core::{
         AgentJobCompletion, AgentJobLease, AgentJobProgress, Architecture, BootMode,
         CreateDeploymentJob, DeploymentOptions, DeploymentStage, DeploymentTarget, Disk, JobState,
-        Operation, PartitionPlan,
+        LinuxInstallOptions, LinuxInstallerGuardRequest, LinuxInstallerObservedDisk, Operation,
+        PartitionPlan,
+    };
+    use hadris_iso::{
+        joliet::JolietLevel,
+        read::PathSeparator,
+        write::{
+            InputTree, IsoImageWriter,
+            options::{BaseIsoLevel, CreationFeatures, IsoFormatOptions},
+        },
     };
 
     fn disk() -> Disk {
@@ -815,6 +1247,135 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn dynamic_boot_distinguishes_no_assignment_from_a_refused_linux_assignment() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let registry = Arc::new(DeviceRegistry::open(temp.path()).expect("registry should open"));
+        let jobs =
+            Arc::new(JobRepository::open(temp.path().join("jobs")).expect("jobs should open"));
+        let images =
+            Arc::new(ImageLibrary::open(temp.path().join("images")).expect("images should open"));
+        let (registered, registration) = registry
+            .register(
+                inventory(),
+                "192.0.2.20".parse().expect("test IP should parse"),
+            )
+            .expect("device should register");
+        let control_plane = ControlPlane::new(
+            Arc::clone(&registry),
+            Arc::clone(&jobs),
+            images,
+            Arc::new(ActivityRepository::open(temp.path().join("activities.json")).unwrap()),
+        );
+        let status = control_plane.start("127.0.0.1", 0).await.unwrap();
+        let endpoint = status.endpoint.expect("endpoint should be available");
+        let client = reqwest::Client::new();
+        let boot_url = format!(
+            "{endpoint}/api/v1/install/boot.ipxe?mac={}&arch=x86_64&platform=efi",
+            registered.device.mac_address
+        );
+
+        let no_assignment = client
+            .get(&boot_url)
+            .send()
+            .await
+            .expect("boot request should complete")
+            .error_for_status()
+            .expect("boot request should be accepted")
+            .text()
+            .await
+            .expect("boot script should decode");
+        assert!(no_assignment.contains("easydeploymesh-winpe.ipxe"));
+
+        let queued = jobs
+            .enqueue(CreateDeploymentJob {
+                name: "Refused Linux assignment".to_owned(),
+                operation: Operation::InstallLinux,
+                image_id: Uuid::new_v4(),
+                targets: vec![DeploymentTarget {
+                    device_id: registered.device.id,
+                    target_disk_id: disk().id,
+                    target_disk_model: disk().model,
+                    target_disk_serial: disk().serial,
+                    target_disk_size_bytes: disk().size_bytes,
+                }],
+                options: DeploymentOptions {
+                    linux_install: Some(LinuxInstallOptions {
+                        hostname: "lab-linux-01".to_owned(),
+                        username: "operator".to_owned(),
+                        ssh_authorized_keys: vec![
+                            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestControlPlaneKey".to_owned(),
+                        ],
+                    }),
+                    ..DeploymentOptions::default()
+                },
+            })
+            .expect("Linux job should enqueue");
+
+        let agent_claim = client
+            .post(format!(
+                "{endpoint}/api/v1/agents/{}/jobs/claim",
+                registered.device.id
+            ))
+            .bearer_auth(&registration.device_token)
+            .send()
+            .await
+            .expect("Agent claim should complete")
+            .error_for_status()
+            .expect("Agent claim should be accepted")
+            .json::<Option<AgentJobLease>>()
+            .await
+            .expect("Agent claim should decode");
+        assert!(agent_claim.is_none());
+
+        let denied = client
+            .get(&boot_url)
+            .send()
+            .await
+            .expect("boot request should complete")
+            .error_for_status()
+            .expect("denial script should be returned as iPXE")
+            .text()
+            .await
+            .expect("denial script should decode");
+        assert!(denied.contains("assignment denied"));
+        assert!(!denied.contains("easydeploymesh-winpe.ipxe"));
+        assert_eq!(
+            jobs.list()
+                .expect("jobs should list")
+                .into_iter()
+                .find(|job| job.id == queued.id)
+                .expect("job should remain")
+                .state,
+            JobState::Waiting
+        );
+        control_plane.stop().await.unwrap();
+    }
+
+    #[test]
+    fn installer_range_parser_accepts_one_bounded_range_and_rejects_ambiguity() {
+        let explicit = axum::http::HeaderValue::from_static("bytes=10-19");
+        assert!(matches!(
+            parse_single_range(Some(&explicit), 100),
+            Ok(Some((10, 19)))
+        ));
+        let suffix = axum::http::HeaderValue::from_static("bytes=-5");
+        assert!(matches!(
+            parse_single_range(Some(&suffix), 100),
+            Ok(Some((95, 99)))
+        ));
+        let multiple = axum::http::HeaderValue::from_static("bytes=0-1,10-11");
+        assert!(matches!(
+            parse_single_range(Some(&multiple), 100),
+            Err(ApiError::RangeNotSatisfiable(100))
+        ));
+        let overflow = axum::http::HeaderValue::from_static("bytes=100-");
+        assert!(matches!(
+            parse_single_range(Some(&overflow), 100),
+            Err(ApiError::RangeNotSatisfiable(100))
+        ));
+    }
+
     fn wim_fixture(payload: &[u8]) -> Vec<u8> {
         const HEADER_SIZE: usize = 208;
         let mut contents = vec![0_u8; HEADER_SIZE];
@@ -826,6 +1387,239 @@ mod tests {
         contents[44..48].copy_from_slice(&1_u32.to_le_bytes());
         contents.extend_from_slice(payload);
         contents
+    }
+
+    fn create_ubuntu_iso(path: &std::path::Path) {
+        const BOOT_ASSET_BYTES: usize = 1024 * 1024;
+        let source = path
+            .parent()
+            .expect("fixture ISO should have a parent")
+            .join(format!("control-plane-iso-source-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(source.join(".disk")).unwrap();
+        std::fs::create_dir_all(source.join("casper")).unwrap();
+        std::fs::write(
+            source.join(".disk/info"),
+            "Ubuntu-Server 24.04.3 LTS \"Noble Numbat\" - Release amd64 (20250805)",
+        )
+        .unwrap();
+        let mut kernel = vec![0x5a_u8; BOOT_ASSET_BYTES];
+        kernel[0x1fe..0x200].copy_from_slice(&[0x55, 0xaa]);
+        kernel[0x202..0x206].copy_from_slice(b"HdrS");
+        kernel[0x206..0x208].copy_from_slice(&0x020b_u16.to_le_bytes());
+        std::fs::write(source.join("casper/vmlinuz"), kernel).unwrap();
+        std::fs::write(
+            source.join("casper/initrd"),
+            vec![0xa5_u8; BOOT_ASSET_BYTES],
+        )
+        .unwrap();
+
+        let input = InputTree::from_fs(&source, PathSeparator::ForwardSlash).unwrap();
+        let options = IsoFormatOptions {
+            volume_name: "UBUNTU_SERVER_2404".to_owned(),
+            system_id: None,
+            volume_set_id: None,
+            publisher_id: Some("Canonical".to_owned()),
+            preparer_id: Some("EasyDeployMesh tests".to_owned()),
+            application_id: Some("Ubuntu Server test media".to_owned()),
+            sector_size: 2048,
+            path_separator: PathSeparator::ForwardSlash,
+            features: CreationFeatures {
+                filenames: BaseIsoLevel::Level2 {
+                    supports_lowercase: true,
+                    supports_rrip: false,
+                },
+                long_filenames: false,
+                joliet: Some(JolietLevel::Level3),
+                rock_ridge: None,
+                el_torito: None,
+                hybrid_boot: None,
+            },
+            strict_charset: false,
+        };
+        let output = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        IsoImageWriter::create(output, input, options).unwrap();
+    }
+
+    #[tokio::test]
+    async fn linux_installer_session_guards_storage_and_requires_matching_first_boot_attempt() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let registry = Arc::new(DeviceRegistry::open(temp.path()).expect("registry should open"));
+        let jobs =
+            Arc::new(JobRepository::open(temp.path().join("jobs")).expect("jobs should open"));
+        let images =
+            Arc::new(ImageLibrary::open(temp.path().join("images")).expect("images should open"));
+        let (registered, _) = registry
+            .register(
+                inventory(),
+                "192.0.2.20".parse().expect("test IP should parse"),
+            )
+            .expect("device should register");
+        let iso_path = temp.path().join("ubuntu-server.iso");
+        create_ubuntu_iso(&iso_path);
+        let image = images.import(&iso_path).expect("Ubuntu ISO should import");
+        let queued = jobs
+            .enqueue(CreateDeploymentJob {
+                name: "Guarded Ubuntu deployment".to_owned(),
+                operation: Operation::InstallLinux,
+                image_id: image.id,
+                targets: vec![DeploymentTarget {
+                    device_id: registered.device.id,
+                    target_disk_id: disk().id,
+                    target_disk_model: disk().model,
+                    target_disk_serial: disk().serial,
+                    target_disk_size_bytes: disk().size_bytes,
+                }],
+                options: DeploymentOptions {
+                    linux_install: Some(LinuxInstallOptions {
+                        hostname: "lab-linux-01".to_owned(),
+                        username: "operator".to_owned(),
+                        ssh_authorized_keys: vec![
+                            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestInstallerSessionKey"
+                                .to_owned(),
+                        ],
+                    }),
+                    ..DeploymentOptions::default()
+                },
+            })
+            .expect("Linux job should enqueue");
+        let control_plane = ControlPlane::new(
+            registry,
+            Arc::clone(&jobs),
+            images,
+            Arc::new(ActivityRepository::open(temp.path().join("activities.json")).unwrap()),
+        );
+        let status = control_plane.start("127.0.0.1", 0).await.unwrap();
+        let endpoint = status.endpoint.expect("endpoint should be available");
+        let client = reqwest::Client::new();
+        let script = client
+            .get(format!(
+                "{endpoint}/api/v1/install/boot.ipxe?mac={}&arch=x86_64&platform=efi",
+                registered.device.mac_address
+            ))
+            .header(reqwest::header::HOST, "attacker.invalid:9999")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let script_value = |name: &str| {
+            script
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("set {name} ")))
+                .expect("assignment variable should exist")
+                .to_owned()
+        };
+        let session_url = script_value("edm-session");
+        let attempt_id = Uuid::parse_str(&script_value("edm-attempt")).unwrap();
+        let token = script_value("edm-token");
+        assert!(session_url.starts_with(&endpoint));
+        assert!(!script.contains("attacker.invalid"));
+        assert!(script.contains("boot=casper"));
+        assert!(script.contains("/seed/${edm-token}/"));
+
+        let seed = client
+            .get(format!("{session_url}/seed/{token}/user-data"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(seed.contains("early-commands"));
+        assert!(
+            !seed
+                .lines()
+                .any(|line| line.trim_start().starts_with("storage:"))
+        );
+
+        let ranged_iso = client
+            .get(format!("{session_url}/iso?token={token}"))
+            .header(reqwest::header::RANGE, "bytes=0-31")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ranged_iso.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(ranged_iso.headers()[reqwest::header::CONTENT_LENGTH], "32");
+        assert_eq!(ranged_iso.bytes().await.unwrap().len(), 32);
+
+        let autoinstall = client
+            .post(format!("{session_url}/guard"))
+            .bearer_auth(&token)
+            .json(&LinuxInstallerGuardRequest {
+                image_sha256: image.sha256.expect("ISO checksum should exist"),
+                disks: vec![LinuxInstallerObservedDisk {
+                    path: "/dev/nvme0n1".to_owned(),
+                    model: disk().model,
+                    serial: disk().serial,
+                    size_bytes: disk().size_bytes,
+                }],
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(autoinstall.contains("path: \"/dev/nvme0n1\""));
+        assert!(autoinstall.contains("shutdown: reboot"));
+        assert_eq!(
+            jobs.list()
+                .unwrap()
+                .into_iter()
+                .find(|job| job.id == queued.id)
+                .unwrap()
+                .state,
+            JobState::Running
+        );
+
+        client
+            .post(format!("{session_url}/events"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"kind": "awaiting_first_boot"}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .expect("awaiting event should be accepted");
+        let mismatch = client
+            .post(format!("{session_url}/first-boot"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"attemptId": Uuid::new_v4()}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(mismatch.status(), reqwest::StatusCode::CONFLICT);
+        assert_eq!(
+            jobs.list().unwrap()[0].state,
+            JobState::Running,
+            "a mismatched attempt must not complete the job"
+        );
+
+        client
+            .post(format!("{session_url}/first-boot"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"attemptId": attempt_id}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .expect("matching first boot should complete");
+        let completed = jobs.list().unwrap().remove(0);
+        assert_eq!(completed.state, JobState::Succeeded);
+        assert_eq!(completed.stage, Some(DeploymentStage::Finalizing));
+        control_plane.stop().await.unwrap();
     }
 
     fn gho_fixture(partitions: &[&[u8]]) -> Vec<u8> {
@@ -904,6 +1698,7 @@ mod tests {
                 options: DeploymentOptions {
                     image_index: 2,
                     partition_plan: PartitionPlan::uefi_gpt(),
+                    linux_install: None,
                 },
             })
             .unwrap();

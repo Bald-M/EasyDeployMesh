@@ -18,8 +18,8 @@ export async function pickImageFiles(): Promise<string[]> {
     directory: false,
     filters: [
       {
-        name: 'Windows deployment images',
-        extensions: ['gho', 'wim', 'esd', 'swm']
+        name: 'System installation images',
+        extensions: ['gho', 'wim', 'esd', 'swm', 'iso']
       }
     ]
   })
@@ -31,7 +31,8 @@ export async function pickImageFiles(): Promise<string[]> {
   return Array.isArray(selection) ? selection : [selection]
 }
 
-export function verifyGhoImage(id: string): Promise<ImageArtifact> {
+export async function verifyGhoImage(id: string): Promise<ImageArtifact> {
+  requireNativeMutation()
   return invoke<ImageArtifact>('verify_gho_image', { id })
 }
 
@@ -44,10 +45,12 @@ export async function getImages(): Promise<ImageArtifact[]> {
 }
 
 export async function importImage(path: string): Promise<ImageArtifact> {
+  requireNativeMutation()
   return invoke<ImageArtifact>('import_image', { path })
 }
 
 export async function removeImage(id: string): Promise<boolean> {
+  requireNativeMutation()
   return invoke<boolean>('remove_image', { id })
 }
 
@@ -60,14 +63,17 @@ export async function getJobs(): Promise<DeploymentJob[]> {
 }
 
 export async function createJob(request: CreateDeploymentJob): Promise<DeploymentJob> {
+  requireNativeMutation()
   return invoke<DeploymentJob>('create_job', { request })
 }
 
 export async function removeJob(id: string): Promise<boolean> {
+  requireNativeMutation()
   return invoke<boolean>('remove_job', { id })
 }
 
 export async function transitionJob(id: string, nextState: DeploymentJob['state']): Promise<DeploymentJob> {
+  requireNativeMutation()
   return invoke<DeploymentJob>('transition_job', { id, nextState })
 }
 
@@ -80,5 +86,12 @@ export async function getDevices(verifyOnline = false): Promise<RegisteredDevice
 }
 
 export async function removeDevice(id: string): Promise<boolean> {
+  requireNativeMutation()
   return invoke<boolean>('remove_device', { id })
+}
+
+function requireNativeMutation() {
+  if (!isTauriRuntime()) {
+    throw new Error('This operation requires the EasyDeployMesh desktop runtime')
+  }
 }

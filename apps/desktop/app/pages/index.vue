@@ -11,7 +11,11 @@ const jobStore = useJobStore()
 const { t } = useI18n()
 
 const deployableVerifiedCount = computed(() => imageStore.images.filter(image => (
-  ['automatic', 'manual'].includes(classifyImageDeploymentSupport(image.format, image.verified))
+  ['automatic', 'manual'].includes(classifyImageDeploymentSupport(
+    image.format,
+    image.verified,
+    image.installerCapability ?? null
+  ))
 )).length)
 
 const metrics = computed(() => [

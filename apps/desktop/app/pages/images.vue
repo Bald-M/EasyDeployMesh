@@ -26,7 +26,11 @@ function ghoBlockedReason(reason: string | null | undefined) {
 
 const imageRows = computed(() => imageStore.images.map(image => ({
   image,
-  deploymentSupport: classifyImageDeploymentSupport(image.format, image.verified)
+  deploymentSupport: classifyImageDeploymentSupport(
+    image.format,
+    image.verified,
+    image.installerCapability ?? null
+  )
 })))
 
 function formatImportedAt(value: string) {
@@ -226,6 +230,20 @@ async function handleRemove(image: ImageArtifact) {
                 :title="image.sourcePath"
               >
                 {{ image.sourcePath }}
+              </p>
+              <p
+                v-if="image.format === 'iso' && image.installerCapability"
+                class="mt-1 truncate text-[11px]"
+                :class="image.installerCapability.deployable ? 'text-success' : 'text-warning'"
+              >
+                {{ $t('images.linuxInstallerCapability', {
+                  distribution: image.installerCapability.distribution,
+                  release: image.installerCapability.release,
+                  architecture: image.installerCapability.architecture,
+                  profileVersion: image.installerCapability.profileVersion,
+                  memory: formatBytes(image.installerCapability.minimumMemoryBytes, locale),
+                  disk: formatBytes(image.installerCapability.minimumDiskBytes, locale)
+                }) }}
               </p>
             </div>
 

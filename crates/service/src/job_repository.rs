@@ -1,5 +1,5 @@
 use easydeploymesh_core::{
-    AgentJobProgress, CreateDeploymentJob, DeploymentJob, DeploymentStage, JobState,
+    AgentJobProgress, CreateDeploymentJob, DeploymentJob, DeploymentStage, JobState, Operation,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -39,6 +39,22 @@ pub enum JobRepositoryError {
     WrongDevice(Uuid),
     #[error("deployment progress must be between 0 and 100")]
     InvalidProgress,
+    #[error("deployment job uses a different execution protocol")]
+    WrongExecutionProtocol,
+    #[error("Linux installation options are required for a Linux installation job")]
+    MissingLinuxInstallOptions,
+    #[error("Linux installation options are only valid for a Linux installation job")]
+    UnexpectedLinuxInstallOptions,
+    #[error("Linux installation requires a stable target disk serial number")]
+    MissingLinuxTargetSerial,
+    #[error("Linux installation options are invalid: {0}")]
+    InvalidLinuxInstallOptions(#[from] easydeploymesh_core::LinuxInstallOptionsError),
+    #[error("Linux installer handoff is no longer available")]
+    InstallerHandoffUnavailable,
+    #[error("Linux installer state is controlled by target guard and first-boot confirmation")]
+    InstallerControlUnavailable,
+    #[error("Linux installer progress cannot move backwards")]
+    InstallerProgressRegression,
     #[error("deployment job lock was poisoned")]
     LockPoisoned,
     #[error(transparent)]
@@ -243,6 +259,13 @@ impl JobRepository {
             .iter_mut()
             .find(|job| job.id == id)
             .ok_or(JobRepositoryError::NotFound(id))?;
+        if job.operation == Operation::InstallLinux
+            && ((job.state == JobState::Waiting && next_state == JobState::Running)
+                || (matches!(job.state, JobState::Running | JobState::Paused)
+                    && next_state != JobState::Failed))
+        {
+            return Err(JobRepositoryError::InstallerControlUnavailable);
+        }
         job.state = job.state.transition(next_state)?;
         job.updated_at = chrono::Utc::now();
         if next_state == JobState::Succeeded {
@@ -278,11 +301,12 @@ impl JobRepository {
         let mut next_jobs = jobs.clone();
         let now = chrono::Utc::now();
         let Some(job) = next_jobs.iter_mut().find(|job| {
-            (job.state == JobState::Waiting
-                || (job.state == JobState::Running
-                    && job
-                        .lease_expires_at
-                        .is_some_and(|expires_at| expires_at < now)))
+            job.operation != Operation::InstallLinux
+                && (job.state == JobState::Waiting
+                    || (job.state == JobState::Running
+                        && job
+                            .lease_expires_at
+                            .is_some_and(|expires_at| expires_at < now)))
                 && job.targets.len() == 1
                 && job.targets[0].device_id == device_id
                 && is_eligible(job)
@@ -303,6 +327,153 @@ impl JobRepository {
         self.persist(&next_jobs)?;
         *jobs = next_jobs;
         Ok(Some(leased))
+    }
+
+    /// Records that a waiting Linux job has entered its installer boot attempt without
+    /// authorizing any destructive work.
+    pub(crate) fn mark_installer_booting(
+        &self,
+        job_id: Uuid,
+        device_id: Uuid,
+        image_id: Uuid,
+    ) -> Result<DeploymentJob, JobRepositoryError> {
+        let mut jobs = self
+            .jobs
+            .write()
+            .map_err(|_| JobRepositoryError::LockPoisoned)?;
+        let mut next_jobs = jobs.clone();
+        let job = next_jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .ok_or(JobRepositoryError::NotFound(job_id))?;
+        if job.operation != Operation::InstallLinux {
+            return Err(JobRepositoryError::WrongExecutionProtocol);
+        }
+        if job.state != JobState::Waiting
+            || job.image_id != image_id
+            || job.targets.len() != 1
+            || job.targets[0].device_id != device_id
+        {
+            return Err(JobRepositoryError::InstallerHandoffUnavailable);
+        }
+        job.stage = Some(DeploymentStage::BootingInstaller);
+        job.status_message =
+            Some("Linux installer is booting; destructive work is not authorized".to_owned());
+        job.error_message = None;
+        job.updated_at = chrono::Utc::now();
+        let updated = job.clone();
+        self.persist(&next_jobs)?;
+        *jobs = next_jobs;
+        Ok(updated)
+    }
+
+    /// Atomically performs the one-way Linux installer handoff. Unlike an Agent lease,
+    /// an expired Linux installer lease is never reclaimed automatically.
+    pub(crate) fn lease_installer_job(
+        &self,
+        job_id: Uuid,
+        device_id: Uuid,
+        image_id: Uuid,
+        duration: chrono::Duration,
+    ) -> Result<DeploymentJob, JobRepositoryError> {
+        let mut jobs = self
+            .jobs
+            .write()
+            .map_err(|_| JobRepositoryError::LockPoisoned)?;
+        let mut next_jobs = jobs.clone();
+        let job = next_jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .ok_or(JobRepositoryError::NotFound(job_id))?;
+        if job.operation != Operation::InstallLinux {
+            return Err(JobRepositoryError::WrongExecutionProtocol);
+        }
+        if job.state != JobState::Waiting
+            || job.image_id != image_id
+            || job.targets.len() != 1
+            || job.targets[0].device_id != device_id
+        {
+            return Err(JobRepositoryError::InstallerHandoffUnavailable);
+        }
+
+        let now = chrono::Utc::now();
+        job.state = job.state.transition(JobState::Running)?;
+        job.stage = Some(DeploymentStage::ValidatingTarget);
+        job.progress_percent = 1;
+        job.status_message = Some("Linux installer target guard authorized".to_owned());
+        job.error_message = None;
+        job.lease_id = Some(Uuid::new_v4());
+        job.lease_expires_at = Some(now + duration);
+        job.updated_at = now;
+        let leased = job.clone();
+        self.persist(&next_jobs)?;
+        *jobs = next_jobs;
+        Ok(leased)
+    }
+
+    pub(crate) fn report_installer_progress(
+        &self,
+        job_id: Uuid,
+        device_id: Uuid,
+        lease_id: Uuid,
+        lease_duration: chrono::Duration,
+        stage: DeploymentStage,
+        progress_percent: u8,
+        message: Option<String>,
+    ) -> Result<DeploymentJob, JobRepositoryError> {
+        if progress_percent > 99 {
+            return Err(JobRepositoryError::InvalidProgress);
+        }
+        let renewed_until = chrono::Utc::now() + lease_duration;
+        self.update_installer_job(job_id, device_id, lease_id, |job| {
+            let current_rank = job.stage.map(installer_stage_rank).unwrap_or(0);
+            if installer_stage_rank(stage) < current_rank || progress_percent < job.progress_percent
+            {
+                return Err(JobRepositoryError::InstallerProgressRegression);
+            }
+            job.stage = Some(stage);
+            job.progress_percent = progress_percent;
+            job.status_message = message
+                .map(|value| value.trim().chars().take(512).collect())
+                .filter(|value: &String| !value.is_empty());
+            job.lease_expires_at = Some(
+                job.lease_expires_at
+                    .map_or(renewed_until, |current| current.max(renewed_until)),
+            );
+            Ok(())
+        })
+    }
+
+    pub(crate) fn complete_installer(
+        &self,
+        job_id: Uuid,
+        device_id: Uuid,
+        lease_id: Uuid,
+        succeeded: bool,
+        error_message: Option<String>,
+    ) -> Result<DeploymentJob, JobRepositoryError> {
+        self.update_installer_job(job_id, device_id, lease_id, |job| {
+            job.state = job.state.transition(if succeeded {
+                JobState::Succeeded
+            } else {
+                JobState::Failed
+            })?;
+            if succeeded {
+                job.stage = Some(DeploymentStage::Finalizing);
+                job.progress_percent = 100;
+                job.status_message = Some("Linux installation completed on first boot".to_owned());
+                job.error_message = None;
+            } else {
+                job.status_message = None;
+                job.error_message = error_message
+                    .map(|value| value.trim().chars().take(2048).collect())
+                    .filter(|value: &String| !value.is_empty())
+                    .or_else(|| Some("Linux installer reported a failure".to_owned()));
+            }
+            job.lease_id = None;
+            job.lease_expires_at = None;
+            Ok(())
+        })
     }
 
     pub fn report_progress(
@@ -344,6 +515,9 @@ impl JobRepository {
             .iter()
             .find(|job| job.id == job_id)
             .ok_or(JobRepositoryError::NotFound(job_id))?;
+        if job.operation == Operation::InstallLinux {
+            return Err(JobRepositoryError::WrongExecutionProtocol);
+        }
         if !job
             .targets
             .iter()
@@ -412,6 +586,9 @@ impl JobRepository {
             .iter_mut()
             .find(|job| job.id == job_id)
             .ok_or(JobRepositoryError::NotFound(job_id))?;
+        if job.operation == Operation::InstallLinux {
+            return Err(JobRepositoryError::WrongExecutionProtocol);
+        }
         if !job
             .targets
             .iter()
@@ -454,6 +631,9 @@ impl JobRepository {
             .iter_mut()
             .find(|job| job.id == job_id)
             .ok_or(JobRepositoryError::NotFound(job_id))?;
+        if job.operation == Operation::InstallLinux {
+            return Err(JobRepositoryError::WrongExecutionProtocol);
+        }
         if !job
             .targets
             .iter()
@@ -470,6 +650,44 @@ impl JobRepository {
             return Err(JobRepositoryError::InvalidLease);
         }
         update(job);
+        job.updated_at = chrono::Utc::now();
+        let updated = job.clone();
+        self.persist(&next_jobs)?;
+        *jobs = next_jobs;
+        Ok(updated)
+    }
+
+    fn update_installer_job(
+        &self,
+        job_id: Uuid,
+        device_id: Uuid,
+        lease_id: Uuid,
+        update: impl FnOnce(&mut DeploymentJob) -> Result<(), JobRepositoryError>,
+    ) -> Result<DeploymentJob, JobRepositoryError> {
+        let mut jobs = self
+            .jobs
+            .write()
+            .map_err(|_| JobRepositoryError::LockPoisoned)?;
+        let mut next_jobs = jobs.clone();
+        let job = next_jobs
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .ok_or(JobRepositoryError::NotFound(job_id))?;
+        if job.operation != Operation::InstallLinux {
+            return Err(JobRepositoryError::WrongExecutionProtocol);
+        }
+        if job.targets.len() != 1 || job.targets[0].device_id != device_id {
+            return Err(JobRepositoryError::WrongDevice(device_id));
+        }
+        if job.state != JobState::Running
+            || job.lease_id != Some(lease_id)
+            || job
+                .lease_expires_at
+                .is_none_or(|expires_at| expires_at < chrono::Utc::now())
+        {
+            return Err(JobRepositoryError::InvalidLease);
+        }
+        update(job)?;
         job.updated_at = chrono::Utc::now();
         let updated = job.clone();
         self.persist(&next_jobs)?;
@@ -497,10 +715,22 @@ fn validate_request(request: &CreateDeploymentJob) -> Result<(), JobRepositoryEr
     if request.targets.is_empty() {
         return Err(JobRepositoryError::MissingTargets);
     }
-    if request.options.image_index == 0 {
-        return Err(JobRepositoryError::InvalidImageIndex);
+    if request.operation == Operation::InstallLinux {
+        request
+            .options
+            .linux_install
+            .as_ref()
+            .ok_or(JobRepositoryError::MissingLinuxInstallOptions)?
+            .validate()?;
+    } else {
+        if request.options.linux_install.is_some() {
+            return Err(JobRepositoryError::UnexpectedLinuxInstallOptions);
+        }
+        if request.options.image_index == 0 {
+            return Err(JobRepositoryError::InvalidImageIndex);
+        }
+        request.options.partition_plan.validate()?;
     }
-    request.options.partition_plan.validate()?;
     if let Some(target) = request.targets.iter().find(|target| {
         target.target_disk_id.trim().is_empty()
             || target.target_disk_model.trim().is_empty()
@@ -510,13 +740,40 @@ fn validate_request(request: &CreateDeploymentJob) -> Result<(), JobRepositoryEr
             target.target_disk_id.clone(),
         ));
     }
+    if request.operation == Operation::InstallLinux
+        && request.targets.iter().any(|target| {
+            target
+                .target_disk_serial
+                .as_deref()
+                .is_none_or(|serial| serial.trim().is_empty())
+        })
+    {
+        return Err(JobRepositoryError::MissingLinuxTargetSerial);
+    }
     Ok(())
+}
+
+fn installer_stage_rank(stage: DeploymentStage) -> u8 {
+    match stage {
+        DeploymentStage::Preflight => 0,
+        DeploymentStage::BootingInstaller => 1,
+        DeploymentStage::DownloadingImage => 2,
+        DeploymentStage::ValidatingTarget => 3,
+        DeploymentStage::Partitioning => 4,
+        DeploymentStage::ApplyingImage | DeploymentStage::InstallingSystem => 5,
+        DeploymentStage::ConfiguringBoot => 6,
+        DeploymentStage::Finalizing => 7,
+        DeploymentStage::Rebooting => 8,
+        DeploymentStage::AwaitingFirstBoot => 9,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use easydeploymesh_core::{DeploymentOptions, DeploymentTarget, Operation};
+    use easydeploymesh_core::{
+        DeploymentOptions, DeploymentTarget, LinuxInstallOptions, Operation,
+    };
 
     fn request() -> CreateDeploymentJob {
         CreateDeploymentJob {
@@ -532,6 +789,22 @@ mod tests {
             }],
             options: DeploymentOptions::default(),
         }
+    }
+
+    fn linux_request() -> CreateDeploymentJob {
+        let mut request = request();
+        request.operation = Operation::InstallLinux;
+        request.options = DeploymentOptions {
+            linux_install: Some(LinuxInstallOptions {
+                hostname: "lab-linux-01".to_owned(),
+                username: "operator".to_owned(),
+                ssh_authorized_keys: vec![
+                    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestRepositoryKey".to_owned(),
+                ],
+            }),
+            ..DeploymentOptions::default()
+        };
+        request
     }
 
     #[test]
@@ -566,6 +839,104 @@ mod tests {
             repository.list().expect("jobs should list")[0].state,
             JobState::Waiting
         );
+    }
+
+    #[test]
+    fn linux_jobs_require_options_and_a_stable_target_serial() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let repository = JobRepository::open(temp.path()).expect("repository should open");
+        let mut missing_options = linux_request();
+        missing_options.options.linux_install = None;
+        assert!(matches!(
+            repository.enqueue(missing_options),
+            Err(JobRepositoryError::MissingLinuxInstallOptions)
+        ));
+
+        let mut missing_serial = linux_request();
+        missing_serial.targets[0].target_disk_serial = None;
+        assert!(matches!(
+            repository.enqueue(missing_serial),
+            Err(JobRepositoryError::MissingLinuxTargetSerial)
+        ));
+    }
+
+    #[test]
+    fn windows_agent_claim_never_leases_a_linux_installer_job() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let repository = JobRepository::open(temp.path()).expect("repository should open");
+        let request = linux_request();
+        let device_id = request.targets[0].device_id;
+        let queued = repository
+            .enqueue(request)
+            .expect("Linux job should enqueue");
+
+        assert!(
+            repository
+                .lease_for_device_if(device_id, chrono::Duration::minutes(30), |_| true)
+                .expect("Agent claim should be evaluated")
+                .is_none()
+        );
+        assert_eq!(
+            repository.list().expect("jobs should list")[0].state,
+            JobState::Waiting
+        );
+        assert_eq!(queued.operation, Operation::InstallLinux);
+    }
+
+    #[test]
+    fn installer_handoff_is_one_way_and_cannot_be_reclaimed_or_paused() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let repository = JobRepository::open(temp.path()).expect("repository should open");
+        let request = linux_request();
+        let device_id = request.targets[0].device_id;
+        let image_id = request.image_id;
+        let queued = repository
+            .enqueue(request)
+            .expect("Linux job should enqueue");
+        assert!(matches!(
+            repository.transition(queued.id, JobState::Running),
+            Err(JobRepositoryError::InstallerControlUnavailable)
+        ));
+        repository
+            .mark_installer_booting(queued.id, device_id, image_id)
+            .expect("boot attempt should be recorded");
+
+        let handed_off = repository
+            .lease_installer_job(
+                queued.id,
+                device_id,
+                image_id,
+                chrono::Duration::seconds(-1),
+            )
+            .expect("guarded handoff should lease once");
+        assert_eq!(handed_off.state, JobState::Running);
+        assert!(matches!(
+            repository.lease_installer_job(
+                queued.id,
+                device_id,
+                image_id,
+                chrono::Duration::minutes(30),
+            ),
+            Err(JobRepositoryError::InstallerHandoffUnavailable)
+        ));
+        assert!(
+            repository
+                .lease_for_device(device_id, chrono::Duration::minutes(30))
+                .expect("Agent claim should be evaluated")
+                .is_none()
+        );
+        assert!(matches!(
+            repository.transition(queued.id, JobState::Paused),
+            Err(JobRepositoryError::InstallerControlUnavailable)
+        ));
+        assert!(matches!(
+            repository.transition(queued.id, JobState::Cancelled),
+            Err(JobRepositoryError::InstallerControlUnavailable)
+        ));
+        assert!(matches!(
+            repository.transition(queued.id, JobState::Succeeded),
+            Err(JobRepositoryError::InstallerControlUnavailable)
+        ));
     }
 
     #[test]

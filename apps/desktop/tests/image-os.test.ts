@@ -9,7 +9,8 @@ describe('image operating system detection', () => {
     ['Windows 8.1 Enterprise.gho', 'windows-8'],
     ['winxp-sp3.gho', 'windows-xp'],
     ['Windows_Server_2022.wim', 'windows-server'],
-    ['win2019-datacenter.wim', 'windows-server']
+    ['win2019-datacenter.wim', 'windows-server'],
+    ['ubuntu-24.04.3-live-server-amd64.iso', 'ubuntu']
   ])('recognizes %s as %s', (filename, expected) => {
     expect(detectImageOperatingSystem(filename)).toBe(expected)
   })

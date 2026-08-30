@@ -4,8 +4,8 @@
   <h1>EasyDeployMesh</h1>
 
   <p>
-    Discover PCs and orchestrate safe, repeatable Windows image deployments<br>
-    from one desktop application on your local network.
+    Discover PCs and orchestrate safe Windows image deployments and controlled<br>
+    Ubuntu Server installations from ISO media on your local network.
   </p>
 
   <p>
@@ -47,9 +47,10 @@
 ## Why EasyDeployMesh?
 
 EasyDeployMesh brings device discovery, PXE boot, image verification, deployment
-jobs, and WinPE execution into a single local-first workflow. The desktop host
-keeps authoritative state and approves work; a small Rust Agent running on the
-target machine performs the deployment.
+jobs, WinPE execution, and a narrow Ubuntu installer workflow into one
+local-first application. The desktop host keeps authoritative state and
+approves work; Windows deployments run through the Rust Agent, while Linux ISO
+jobs use Ubuntu's native installer behind a target-side disk guard.
 
 The project is designed to fail closed. Images are copied into a managed store
 and verified before use, jobs are issued through authenticated expiring leases,
@@ -67,6 +68,8 @@ partitioning.
   WinPE layouts receive automatic Agent injection into a managed `boot.wim`.
 - Persistent WIM, ESD, and SWM image catalog with SHA-256 verification.
 - Unattended WIM/ESD deployment using DiskPart, DISM, and BCDBoot in WinPE.
+- Content-verified Ubuntu Server 24.04 LTS live-server ISO import and unattended
+  amd64/UEFI installation with DHCP, whole-disk GPT/ext4, and SSH-key access.
 - Guarded deployment state machine with pause, retry, cancellation, progress,
   activity history, and durable job storage.
 - Machine-readable WinPE diagnostics with token redaction and integrity checks.
@@ -126,8 +129,17 @@ compatible or offline PE media must not be used for automated deployment.
 | WIM | Yes | Yes | Verified on import and again before deployment |
 | ESD | Yes | Yes | Uses the WIM deployment operation and a selected image index |
 | SWM | Yes | No | Catalog-only in the current Agent |
+| Ubuntu Server 24.04 LTS live-server ISO (amd64) | Yes | Preview | Content-inspected; kernel, initrd, and ISO are revalidated before a guarded UEFI autoinstall |
 | GHO | No | No | Unsupported; convert the image to WIM or ESD before import |
 | GHS | No | No | Unsupported Ghost span format |
+
+The Linux ISO profile is intentionally narrow: amd64 UEFI, Secure Boot off,
+DHCP, one target disk with a unique non-empty serial, whole-disk GPT/direct ext4,
+and one SSH-key-only administrator. Ubuntu Desktop or remastered media, Legacy
+BIOS, ARM, static networking, RAID, LVM, ZFS, LUKS, retained partitions,
+password login, raw autoinstall YAML, and arbitrary commands are rejected.
+Treat this path as a preview until the exact ISO and hardware combination has
+passed an end-to-end disposable QEMU/OVMF or physical-machine test.
 
 ### Why GHO is unsupported
 
@@ -160,6 +172,16 @@ Download the latest installer from
 4. Confirm that the target appears online under **Devices**.
 5. Import a supported image, select the exact target disk, and create a
    deployment job.
+
+For Linux ISO installation, first let the target register so the host has a
+recent authoritative inventory. Use a standard managed WinPE network package
+(the native-ISO PE fallback cannot host the dynamic dispatcher), start both the
+control and PXE services, import the Ubuntu Server ISO, then select the verified
+ISO, target disk, Linux username, and SSH public key under **Devices**. Each
+selected device receives its own job. On the next UEFI PXE boot, the installer
+hashes the downloaded ISO and reports its Linux disk inventory; destructive
+storage configuration is released only after the selected serial/model/size
+matches exactly and uniquely.
 
 For a manual Agent diagnostic run:
 

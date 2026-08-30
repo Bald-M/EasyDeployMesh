@@ -5,6 +5,7 @@ export type ImageOperatingSystem =
   | 'windows-10'
   | 'windows-11'
   | 'windows-server'
+  | 'ubuntu'
   | 'unknown'
 
 const WINDOWS_VERSION_PATTERNS: Array<[
@@ -26,6 +27,10 @@ export function detectImageOperatingSystem(
   ...candidates: Array<string | null | undefined>
 ): ImageOperatingSystem {
   const searchableText = candidates.filter(Boolean).join(' ')
+
+  if (/(?:^|[\\/\s._-])ubuntu(?=$|[\\/\s._-])/iu.test(searchableText)) {
+    return 'ubuntu'
+  }
 
   for (const [operatingSystem, pattern] of WINDOWS_VERSION_PATTERNS) {
     if (pattern.test(searchableText)) {
