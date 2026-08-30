@@ -271,6 +271,74 @@ pub enum ImageFormat {
     Wim,
     Esd,
     Swm,
+    Iso,
+}
+
+pub const UBUNTU_AUTOINSTALL_PROFILE_VERSION: u32 = 1;
+pub const UBUNTU_MINIMUM_DISK_BYTES: u64 = 25 * 1024 * 1024 * 1024;
+pub const UBUNTU_MINIMUM_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallerDistribution {
+    Ubuntu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallerProfile {
+    UbuntuAutoinstall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallerBootAsset {
+    /// Canonical path below the managed image object's directory.
+    pub path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallerCapability {
+    pub deployable: bool,
+    pub distribution: InstallerDistribution,
+    /// The supported release series, currently exactly `24.04`.
+    pub release: String,
+    pub architecture: Architecture,
+    pub profile: InstallerProfile,
+    pub profile_version: u32,
+    pub kernel: InstallerBootAsset,
+    pub initrd: InstallerBootAsset,
+    pub minimum_memory_bytes: u64,
+    pub minimum_disk_bytes: u64,
+    pub blocked_reason: Option<String>,
+}
+
+impl InstallerCapability {
+    /// Returns whether this capability matches the only Linux installer profile
+    /// currently implemented by the host.
+    pub fn is_supported_ubuntu_server_v1(&self) -> bool {
+        self.deployable
+            && self.blocked_reason.is_none()
+            && self.distribution == InstallerDistribution::Ubuntu
+            && self.release == "24.04"
+            && self.architecture == Architecture::X86_64
+            && self.profile == InstallerProfile::UbuntuAutoinstall
+            && self.profile_version == UBUNTU_AUTOINSTALL_PROFILE_VERSION
+            && self.minimum_memory_bytes >= UBUNTU_MINIMUM_MEMORY_BYTES
+            && self.minimum_disk_bytes >= UBUNTU_MINIMUM_DISK_BYTES
+            && installer_asset_metadata_is_valid(&self.kernel)
+            && installer_asset_metadata_is_valid(&self.initrd)
+    }
+}
+
+fn installer_asset_metadata_is_valid(asset: &InstallerBootAsset) -> bool {
+    !asset.path.trim().is_empty()
+        && asset.size_bytes > 0
+        && asset.sha256.len() == 64
+        && asset.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +378,8 @@ pub struct ImageArtifact {
     pub verified: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gho_capability: Option<GhoImageCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installer_capability: Option<InstallerCapability>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -319,6 +389,7 @@ pub enum Operation {
     DeployGho,
     CaptureGho,
     DeployWim,
+    InstallLinux,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

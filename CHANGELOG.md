@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added a preview, content-verified Ubuntu Server 24.04 LTS live-server ISO
+  workflow for amd64 UEFI targets. Batch selection still creates independent
+  single-device jobs; the implemented profile is DHCP, whole-disk GPT/direct
+  ext4, and SSH-key-only access.
+- Added dynamic iPXE dispatch and short-lived installer sessions. The initial
+  NoCloud seed contains no storage configuration; the target must rehash the
+  downloaded ISO and report a uniquely matching disk serial, model, and size
+  before the control plane releases destructive autoinstall storage.
+
+### Security
+
+- Linux installer attempts are bound to versioned media metadata and digested
+  session capabilities, are not automatically reclaimed after destructive
+  handoff, and cannot be paused or cancelled once disk authorization succeeds.
+
 ## [0.2.6] - 2026-08-26
 
 ### Added

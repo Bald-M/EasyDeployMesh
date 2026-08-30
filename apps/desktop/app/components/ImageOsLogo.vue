@@ -12,6 +12,7 @@ const labels: Record<ImageOperatingSystem, string> = {
   'windows-10': 'Windows 10',
   'windows-11': 'Windows 11',
   'windows-server': 'Windows Server',
+  ubuntu: 'Ubuntu Linux',
   unknown: 'Unknown operating system'
 }
 </script>
@@ -63,6 +64,7 @@ const labels: Record<ImageOperatingSystem, string> = {
       <span class="text-[7px] font-bold leading-none text-[#0078d4]">SERVER</span>
     </div>
 
+    <UIcon v-else-if="props.operatingSystem === 'ubuntu'" name="i-simple-icons-ubuntu" class="size-6 text-[#e95420]" />
     <UIcon v-else name="i-lucide-hard-drive-download" class="size-5" />
   </div>
 </template>

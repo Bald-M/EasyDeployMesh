@@ -7,7 +7,8 @@ than a future roadmap.
 ## Purpose and scope
 
 EasyDeployMesh is a local-first desktop application for discovering PCs and
-coordinating repeatable Windows image deployments on a trusted local network.
+coordinating repeatable Windows image deployments and a deliberately narrow
+Linux installer workflow on a trusted local network.
 The desktop host owns configuration, image storage, device records, job state,
 PXE boot infrastructure, and the control plane. A small Agent runs on the target
 machine—normally in Windows PE—and performs the destructive disk operations.
@@ -24,9 +25,16 @@ The project currently supports:
 - GHO, GHS, WIM, ESD, and SWM cataloging. SWM remains catalog-only.
 - UEFI/GPT and legacy BIOS/MBR partition plans.
 - Standalone DHCP or ProxyDHCP PXE boot with TFTP.
+- Content-verified Ubuntu Server 24.04 LTS live-server ISO installation on
+  amd64 UEFI targets through the distribution's native autoinstall workflow.
+  Linux installation is DHCP-only, erases one uniquely identified whole disk,
+  creates GPT/direct ext4 storage, and provisions one SSH-key-only user.
 
 Capture, raw whole-disk layout restoration, encrypted GHO images, and recovery
-partitions are not implemented.
+partitions are not implemented. Linux Desktop or remastered ISOs, Legacy BIOS,
+ARM, Secure Boot, static networking, RAID, LVM, ZFS, encryption, retained
+partitions, raw autoinstall YAML, passwords, and arbitrary installer commands
+are also outside the implemented Linux profile.
 
 ## System context
 
@@ -38,9 +46,11 @@ flowchart LR
     Host --> Repos["Persistent repositories"]
     Host --> CP["HTTP control plane"]
     Host --> PXE["DHCP / ProxyDHCP / TFTP"]
-    PXE -->|"WinPE boot package"| Target["Target PC / WinPE"]
+    PXE -->|"dynamic iPXE decision"| Target["Target PC"]
     CP <-->|"registration, heartbeat, lease, image, progress"| Agent["Rust Agent"]
     Agent -->|"DiskPart, DISM, BCDBoot or native GHO decode"| Target
+    CP <-->|"session, ISO, guard, autoinstall, first boot"| Installer["Ubuntu installer"]
+    Installer -->|"Subiquity / curtin"| Target
     Repos --> Data["Application data directory"]
 ```
 
@@ -56,8 +66,9 @@ operations.
 The core module contains shared serializable domain types and pure invariants:
 
 - Device inventory, disk fingerprints, boot modes, and architectures.
-- Image formats and verified GHO capability metadata.
+- Image formats and verified GHO or Linux-installer capability metadata.
 - Deployment requests, targets, options, stages, and leases.
+- Bounded Linux install intent and installer guard inventory.
 - The guarded job state machine.
 - Partition-plan construction and validation.
 
@@ -90,6 +101,9 @@ The service module contains privileged host behavior:
 - `ActivityRepository` records bounded operational history in
   `activities.json`.
 - `ControlPlane` exposes the Agent HTTP protocol and composes the repositories.
+- `InstallerDeployment` owns short-lived Linux installer sessions, boot
+  decisions, media authorization, target-side disk guarding, generated
+  autoinstall data, and first-boot completion.
 - `BootPackage` imports boot media and injects the Agent runtime into WinPE.
 - `PxeService` implements DHCP/ProxyDHCP, TFTP, lease persistence, and PXE client
   discovery.
@@ -133,6 +147,11 @@ On Windows/WinPE, the executor creates a DiskPart plan, downloads the image to a
 temporary cache partition, verifies SHA-256, applies the image, creates boot
 files, removes the cache partition, and reboots after confirmed success.
 
+The Agent never executes a Linux ISO job. A previously registered device is
+resolved by normalized MAC address at PXE boot, and a separate installer-session
+protocol drives the Ubuntu installer. This keeps distribution-specific boot and
+autoinstall behavior out of the Windows destructive executor.
+
 ### `scripts`
 
 The scripts stage Agent sidecars, collect installers, validate WinPE packages,
@@ -160,12 +179,12 @@ the device token.
 
 ### Image import and verification
 
-1. The operator selects a GHO, WIM, ESD, or SWM file.
+1. The operator selects a GHO, WIM, ESD, SWM, or ISO file.
 2. `ImageLibrary` canonicalizes the source, validates the format, discovers
    spans, and copies all files into a temporary directory in the managed store.
 3. It synchronizes copied files, computes size and SHA-256, inspects GHO
-   capability or validates the WIM/ESD container, then atomically moves the
-   staged directory into `library/objects/<uuid>`.
+capability or validates the WIM/ESD container, then atomically moves the
+staged directory into `library/objects/<uuid>`.
 4. The manifest records only managed paths. Symlinks, paths outside the object
    store, changed sizes, changed hashes, ambiguous spans, and unsafe names fail
    closed.
@@ -178,6 +197,15 @@ to obtain an expanded byte count and SHA-256 for every restorable NTFS stream.
 Job creation binds an explicit source partition, and the Agent checks parser
 version, expanded byte count, and expanded SHA-256 while writing the locked
 volume. The expanded partition must fit the planned Windows volume.
+
+An ISO is never treated as a raw disk image. ISO import uses bounded filesystem
+inspection and accepts only the implemented Ubuntu Server live-server profile.
+It requires `.disk/info`, `casper/vmlinuz`, and `casper/initrd`, derives the
+release and architecture from media content rather than the filename, and
+copies the kernel and initrd into the same managed image object. The manifest
+binds the ISO, kernel, and initrd sizes and SHA-256 values to a versioned
+installer capability. Job creation and boot discovery re-open canonical managed
+files and revalidate all three artifacts.
 
 ### Deployment scheduling and execution
 
@@ -208,6 +236,56 @@ Each persisted job currently has exactly one target. Batch deployment is a UI
 operation that creates multiple independent jobs. A device may have only one
 non-terminal job, preventing concurrent destructive work on the same machine.
 
+### Linux installer session
+
+```mermaid
+sequenceDiagram
+    participant PXE as iPXE target
+    participant CP as Control plane
+    participant Jobs as Job repository
+    participant Subiquity as Ubuntu installer
+    participant OS as Installed system
+
+    PXE->>CP: boot request (MAC, amd64, UEFI)
+    CP->>CP: resolve device and waiting Linux job; revalidate media
+    CP-->>PXE: short-lived session + kernel/initrd/ISO/NoCloud URLs
+    PXE->>CP: stream verified boot assets and ISO
+    Subiquity->>CP: guard (target-computed ISO hash + observed disks)
+    CP->>CP: uniquely match serial, model, and size
+    CP->>Jobs: waiting -> running; bind non-reclaimable attempt
+    CP-->>Subiquity: final generated autoinstall with exact /dev path
+    Subiquity->>CP: bounded progress / installed callback
+    OS->>CP: first-boot completion callback
+    CP->>Jobs: running -> succeeded
+```
+
+The dynamic `boot.ipxe` asks the control plane for a per-device decision. A
+device without a Linux assignment chains to the exact managed WinPE script; a
+device with a Linux assignment that fails identity, compatibility, or integrity
+checks receives a stop decision and must not fall through to another installer.
+Native-ISO WinPE packages cannot host this dispatcher because their fallback
+HTTP port is allocated only when PXE starts; Linux jobs therefore require a
+standard managed WinPE network package.
+
+Boot discovery creates an expiring capability session but does not yet lease the
+job or authorize disk changes. The initial NoCloud `user-data` contains the
+EasyDeployMesh guard in `early-commands` and deliberately omits `storage`.
+The target hashes the ISO it actually downloaded, enumerates physical disks,
+and posts that bounded inventory. Only an exact, unique match of the selected
+non-empty serial, model, and size (with the existing 1 MiB tolerance) permits
+`waiting -> running`; the response then replaces `/autoinstall.yaml` with the
+host-generated whole-disk configuration. Zero or multiple matches fail before
+Subiquity receives destructive storage instructions.
+
+Installer sessions store only token digests and bind token, device, job, image,
+profile version, and attempt. Media reads support a single bounded HTTP byte
+range and revalidate managed paths. Installer callbacks are ordered by phase;
+completion is accepted only from the installed system's one-shot first-boot
+callback. Once storage authorization has been issued, the attempt is never
+automatically reclaimed and pause/cancel is rejected because the host cannot
+prove that Subiquity has stopped writing. A timeout is an unknown outcome that
+requires operator inspection before an explicit retry.
+
 The normal state path is:
 
 ```text
@@ -217,12 +295,13 @@ draft -> waiting -> running -> succeeded
                          `--> cancelled
 ```
 
-Jobs are leased for two hours. Progress and control polling renew the lease.
-An expired running lease may be claimed again, but only after current image and
-disk eligibility checks pass. Image download requires both device
+Windows Agent jobs are leased for two hours. Progress and control polling renew
+the lease. An expired running Windows lease may be claimed again, but only after
+current image and disk eligibility checks pass. Linux installer attempts are
+not automatically reclaimed after destructive authorization. Image download requires both device
 authentication and a valid, unexpired lease for that job.
 
-Pause and cancellation are cooperative. During external Windows processes,
+Pause and cancellation are cooperative for Windows Agent jobs. During external Windows processes,
 pause suspends the process; during streaming download and hashing, the Agent
 polls control state between chunks. The process runner also stops a child if the
 control endpoint explicitly returns a state other than running or paused. During
@@ -387,8 +466,12 @@ The application still applies defense in depth within that trust model:
 - Ephemeral enrollment credentials and per-device bearer credentials.
 - Digested secrets and constant-time comparisons.
 - Authenticated, device-bound, expiring job leases.
+- Digested, expiring installer-session capabilities bound to one device, job,
+  image, profile version, and attempt.
 - Managed image paths with canonicalization and symlink rejection.
 - Repeated compressed-image and expanded-GHO integrity verification.
+- Repeated ISO, kernel, and initrd verification, including an ISO hash computed
+  by the target before destructive autoinstall storage is released.
 - Repeated target-disk fingerprint verification.
 - Guarded job transitions and one active job per device.
 - Bounds and expansion limits in the GHO parser.
@@ -408,9 +491,13 @@ problem is not a reason to bypass authentication, verification, or targeting.
   should ask for a domain operation rather than mutate manifest-shaped data.
 - Keep transport composition in `ControlPlane`; do not let HTTP request details
   leak into repositories.
+- Keep distribution boot syntax and generated autoinstall data inside
+  `InstallerDeployment`; callers provide bounded intent, never raw YAML or
+  arbitrary early/late commands.
 - Keep native command invocation and destructive execution in the Agent. The
-  desktop host approves work; it does not remotely construct arbitrary shell
-  commands.
+  Ubuntu path delegates installation to Subiquity only after the independent
+  target guard succeeds. The desktop host approves bounded work; it does not
+  remotely accept or construct arbitrary operator shell commands.
 - Keep Tauri commands thin but policy-aware. Cross-repository atomicity belongs
   in a coordinator such as `DeploymentMutationCoordinator`.
 - Keep frontend utilities pure when possible and test them through their exported
@@ -427,7 +514,8 @@ problem is not a reason to bypass authentication, verification, or targeting.
 - `crates/gho`: decoder behavior, truncation, corruption, compression, and
   expansion limits.
 - `crates/service`: repository persistence, validation, authentication, HTTP
-  protocol behavior, PXE packet handling, and boot-package logic.
+  protocol behavior, installer-session phase ordering, media/disk guards, PXE
+  packet handling, and boot-package logic.
 - `crates/agent`: inventory parsing, retry behavior, diagnostics, layout
   generation, and pre-destructive disk checks.
 - `apps/desktop/src-tauri`: cross-repository coordination and compatibility

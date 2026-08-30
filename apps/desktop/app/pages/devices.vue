@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import type { BootMode, ImageArtifact, PartitionPlan, RegisteredDevice } from '~/types/deployment'
+import type { BootMode, Disk, ImageArtifact, PartitionPlan, RegisteredDevice } from '~/types/deployment'
 import { enqueueDeploymentBatch } from '~/utils/deployment-batch'
-import { formatBytes } from '~/utils/files'
+import { compactHash, formatBytes } from '~/utils/files'
+import { deploymentOperationForImageFormat } from '~/utils/image-deployment-support'
 import {
   batchDeploymentTargets,
   deploymentLaunchBlocker,
@@ -34,6 +35,17 @@ import {
   validateCustomPartitionTemplate,
   type CustomPartitionTemplate
 } from '~/utils/custom-partition-templates'
+import {
+  defaultLinuxTargetDisk,
+  linuxDeploymentConfirmationKey,
+  linuxInstallOptionsFor,
+  linuxTargetBlockers,
+  parseLinuxSshAuthorizedKeys,
+  supportedUbuntuInstallerCapability,
+  validateLinuxInstallForm,
+  type LinuxInstallForm,
+  type LinuxTargetBlocker
+} from '~/utils/linux-install'
 
 definePageMeta({ titleKey: 'nav.devices' })
 
@@ -55,6 +67,9 @@ const selectedDiskIds = ref<Record<string, string>>({})
 const selectedImageIndex = ref(1)
 const partitionPreset = ref<string>('recommended')
 const windowsPartitionSizeGib = ref(30)
+const linuxHostnamePrefix = ref('ubuntu')
+const linuxUsername = ref('ubuntu')
+const linuxSshPublicKeys = ref('')
 const customTemplates = ref<CustomPartitionTemplate[]>([])
 const templateDialogOpen = ref(false)
 const templateDraft = ref<CustomPartitionTemplate | null>(null)
@@ -77,9 +92,14 @@ const ordinaryOnlineDevices = computed(() =>
   deviceStore.devices.filter(entry => operationalStatus(entry) === 'online')
 )
 
-const verifiedImages = computed(() => imageStore.images.filter(image => image.verified && ['gho', 'wim', 'esd'].includes(image.format)))
+const verifiedImages = computed(() => imageStore.images.filter(image => image.verified && (
+  ['gho', 'wim', 'esd'].includes(image.format)
+  || supportedUbuntuInstallerCapability(image) !== null
+)))
 const imageItems = computed(() => verifiedImages.value.map(image => ({
-  label: `${image.name} · ${image.format.toUpperCase()} · ${formatBytes(image.sizeBytes, locale.value)}`,
+  label: image.format === 'iso' && image.installerCapability
+    ? `${image.name} · Ubuntu ${image.installerCapability.release} · ${formatBytes(image.sizeBytes, locale.value)}`
+    : `${image.name} · ${image.format.toUpperCase()} · ${formatBytes(image.sizeBytes, locale.value)}`,
   value: image.id
 })))
 const eligibleDevices = computed(() => deviceStore.devices.filter(isEntryDeployable))
@@ -105,10 +125,22 @@ const currentSendTarget = computed(() => {
     : null
 })
 const selectedImage = computed(() => verifiedImages.value.find(image => image.id === selectedImageId.value) ?? null)
+const selectedImageIsLinux = computed(() => selectedImage.value?.format === 'iso')
+const selectedInstallerCapability = computed(() => supportedUbuntuInstallerCapability(selectedImage.value))
+const linuxInstallForm = computed<LinuxInstallForm>(() => ({
+  hostnamePrefix: linuxHostnamePrefix.value,
+  username: linuxUsername.value,
+  sshPublicKeys: linuxSshPublicKeys.value
+}))
+const linuxInstallFormErrors = computed(() => selectedImageIsLinux.value
+  ? validateLinuxInstallForm(linuxInstallForm.value)
+  : [])
+const linuxSshAuthorizedKeys = computed(() => parseLinuxSshAuthorizedKeys(linuxSshPublicKeys.value))
 const selectedGhoPartitions = computed(() => selectedImage.value?.format === 'gho'
   ? selectedImage.value.ghoCapability?.partitions ?? []
   : [])
 const selectedImageIndexIsValid = computed(() => {
+  if (selectedImageIsLinux.value) return true
   if (selectedImage.value?.format !== 'gho') return selectedImageIndex.value >= 1
   return selectedGhoPartitions.value.some(partition => partition.sourcePartition === selectedImageIndex.value)
 })
@@ -170,6 +202,9 @@ const sendActionLabel = computed(() => {
   return t('devices.send')
 })
 function selectedPartitionPlan(bootMode: BootMode) {
+  if (selectedImageIsLinux.value) {
+    return partitionPlanFor('uefi_gpt', 'uefi')
+  }
   if (partitionPreset.value.startsWith('custom:')) {
     const template = customTemplates.value.find(item => `custom:${item.id}` === partitionPreset.value)
     return template ? customPartitionPlan(template, bootMode) : null
@@ -233,9 +268,18 @@ const partitionPresetItems = computed(() => [
 const sendTargetDisksAreValid = computed(() => sendTargets.value.every(entry =>
   selectedDisk(entry) !== null
 ))
+const linuxTargetFailures = computed(() => {
+  const capability = selectedInstallerCapability.value
+  if (!selectedImageIsLinux.value || !capability) return []
+  return sendTargets.value.flatMap((entry) => {
+    const disk = selectedDisk(entry)
+    const blockers = linuxTargetBlockers(entry, disk, capability)
+    return blockers.length ? [{ entry, disk, blockers }] : []
+  })
+})
 const targetsWithoutPartitionCapacity = computed(() => {
   const image = selectedImage.value
-  if (!image) return []
+  if (!image || selectedImageIsLinux.value) return []
   return sendTargets.value.flatMap((entry) => {
     const disk = selectedDisk(entry)
     const plan = selectedPartitionPlan(entry.device.bootMode)
@@ -259,39 +303,53 @@ const partitionCapacityErrorDescription = computed(() => {
     fixed: formatBytes(smallest.capacity.fixedMib * 1024 ** 2, locale.value)
   })
 })
-const deploymentConfirmationKey = computed(() => JSON.stringify({
-  mode: sendMode.value,
-  image: selectedImage.value
-    ? {
-        id: selectedImage.value.id,
-        sha256: selectedImage.value.sha256,
-        sizeBytes: selectedImage.value.sizeBytes,
-        verified: selectedImage.value.verified
-      }
-    : null,
-  imageIndex: selectedImageIndex.value,
-  partitionPreset: partitionPreset.value,
-  windowsPartitionSizeGib: partitionPreset.value === 'windows_and_data' ? windowsPartitionSizeGib.value : null,
-  targets: sendTargets.value
-    .map((entry) => {
-      const disk = selectedDisk(entry)
-      return {
-        deviceId: entry.device.id,
-        online: entry.online,
-        bootMode: entry.device.bootMode,
-        partitionPlan: selectedPartitionPlan(entry.device.bootMode),
-        disk: disk
-          ? {
-              id: disk.id,
-              model: disk.model,
-              serial: disk.serial,
-              sizeBytes: disk.sizeBytes
-            }
-          : null
-      }
+const deploymentConfirmationKey = computed(() => {
+  const image = selectedImage.value
+  if (image?.format === 'iso') {
+    return JSON.stringify({
+      mode: sendMode.value,
+      deployment: linuxDeploymentConfirmationKey(
+        image,
+        sendTargets.value.map(entry => ({ entry, disk: selectedDisk(entry) })),
+        linuxInstallForm.value
+      )
     })
-    .sort((left, right) => left.deviceId.localeCompare(right.deviceId))
-}))
+  }
+
+  return JSON.stringify({
+    mode: sendMode.value,
+    image: image
+      ? {
+          id: image.id,
+          sha256: image.sha256,
+          sizeBytes: image.sizeBytes,
+          verified: image.verified
+        }
+      : null,
+    imageIndex: selectedImageIndex.value,
+    partitionPreset: partitionPreset.value,
+    windowsPartitionSizeGib: partitionPreset.value === 'windows_and_data' ? windowsPartitionSizeGib.value : null,
+    targets: sendTargets.value
+      .map((entry) => {
+        const disk = selectedDisk(entry)
+        return {
+          deviceId: entry.device.id,
+          online: entry.online,
+          bootMode: entry.device.bootMode,
+          partitionPlan: selectedPartitionPlan(entry.device.bootMode),
+          disk: disk
+            ? {
+                id: disk.id,
+                model: disk.model,
+                serial: disk.serial,
+                sizeBytes: disk.sizeBytes
+              }
+            : null
+        }
+      })
+      .sort((left, right) => left.deviceId.localeCompare(right.deviceId))
+  })
+})
 const deploymentConfirmation = computed({
   get: () => deploymentConfirmed.value,
   set: (confirmed: boolean) => {
@@ -311,11 +369,16 @@ const canSend = computed(() => Boolean(
   && selectedPlansAreKnown.value
   && sendTargetDisksAreValid.value
   && targetsWithoutPartitionCapacity.value.length === 0
+  && (!selectedImageIsLinux.value || Boolean(selectedInstallerCapability.value))
+  && linuxInstallFormErrors.value.length === 0
+  && linuxTargetFailures.value.length === 0
   && !sending.value
 ))
 
 function operationFor(image: ImageArtifact) {
-  return image.format === 'gho' ? 'deploy_gho' as const : 'deploy_wim' as const
+  const operation = deploymentOperationForImageFormat(image.format)
+  if (!operation) throw new Error(`unsupported deployment image format: ${image.format}`)
+  return operation
 }
 
 function smallWindowsPartitionGib(plan: PartitionPlan | null) {
@@ -326,6 +389,9 @@ function smallWindowsPartitionGib(plan: PartitionPlan | null) {
 }
 
 function defaultDisk(entry: RegisteredDevice) {
+  if (selectedImageIsLinux.value) {
+    return defaultLinuxTargetDisk(entry.device.disks)
+  }
   return entry.device.disks.find(disk => !disk.isSystem) ?? entry.device.disks[0]
 }
 
@@ -343,9 +409,37 @@ function initializeTargetDisks(entries: readonly RegisteredDevice[]) {
 
 function targetDiskItems(entry: RegisteredDevice) {
   return entry.device.disks.map(disk => ({
-    label: `${disk.model || t('devices.unknownDisk')} · ${formatBytes(disk.sizeBytes, locale.value)}${disk.isSystem ? ` · ${t('devices.systemDisk')}` : ''}`,
+    label: `${disk.model || t('devices.unknownDisk')} · ${formatBytes(disk.sizeBytes, locale.value)} · ${disk.serial?.trim() ? t('devices.diskSerial', { serial: disk.serial }) : t('devices.diskSerialMissing')}${disk.isSystem ? ` · ${t('devices.systemDisk')}` : ''}`,
     value: disk.id
   }))
+}
+
+function linuxInstallFor(entry: RegisteredDevice) {
+  return linuxInstallOptionsFor(entry, linuxInstallForm.value)
+}
+
+function linuxTargetBlockerText(
+  entry: RegisteredDevice,
+  disk: Disk | null,
+  blocker: LinuxTargetBlocker
+) {
+  const capability = selectedInstallerCapability.value
+  return t(`devices.linuxInstall.blockers.${blocker}`, {
+    actualArchitecture: t(`devices.architectures.${entry.device.architecture}`),
+    actualBootMode: t(`devices.bootModes.${entry.device.bootMode}`),
+    actualMemory: formatBytes(entry.device.memoryBytes, locale.value),
+    requiredMemory: formatBytes(capability?.minimumMemoryBytes ?? 0, locale.value),
+    actualDisk: formatBytes(disk?.sizeBytes ?? 0, locale.value),
+    requiredDisk: formatBytes(capability?.minimumDiskBytes ?? 0, locale.value)
+  })
+}
+
+function linuxTargetFailureDescription(
+  entry: RegisteredDevice,
+  disk: Disk | null,
+  blockers: readonly LinuxTargetBlocker[]
+) {
+  return blockers.map(blocker => linuxTargetBlockerText(entry, disk, blocker)).join(' · ')
 }
 
 function updateTargetDisk(entry: RegisteredDevice, value: string) {
@@ -482,9 +576,12 @@ function formatUptime(seconds: number | null) {
 async function handleSend() {
   const image = selectedImage.value
   if (!image || !canSend.value) return
-  const smallSize = sendTargets.value
-    .map(entry => smallWindowsPartitionGib(selectedPartitionPlan(entry.device.bootMode)))
-    .find(size => size !== null)
+  const isLinuxInstall = image.format === 'iso'
+  const smallSize = isLinuxInstall
+    ? null
+    : sendTargets.value
+        .map(entry => smallWindowsPartitionGib(selectedPartitionPlan(entry.device.bootMode)))
+        .find(size => size !== null)
   if (smallSize !== undefined && smallSize !== null
     && !window.confirm(t('devices.smallWindowsPartitionWarning', { size: smallSize }))) return
   const recipients = [...sendTargets.value]
@@ -514,8 +611,11 @@ async function handleSend() {
         targetDiskSizeBytes: disk.sizeBytes
       },
       options: {
-        imageIndex,
-        partitionPlan
+        imageIndex: isLinuxInstall ? 1 : imageIndex,
+        partitionPlan,
+        ...(isLinuxInstall
+          ? { linuxInstall: linuxInstallOptionsFor(entry, linuxInstallForm.value) }
+          : {})
       }
     }
   })
@@ -778,6 +878,7 @@ watch(selectedImageId, () => {
   selectedImageIndex.value = selectedImage.value?.format === 'gho'
     ? selectedGhoPartitions.value[0]?.sourcePartition ?? 1
     : 1
+  initializeTargetDisks(sendTargets.value)
 })
 
 async function refreshClients(verifyOnline = false) {
@@ -1110,7 +1211,66 @@ onBeforeUnmount(() => {
           <UFormField :label="$t('devices.selectImage')">
             <USelect v-model="selectedImageId" :items="imageItems" value-key="value" class="w-full" :disabled="sending" />
           </UFormField>
+          <template v-if="selectedImageIsLinux">
+            <UAlert
+              v-if="selectedInstallerCapability"
+              color="success"
+              variant="subtle"
+              icon="i-lucide-badge-check"
+              :title="$t('devices.linuxInstall.verifiedTitle')"
+              :description="$t('devices.linuxInstall.verifiedDescription', {
+                release: selectedInstallerCapability.release,
+                architecture: selectedInstallerCapability.architecture,
+                profileVersion: selectedInstallerCapability.profileVersion,
+                memory: formatBytes(selectedInstallerCapability.minimumMemoryBytes, locale),
+                disk: formatBytes(selectedInstallerCapability.minimumDiskBytes, locale)
+              })"
+            />
+            <div class="grid gap-4 md:grid-cols-2">
+              <UFormField
+                :label="$t('devices.linuxInstall.hostnamePrefix')"
+                :description="$t('devices.linuxInstall.hostnamePrefixHint')"
+              >
+                <UInput v-model="linuxHostnamePrefix" class="w-full" :disabled="sending" autocomplete="off" />
+              </UFormField>
+              <UFormField
+                :label="$t('devices.linuxInstall.username')"
+                :description="$t('devices.linuxInstall.usernameHint')"
+              >
+                <UInput v-model="linuxUsername" class="w-full" :disabled="sending" autocomplete="username" />
+              </UFormField>
+            </div>
+            <UFormField
+              :label="$t('devices.linuxInstall.sshPublicKeys')"
+              :description="$t('devices.linuxInstall.sshPublicKeysHint')"
+            >
+              <UTextarea
+                v-model="linuxSshPublicKeys"
+                class="w-full font-mono"
+                :rows="4"
+                :disabled="sending"
+                :placeholder="$t('devices.linuxInstall.sshPublicKeysPlaceholder')"
+              />
+            </UFormField>
+            <UAlert
+              color="info"
+              variant="subtle"
+              icon="i-lucide-settings-2"
+              :title="$t('devices.linuxInstall.fixedPolicyTitle')"
+              :description="$t('devices.linuxInstall.fixedPolicyDescription')"
+            />
+            <UAlert
+              v-for="error in linuxInstallFormErrors"
+              :key="error"
+              color="error"
+              variant="subtle"
+              icon="i-lucide-circle-alert"
+              :title="$t('devices.linuxInstall.invalidConfiguration')"
+              :description="$t(`devices.linuxInstall.formErrors.${error}`)"
+            />
+          </template>
           <UFormField
+            v-else
             :label="selectedImage?.format === 'gho' ? $t('devices.ghoPartition') : $t('devices.imageIndex')"
             :description="selectedImage?.format === 'gho' ? $t('devices.ghoPartitionHint') : $t('devices.imageIndexHint')"
           >
@@ -1131,6 +1291,7 @@ onBeforeUnmount(() => {
                 :items="targetDiskItems(currentSendTarget)"
                 value-key="value"
                 class="w-full"
+                :placeholder="selectedImageIsLinux ? $t('devices.linuxInstall.selectDiskExplicitly') : undefined"
                 :disabled="sending || !isEntryDeployable(currentSendTarget)"
                 @update:model-value="updateTargetDisk(currentSendTarget, $event)"
               />
@@ -1180,6 +1341,7 @@ onBeforeUnmount(() => {
                   value-key="value"
                   size="sm"
                   class="w-full"
+                  :placeholder="selectedImageIsLinux ? $t('devices.linuxInstall.selectDiskExplicitly') : undefined"
                   :disabled="sending"
                   :aria-label="$t('devices.targetDiskFor', { name: displayName(entry) })"
                   @update:model-value="updateTargetDisk(entry, $event)"
@@ -1187,6 +1349,18 @@ onBeforeUnmount(() => {
               </div>
             </div>
           </div>
+          <template v-if="selectedImageIsLinux">
+            <UAlert
+              v-for="failure in linuxTargetFailures"
+              :key="failure.entry.device.id"
+              color="error"
+              variant="subtle"
+              icon="i-lucide-shield-x"
+              :title="$t('devices.linuxInstall.targetBlockedTitle', { name: displayName(failure.entry) })"
+              :description="linuxTargetFailureDescription(failure.entry, failure.disk, failure.blockers)"
+            />
+          </template>
+          <template v-else>
           <UFormField :label="$t('devices.partitionTemplate')" :description="$t('devices.partitionTemplateHint')">
             <div class="flex gap-2">
               <USelect v-model="partitionPreset" :items="partitionPresetItems" value-key="value" class="min-w-0 flex-1" :disabled="sending" />
@@ -1245,6 +1419,56 @@ onBeforeUnmount(() => {
             :title="$t('devices.partitionCapacityInsufficientTitle')"
             :description="partitionCapacityErrorDescription"
           />
+          </template>
+          <section
+            v-if="selectedImageIsLinux && selectedImage"
+            class="rounded-xl border border-default bg-elevated/40 p-4"
+          >
+            <div class="flex items-start justify-between gap-4">
+              <div>
+                <h3 class="text-sm font-semibold">{{ $t('devices.linuxInstall.confirmationTitle') }}</h3>
+                <p class="mt-1 text-xs text-muted">{{ $t('devices.linuxInstall.confirmationHint') }}</p>
+              </div>
+              <UBadge color="warning" variant="subtle">{{ $t('devices.erasesDisk') }}</UBadge>
+            </div>
+            <dl class="mt-4 grid gap-3 text-xs md:grid-cols-2">
+              <div>
+                <dt class="text-muted">{{ $t('devices.linuxInstall.imageHash') }}</dt>
+                <dd class="mt-1 font-mono" :title="selectedImage.sha256 ?? ''">{{ compactHash(selectedImage.sha256) }}</dd>
+              </div>
+              <div>
+                <dt class="text-muted">{{ $t('devices.linuxInstall.accountSummary') }}</dt>
+                <dd class="mt-1">{{ linuxUsername }} · {{ $t('devices.linuxInstall.keyCount', { count: linuxSshAuthorizedKeys.length }) }}</dd>
+              </div>
+              <div class="md:col-span-2">
+                <dt class="text-muted">{{ $t('devices.linuxInstall.sshPublicKeys') }}</dt>
+                <dd class="mt-1 max-h-24 space-y-1 overflow-y-auto">
+                  <p v-for="(key, keyIndex) in linuxSshAuthorizedKeys" :key="`${keyIndex}-${key}`" class="break-all font-mono text-[10px]">{{ key }}</p>
+                </dd>
+              </div>
+              <div class="md:col-span-2">
+                <dt class="text-muted">{{ $t('devices.linuxInstall.fixedPolicyTitle') }}</dt>
+                <dd class="mt-1">{{ $t('devices.linuxInstall.fixedPolicyShort') }}</dd>
+              </div>
+            </dl>
+            <div class="mt-4 space-y-2">
+              <div
+                v-for="entry in sendTargets"
+                :key="entry.device.id"
+                class="rounded-lg border border-default bg-default px-3 py-2 text-xs"
+              >
+                <div class="flex items-center justify-between gap-3">
+                  <p class="font-semibold">{{ displayName(entry) }} → {{ linuxInstallFor(entry).hostname }}</p>
+                  <span class="font-mono text-dimmed">{{ entry.device.id }}</span>
+                </div>
+                <p v-if="selectedDisk(entry)" class="mt-1 text-muted">
+                  {{ selectedDisk(entry)?.model || $t('devices.unknownDisk') }} ·
+                  {{ formatBytes(selectedDisk(entry)?.sizeBytes ?? 0, locale) }} ·
+                  {{ $t('devices.diskSerial', { serial: selectedDisk(entry)?.serial || '—' }) }}
+                </p>
+              </div>
+            </div>
+          </section>
           <UCheckbox v-model="deploymentConfirmation" :label="$t('devices.confirmDeployment')" :disabled="sending" />
         </div>
       </template>

@@ -1,4 +1,11 @@
-use easydeploymesh_core::{GhoImageCapability, GhoPartitionCapability, ImageArtifact, ImageFormat};
+#[path = "linux_iso.rs"]
+mod linux_iso;
+
+use easydeploymesh_core::{
+    Architecture, GhoImageCapability, GhoPartitionCapability, ImageArtifact, ImageFormat,
+    InstallerBootAsset, InstallerCapability, InstallerDistribution, InstallerProfile,
+    UBUNTU_AUTOINSTALL_PROFILE_VERSION, UBUNTU_MINIMUM_DISK_BYTES, UBUNTU_MINIMUM_MEMORY_BYTES,
+};
 use easydeploymesh_gho::{Compression as GhoCompression, PARSER_VERSION};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -44,6 +51,28 @@ pub enum ImageLibraryError {
     ImageNotVerified { id: Uuid },
     #[error("image {id} unexpectedly has span files and is not a standalone WIM/ESD")]
     DeployableImageHasSpans { id: Uuid },
+    #[error("invalid Ubuntu installer ISO at {path}: {reason}")]
+    InvalidInstallerIso { path: String, reason: String },
+    #[error("image {id} has no supported Linux installer capability")]
+    MissingInstallerCapability { id: Uuid },
+    #[error(
+        "managed installer {asset} for image {id} changed size: expected {expected} bytes, found {actual}"
+    )]
+    InstallerAssetSizeMismatch {
+        id: Uuid,
+        asset: &'static str,
+        expected: u64,
+        actual: u64,
+    },
+    #[error(
+        "managed installer {asset} for image {id} changed SHA-256: expected {expected}, found {actual}"
+    )]
+    InstallerAssetHashMismatch {
+        id: Uuid,
+        asset: &'static str,
+        expected: String,
+        actual: String,
+    },
     #[error("managed file for image {id} is unavailable at {path}: {source}")]
     ManagedFileUnavailable {
         id: Uuid,
@@ -145,6 +174,22 @@ pub struct PreparedGhoDeployment {
     pub download_sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedLinuxIsoAsset {
+    pub canonical_path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedLinuxIso {
+    pub artifact_id: Uuid,
+    pub iso: PreparedLinuxIsoAsset,
+    pub kernel: PreparedLinuxIsoAsset,
+    pub initrd: PreparedLinuxIsoAsset,
+    pub capability: InstallerCapability,
+}
+
 impl ImageLibrary {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, ImageLibraryError> {
         let data_dir = data_dir.as_ref();
@@ -183,7 +228,12 @@ impl ImageLibrary {
             let deployable_format = matches!(image.format, ImageFormat::Wim | ImageFormat::Esd)
                 || image.gho_capability.as_ref().is_some_and(|capability| {
                     capability.deployable && capability.parser_version == PARSER_VERSION
-                });
+                })
+                || (image.format == ImageFormat::Iso
+                    && image
+                        .installer_capability
+                        .as_ref()
+                        .is_some_and(InstallerCapability::is_supported_ubuntu_server_v1));
             let managed_paths = artifact_paths_are_managed(image, &objects_dir);
             if image.verified && (!deployable_format || !managed_paths) {
                 image.verified = false;
@@ -259,6 +309,18 @@ impl ImageLibrary {
         let staged_paths = staged.all_paths();
         let gho_capability = (format == ImageFormat::Gho)
             .then(|| inspect_native_gho(&staged.primary_path(), &staged_paths[1..]));
+        let installer_inspection = if format == ImageFormat::Iso {
+            Some(
+                linux_iso::inspect_and_extract(&staged.primary_path(), &staged.directory).map_err(
+                    |error| ImageLibraryError::InvalidInstallerIso {
+                        path: canonical_path.display().to_string(),
+                        reason: error.to_string(),
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
         if matches!(format, ImageFormat::Wim | ImageFormat::Esd) {
             validate_wim_header(&staged.primary_path())?;
             validate_wim_with_dism(&staged.primary_path(), None)?;
@@ -298,7 +360,9 @@ impl ImageLibrary {
             {
                 return None;
             }
-            let managed_matches = managed_artifact_matches(image, &self.objects_dir);
+            let managed_matches = managed_artifact_matches(image, &self.objects_dir)
+                && (format != ImageFormat::Iso
+                    || managed_installer_assets_match(image, &self.objects_dir));
             if managed_matches && !artifact_file_sizes_match(image, &staged_sizes) {
                 return None;
             }
@@ -311,6 +375,9 @@ impl ImageLibrary {
         let artifact_id = matching_image.map_or_else(Uuid::new_v4, |(image, _)| image.id);
         let managed = staged.commit(&self.objects_dir)?;
         let created_at = chrono::Utc::now();
+        let installer_capability = installer_inspection
+            .as_ref()
+            .map(|inspection| installer_capability(inspection, &managed.directory));
         let artifact = ImageArtifact {
             id: artifact_id,
             name,
@@ -326,8 +393,12 @@ impl ImageLibrary {
             verified: matches!(format, ImageFormat::Wim | ImageFormat::Esd)
                 || gho_capability
                     .as_ref()
-                    .is_some_and(|value| value.deployable),
+                    .is_some_and(|value| value.deployable)
+                || installer_capability
+                    .as_ref()
+                    .is_some_and(InstallerCapability::is_supported_ubuntu_server_v1),
             gho_capability,
+            installer_capability,
             created_at,
         };
 
@@ -408,6 +479,107 @@ impl ImageLibrary {
         validate_wim_with_dism(&managed_path, Some(requested_image_index))?;
 
         Ok(artifact)
+    }
+
+    /// Revalidates the ISO, the boot assets extracted at import, and their
+    /// relationship to the ISO before a Linux installer session is published.
+    pub fn prepare_linux_iso(&self, id: Uuid) -> Result<PreparedLinuxIso, ImageLibraryError> {
+        let artifact = self
+            .images
+            .read()
+            .map_err(|_| ImageLibraryError::LockPoisoned)?
+            .iter()
+            .find(|image| image.id == id)
+            .cloned()
+            .ok_or(ImageLibraryError::ImageNotFound { id })?;
+        if artifact.format != ImageFormat::Iso {
+            return Err(ImageLibraryError::UnsupportedFormat(format!(
+                "Linux installer preparation requires ISO, found {:?} for image {id}",
+                artifact.format
+            )));
+        }
+        if !artifact.verified || !artifact.spans.is_empty() {
+            return Err(ImageLibraryError::ImageNotVerified { id });
+        }
+        let capability = artifact
+            .installer_capability
+            .clone()
+            .filter(InstallerCapability::is_supported_ubuntu_server_v1)
+            .ok_or(ImageLibraryError::MissingInstallerCapability { id })?;
+        let object_directory =
+            managed_object_directory(&artifact, &self.objects_dir).ok_or_else(|| {
+                ImageLibraryError::UnmanagedImagePath {
+                    id,
+                    path: artifact.source_path.clone(),
+                }
+            })?;
+
+        let iso_path = resolve_direct_object_file(
+            id,
+            "ISO",
+            Path::new(&artifact.source_path),
+            &object_directory,
+            None,
+        )?;
+        let expected_iso_sha256 = artifact
+            .sha256
+            .as_deref()
+            .ok_or(ImageLibraryError::MissingChecksum { id })?;
+        let iso = prepare_installer_file(
+            id,
+            "ISO",
+            iso_path,
+            artifact.size_bytes,
+            expected_iso_sha256,
+        )?;
+        let kernel_path = resolve_direct_object_file(
+            id,
+            "kernel",
+            Path::new(&capability.kernel.path),
+            &object_directory,
+            Some(linux_iso::MANAGED_KERNEL_NAME),
+        )?;
+        let kernel = prepare_installer_file(
+            id,
+            "kernel",
+            kernel_path,
+            capability.kernel.size_bytes,
+            &capability.kernel.sha256,
+        )?;
+        let initrd_path = resolve_direct_object_file(
+            id,
+            "initrd",
+            Path::new(&capability.initrd.path),
+            &object_directory,
+            Some(linux_iso::MANAGED_INITRD_NAME),
+        )?;
+        let initrd = prepare_installer_file(
+            id,
+            "initrd",
+            initrd_path,
+            capability.initrd.size_bytes,
+            &capability.initrd.sha256,
+        )?;
+
+        let embedded = linux_iso::inspect_managed(&iso.canonical_path).map_err(|error| {
+            ImageLibraryError::InvalidInstallerIso {
+                path: iso.canonical_path.display().to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+        compare_embedded_asset(id, "embedded kernel", &capability.kernel, &embedded.kernel)?;
+        compare_embedded_asset(id, "embedded initrd", &capability.initrd, &embedded.initrd)?;
+        if embedded.release != capability.release {
+            return Err(ImageLibraryError::MissingInstallerCapability { id });
+        }
+
+        Ok(PreparedLinuxIso {
+            artifact_id: id,
+            iso,
+            kernel,
+            initrd,
+            capability,
+        })
     }
 
     pub fn verify_gho_image(&self, id: Uuid) -> Result<ImageArtifact, ImageLibraryError> {
@@ -788,6 +960,190 @@ fn managed_artifact_matches(image: &ImageArtifact, objects_dir: &Path) -> bool {
     })
 }
 
+fn installer_capability(
+    inspected: &linux_iso::InspectedUbuntuIso,
+    object_directory: &Path,
+) -> InstallerCapability {
+    InstallerCapability {
+        deployable: true,
+        distribution: InstallerDistribution::Ubuntu,
+        release: inspected.release.clone(),
+        architecture: Architecture::X86_64,
+        profile: InstallerProfile::UbuntuAutoinstall,
+        profile_version: UBUNTU_AUTOINSTALL_PROFILE_VERSION,
+        kernel: InstallerBootAsset {
+            path: linux_iso::managed_asset_path(object_directory, inspected.kernel.basename)
+                .display()
+                .to_string(),
+            size_bytes: inspected.kernel.size_bytes,
+            sha256: inspected.kernel.sha256.clone(),
+        },
+        initrd: InstallerBootAsset {
+            path: linux_iso::managed_asset_path(object_directory, inspected.initrd.basename)
+                .display()
+                .to_string(),
+            size_bytes: inspected.initrd.size_bytes,
+            sha256: inspected.initrd.sha256.clone(),
+        },
+        minimum_memory_bytes: UBUNTU_MINIMUM_MEMORY_BYTES,
+        minimum_disk_bytes: UBUNTU_MINIMUM_DISK_BYTES,
+        blocked_reason: None,
+    }
+}
+
+fn managed_installer_assets_match(image: &ImageArtifact, objects_dir: &Path) -> bool {
+    let Some(capability) = image
+        .installer_capability
+        .as_ref()
+        .filter(|capability| capability.is_supported_ubuntu_server_v1())
+    else {
+        return false;
+    };
+    let Some(object_directory) = managed_object_directory(image, objects_dir) else {
+        return false;
+    };
+    let Ok(kernel_path) = resolve_direct_object_file(
+        image.id,
+        "kernel",
+        Path::new(&capability.kernel.path),
+        &object_directory,
+        Some(linux_iso::MANAGED_KERNEL_NAME),
+    ) else {
+        return false;
+    };
+    let Ok(initrd_path) = resolve_direct_object_file(
+        image.id,
+        "initrd",
+        Path::new(&capability.initrd.path),
+        &object_directory,
+        Some(linux_iso::MANAGED_INITRD_NAME),
+    ) else {
+        return false;
+    };
+    prepare_installer_file(
+        image.id,
+        "kernel",
+        kernel_path,
+        capability.kernel.size_bytes,
+        &capability.kernel.sha256,
+    )
+    .is_ok()
+        && prepare_installer_file(
+            image.id,
+            "initrd",
+            initrd_path,
+            capability.initrd.size_bytes,
+            &capability.initrd.sha256,
+        )
+        .is_ok()
+}
+
+fn resolve_direct_object_file(
+    id: Uuid,
+    asset: &'static str,
+    path: &Path,
+    object_directory: &Path,
+    expected_basename: Option<&str>,
+) -> Result<PathBuf, ImageLibraryError> {
+    let raw_parent_matches = path.parent() == Some(object_directory);
+    let basename_matches = expected_basename.is_none_or(|expected| {
+        path.file_name()
+            .is_some_and(|actual| actual == OsStr::new(expected))
+    });
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| ImageLibraryError::ManagedFileUnavailable {
+            id,
+            path: path.display().to_string(),
+            source,
+        })?;
+    if !raw_parent_matches
+        || !basename_matches
+        || metadata.file_type().is_symlink()
+        || !metadata.is_file()
+    {
+        return Err(ImageLibraryError::UnmanagedImagePath {
+            id,
+            path: format!("{asset}: {}", path.display()),
+        });
+    }
+    let canonical_path =
+        fs::canonicalize(path).map_err(|source| ImageLibraryError::ManagedFileUnavailable {
+            id,
+            path: path.display().to_string(),
+            source,
+        })?;
+    if canonical_path.parent() != Some(object_directory) {
+        return Err(ImageLibraryError::UnmanagedImagePath {
+            id,
+            path: format!("{asset}: {}", canonical_path.display()),
+        });
+    }
+    Ok(canonical_path)
+}
+
+fn prepare_installer_file(
+    id: Uuid,
+    asset: &'static str,
+    canonical_path: PathBuf,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<PreparedLinuxIsoAsset, ImageLibraryError> {
+    let actual_size = fs::metadata(&canonical_path)
+        .map_err(|source| ImageLibraryError::ManagedFileUnavailable {
+            id,
+            path: canonical_path.display().to_string(),
+            source,
+        })?
+        .len();
+    if actual_size != expected_size {
+        return Err(ImageLibraryError::InstallerAssetSizeMismatch {
+            id,
+            asset,
+            expected: expected_size,
+            actual: actual_size,
+        });
+    }
+    let actual_sha256 = hash_files(std::slice::from_ref(&canonical_path))?;
+    if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
+        return Err(ImageLibraryError::InstallerAssetHashMismatch {
+            id,
+            asset,
+            expected: expected_sha256.to_owned(),
+            actual: actual_sha256,
+        });
+    }
+    Ok(PreparedLinuxIsoAsset {
+        canonical_path,
+        size_bytes: actual_size,
+        sha256: actual_sha256,
+    })
+}
+
+fn compare_embedded_asset(
+    id: Uuid,
+    asset: &'static str,
+    expected: &InstallerBootAsset,
+    actual: &linux_iso::InspectedAsset,
+) -> Result<(), ImageLibraryError> {
+    if actual.size_bytes != expected.size_bytes {
+        return Err(ImageLibraryError::InstallerAssetSizeMismatch {
+            id,
+            asset,
+            expected: expected.size_bytes,
+            actual: actual.size_bytes,
+        });
+    }
+    if !actual.sha256.eq_ignore_ascii_case(&expected.sha256) {
+        return Err(ImageLibraryError::InstallerAssetHashMismatch {
+            id,
+            asset,
+            expected: expected.sha256.clone(),
+            actual: actual.sha256.clone(),
+        });
+    }
+    Ok(())
+}
+
 fn artifact_basenames_match(image: &ImageArtifact, staged_paths: &[PathBuf]) -> bool {
     let managed_paths = artifact_file_paths(image);
     managed_paths.len() == staged_paths.len()
@@ -818,9 +1174,18 @@ fn artifact_file_paths(image: &ImageArtifact) -> Vec<PathBuf> {
 }
 
 fn artifact_paths_are_managed(image: &ImageArtifact, objects_dir: &Path) -> bool {
-    std::iter::once(image.source_path.as_str())
+    let image_files_are_managed = std::iter::once(image.source_path.as_str())
         .chain(image.spans.iter().map(String::as_str))
-        .all(|path| canonical_path_is_managed(Path::new(path), objects_dir))
+        .all(|path| canonical_path_is_managed(Path::new(path), objects_dir));
+    image_files_are_managed
+        && image
+            .installer_capability
+            .as_ref()
+            .is_none_or(|capability| {
+                [&capability.kernel, &capability.initrd]
+                    .into_iter()
+                    .all(|asset| canonical_path_is_managed(Path::new(&asset.path), objects_dir))
+            })
 }
 
 fn managed_object_directory(image: &ImageArtifact, objects_dir: &Path) -> Option<PathBuf> {
@@ -1185,6 +1550,7 @@ fn detect_image_format(path: &Path) -> Result<ImageFormat, ImageLibraryError> {
         "wim" => Ok(ImageFormat::Wim),
         "esd" => Ok(ImageFormat::Esd),
         "swm" => Ok(ImageFormat::Swm),
+        "iso" => Ok(ImageFormat::Iso),
         _ => Err(ImageLibraryError::UnsupportedFormat(extension)),
     }
 }
@@ -1202,7 +1568,7 @@ fn discover_spans(
     match format {
         ImageFormat::Gho => discover_ghost_spans(primary_path, &files),
         ImageFormat::Swm => Ok(discover_swm_spans(primary_path, &files)),
-        _ => unreachable!(),
+        ImageFormat::Wim | ImageFormat::Esd | ImageFormat::Iso => unreachable!(),
     }
 }
 
@@ -1679,6 +2045,14 @@ fn native_gho_error_code(error: &easydeploymesh_gho::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hadris_iso::{
+        joliet::JolietLevel,
+        read::PathSeparator,
+        write::{
+            InputTree, IsoImageWriter,
+            options::{BaseIsoLevel, CreationFeatures, IsoFormatOptions},
+        },
+    };
     use std::io::Write;
 
     fn create_image(path: &Path, contents: &[u8]) {
@@ -1686,6 +2060,64 @@ mod tests {
         file.write_all(contents)
             .expect("fixture contents should be writable");
     }
+
+    fn create_ubuntu_iso(path: &Path, info: &str, valid_kernel: bool) {
+        let source = path
+            .parent()
+            .expect("fixture ISO should have a parent")
+            .join(format!("iso-source-{}", Uuid::new_v4()));
+        fs::create_dir_all(source.join(".disk"))
+            .expect("fixture metadata directory should be created");
+        fs::create_dir_all(source.join("casper"))
+            .expect("fixture casper directory should be created");
+        fs::write(source.join(".disk/info"), info).expect("fixture info should write");
+        let mut kernel = vec![0x5a_u8; MINIMUM_TEST_BOOT_ASSET_BYTES];
+        if valid_kernel {
+            kernel[0x1fe..0x200].copy_from_slice(&[0x55, 0xaa]);
+            kernel[0x202..0x206].copy_from_slice(b"HdrS");
+            kernel[0x206..0x208].copy_from_slice(&0x020b_u16.to_le_bytes());
+        }
+        fs::write(source.join("casper/vmlinuz"), kernel).expect("fixture kernel should write");
+        fs::write(
+            source.join("casper/initrd"),
+            vec![0xa5_u8; MINIMUM_TEST_BOOT_ASSET_BYTES],
+        )
+        .expect("fixture initrd should write");
+
+        let input = InputTree::from_fs(&source, PathSeparator::ForwardSlash)
+            .expect("fixture tree should be readable");
+        let options = IsoFormatOptions {
+            volume_name: "UBUNTU_SERVER_2404".to_owned(),
+            system_id: None,
+            volume_set_id: None,
+            publisher_id: Some("Canonical".to_owned()),
+            preparer_id: Some("EasyDeployMesh tests".to_owned()),
+            application_id: Some("Ubuntu Server test media".to_owned()),
+            sector_size: 2048,
+            path_separator: PathSeparator::ForwardSlash,
+            features: CreationFeatures {
+                filenames: BaseIsoLevel::Level2 {
+                    supports_lowercase: true,
+                    supports_rrip: false,
+                },
+                long_filenames: false,
+                joliet: Some(JolietLevel::Level3),
+                rock_ridge: None,
+                el_torito: None,
+                hybrid_boot: None,
+            },
+            strict_charset: false,
+        };
+        let output = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("fixture ISO should be writable");
+        IsoImageWriter::create(output, input, options).expect("fixture ISO should be created");
+    }
+
+    const MINIMUM_TEST_BOOT_ASSET_BYTES: usize = 1024 * 1024;
 
     fn create_multi_partition_gho(path: &Path, partitions: &[&[u8]]) {
         let mut contents = vec![0_u8; 512];
@@ -1884,6 +2316,257 @@ mod tests {
     }
 
     #[test]
+    fn imports_ubuntu_server_iso_by_content_and_prepares_managed_boot_assets() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let source_path = temp.path().join("misleading-windows-name.iso");
+        create_ubuntu_iso(
+            &source_path,
+            "Ubuntu-Server 24.04.3 LTS \"Noble Numbat\" - Release amd64 (20250805)",
+            true,
+        );
+        let library_dir = temp.path().join("library");
+        let library = ImageLibrary::open(&library_dir).expect("library should open");
+
+        let artifact = library
+            .import(&source_path)
+            .expect("supported ISO content should import");
+        let capability = artifact
+            .installer_capability
+            .as_ref()
+            .expect("ISO should expose installer capability");
+
+        assert_eq!(artifact.format, ImageFormat::Iso);
+        assert!(artifact.verified);
+        assert!(capability.is_supported_ubuntu_server_v1());
+        assert_eq!(capability.release, "24.04");
+        let managed_parent = Path::new(&artifact.source_path)
+            .parent()
+            .expect("managed ISO should have an object directory");
+        assert_eq!(
+            Path::new(&capability.kernel.path).parent(),
+            Some(managed_parent)
+        );
+        assert_eq!(
+            Path::new(&capability.initrd.path).parent(),
+            Some(managed_parent)
+        );
+
+        let prepared = library
+            .prepare_linux_iso(artifact.id)
+            .expect("all managed Linux media should revalidate");
+        assert_eq!(prepared.artifact_id, artifact.id);
+        assert_eq!(prepared.iso.size_bytes, artifact.size_bytes);
+        assert_eq!(prepared.kernel.sha256, capability.kernel.sha256);
+        assert_eq!(prepared.initrd.sha256, capability.initrd.sha256);
+        assert!(
+            prepared.iso.canonical_path.starts_with(
+                fs::canonicalize(library_dir.join("objects"))
+                    .expect("managed object root should canonicalize")
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_arbitrary_bytes_renamed_as_an_ubuntu_iso() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let source_path = temp.path().join("ubuntu-24.04-live-server-amd64.iso");
+        create_image(&source_path, b"not an installer image");
+        let library = ImageLibrary::open(temp.path().join("library")).expect("library should open");
+
+        let error = library
+            .import(&source_path)
+            .expect_err("a trusted-looking filename must not make an ISO deployable");
+
+        assert!(matches!(
+            error,
+            ImageLibraryError::InvalidInstallerIso { .. }
+        ));
+        assert!(library.list().expect("images should list").is_empty());
+    }
+
+    #[test]
+    fn rejects_non_server_or_wrong_release_iso_metadata() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let source_path = temp.path().join("ubuntu.iso");
+        create_ubuntu_iso(
+            &source_path,
+            "Ubuntu 24.04.3 LTS \"Noble Numbat\" - Release amd64 (20250805)",
+            true,
+        );
+        let library = ImageLibrary::open(temp.path().join("library")).expect("library should open");
+
+        let error = library
+            .import(&source_path)
+            .expect_err("desktop media must not pass the server installer profile");
+
+        assert!(matches!(
+            error,
+            ImageLibraryError::InvalidInstallerIso { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_iso_with_a_non_linux_casper_kernel() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let source_path = temp.path().join("ubuntu.iso");
+        create_ubuntu_iso(
+            &source_path,
+            "Ubuntu-Server 24.04 LTS \"Noble Numbat\" - Release amd64 (20240423)",
+            false,
+        );
+        let library = ImageLibrary::open(temp.path().join("library")).expect("library should open");
+
+        let error = library
+            .import(&source_path)
+            .expect_err("a fake casper kernel must be rejected");
+
+        assert!(matches!(
+            error,
+            ImageLibraryError::InvalidInstallerIso { .. }
+        ));
+    }
+
+    #[test]
+    fn linux_iso_preparation_rejects_same_size_extracted_kernel_tampering() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let source_path = temp.path().join("ubuntu.iso");
+        create_ubuntu_iso(
+            &source_path,
+            "Ubuntu-Server 24.04.2 LTS \"Noble Numbat\" - Release amd64 (20250215)",
+            true,
+        );
+        let library = ImageLibrary::open(temp.path().join("library")).expect("library should open");
+        let artifact = library.import(&source_path).expect("ISO should import");
+        let kernel_path = PathBuf::from(
+            artifact
+                .installer_capability
+                .as_ref()
+                .expect("capability should exist")
+                .kernel
+                .path
+                .clone(),
+        );
+        let mut kernel = fs::read(&kernel_path).expect("managed kernel should be readable");
+        kernel[0] ^= 0xff;
+        create_image(&kernel_path, &kernel);
+
+        let error = library
+            .prepare_linux_iso(artifact.id)
+            .expect_err("same-size managed kernel tampering must fail preflight");
+
+        assert!(matches!(
+            error,
+            ImageLibraryError::InstallerAssetHashMismatch {
+                id,
+                asset: "kernel",
+                ..
+            } if id == artifact.id
+        ));
+    }
+
+    #[test]
+    fn linux_iso_preparation_rejects_same_size_iso_tampering() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let source_path = temp.path().join("ubuntu.iso");
+        create_ubuntu_iso(
+            &source_path,
+            "Ubuntu-Server 24.04.2 LTS \"Noble Numbat\" - Release amd64 (20250215)",
+            true,
+        );
+        let library = ImageLibrary::open(temp.path().join("library")).expect("library should open");
+        let artifact = library.import(&source_path).expect("ISO should import");
+        let managed_path = PathBuf::from(&artifact.source_path);
+        let mut iso = fs::read(&managed_path).expect("managed ISO should be readable");
+        let last = iso.last_mut().expect("fixture ISO should not be empty");
+        *last ^= 0xff;
+        create_image(&managed_path, &iso);
+
+        let error = library
+            .prepare_linux_iso(artifact.id)
+            .expect_err("same-size managed ISO tampering must fail preflight");
+
+        assert!(matches!(
+            error,
+            ImageLibraryError::InstallerAssetHashMismatch {
+                id,
+                asset: "ISO",
+                ..
+            } if id == artifact.id
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_iso_preparation_rejects_a_symlinked_boot_asset() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let source_path = temp.path().join("ubuntu.iso");
+        create_ubuntu_iso(
+            &source_path,
+            "Ubuntu-Server 24.04.2 LTS \"Noble Numbat\" - Release amd64 (20250215)",
+            true,
+        );
+        let library = ImageLibrary::open(temp.path().join("library")).expect("library should open");
+        let artifact = library.import(&source_path).expect("ISO should import");
+        let capability = artifact
+            .installer_capability
+            .as_ref()
+            .expect("capability should exist");
+        let kernel_path = PathBuf::from(&capability.kernel.path);
+        let external_kernel = temp.path().join("external-kernel");
+        fs::copy(&kernel_path, &external_kernel).expect("external fixture should copy");
+        fs::remove_file(&kernel_path).expect("managed fixture should be replaceable");
+        std::os::unix::fs::symlink(&external_kernel, &kernel_path)
+            .expect("managed symlink fixture should be created");
+
+        let error = library
+            .prepare_linux_iso(artifact.id)
+            .expect_err("symlinked boot assets must not cross the managed object seam");
+
+        assert!(matches!(
+            error,
+            ImageLibraryError::UnmanagedImagePath { id, .. } if id == artifact.id
+        ));
+    }
+
+    #[test]
+    fn reopening_a_legacy_iso_without_capability_fails_closed() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let library_dir = temp.path().join("library");
+        let library = ImageLibrary::open(&library_dir).expect("library should initialize");
+        drop(library);
+        let object_directory = library_dir.join("objects").join(Uuid::new_v4().to_string());
+        fs::create_dir(&object_directory).expect("managed fixture directory should be created");
+        let iso_path = object_directory.join("legacy.iso");
+        create_image(&iso_path, b"legacy ISO");
+        let legacy_json = serde_json::json!({
+            "schemaVersion": MANIFEST_SCHEMA_VERSION,
+            "images": [{
+                "id": Uuid::new_v4(),
+                "name": "Legacy ISO",
+                "format": "iso",
+                "sourcePath": fs::canonicalize(&iso_path).expect("fixture should canonicalize"),
+                "sizeBytes": 10,
+                "sha256": "00".repeat(32),
+                "spans": [],
+                "verified": true,
+                "createdAt": chrono::Utc::now()
+            }]
+        });
+        fs::write(
+            library_dir.join("images.json"),
+            serde_json::to_vec_pretty(&legacy_json).expect("legacy manifest should serialize"),
+        )
+        .expect("legacy manifest should write");
+
+        let library = ImageLibrary::open(&library_dir).expect("legacy manifest should load");
+        let loaded = library.list().expect("images should list");
+
+        assert_eq!(loaded.len(), 1);
+        assert!(!loaded[0].verified);
+        assert_eq!(loaded[0].installer_capability, None);
+    }
+
+    #[test]
     fn rejects_arbitrary_bytes_renamed_as_wim() {
         let temp = tempfile::tempdir().expect("temporary directory should be available");
         let source_path = temp.path().join("not-really-windows.wim");
@@ -2020,6 +2703,7 @@ mod tests {
             spans: Vec::new(),
             verified: true,
             gho_capability: None,
+            installer_capability: None,
             created_at: chrono::Utc::now(),
         };
         let manifest = ImageManifest {
@@ -2585,6 +3269,7 @@ mod tests {
             spans: Vec::new(),
             verified: false,
             gho_capability: None,
+            installer_capability: None,
             created_at: chrono::Utc::now(),
         };
         persist_manifest(

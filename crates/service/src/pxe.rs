@@ -1030,6 +1030,80 @@ mod tests {
     }
 
     #[test]
+    fn managed_package_chains_through_the_control_plane_and_retains_winpe_fallback() {
+        let package = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(package.path().join("boot")).unwrap();
+        std::fs::write(package.path().join("boot.ipxe"), MANAGED_IPXE_SCRIPT).unwrap();
+
+        assert!(
+            BootPackage::configure_control_dispatcher(package.path(), "http://192.0.2.10:7760")
+                .unwrap()
+        );
+
+        let dispatcher = std::fs::read_to_string(package.path().join("boot.ipxe")).unwrap();
+        assert!(dispatcher.starts_with(DYNAMIC_BOOT_SCRIPT_HEADER));
+        assert!(dispatcher.contains("http://192.0.2.10:7760/api/v1/install/boot.ipxe"));
+        assert!(dispatcher.contains("mac=${net0/mac}"));
+        assert!(dispatcher.contains("arch=${buildarch}"));
+        assert!(dispatcher.contains("platform=${platform} || goto windows\nexit\n:windows"));
+        assert_eq!(
+            std::fs::read_to_string(package.path().join(WINDOWS_FALLBACK_IPXE_PATH)).unwrap(),
+            MANAGED_IPXE_SCRIPT
+        );
+        assert!(package.path().join(DYNAMIC_BOOT_LAYOUT_MARKER).is_file());
+    }
+
+    #[test]
+    fn managed_loader_refresh_preserves_an_active_control_dispatcher() {
+        let package = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(package.path().join("boot")).unwrap();
+        for (path, bytes) in [
+            ("boot/BCD", b"bcd".as_slice()),
+            ("boot/boot.sdi", b"sdi"),
+            (
+                "boot/boot.wim",
+                br"\Windows\System32\boot\winload.exe".as_slice(),
+            ),
+            ("boot/bootmgr", b"bootmgr"),
+            ("boot/wimboot", b"old-wimboot"),
+        ] {
+            std::fs::write(package.path().join(path), bytes).unwrap();
+        }
+        std::fs::write(package.path().join("boot.ipxe"), MANAGED_IPXE_SCRIPT).unwrap();
+        BootPackage::configure_control_dispatcher(package.path(), "http://192.0.2.10:7760")
+            .unwrap();
+        let dispatcher = std::fs::read(package.path().join("boot.ipxe")).unwrap();
+
+        assert!(BootPackage::ensure_managed_network_boot(package.path()).unwrap());
+        assert_eq!(
+            std::fs::read(package.path().join("boot.ipxe")).unwrap(),
+            dispatcher
+        );
+        assert_eq!(
+            std::fs::read_to_string(package.path().join(WINDOWS_FALLBACK_IPXE_PATH)).unwrap(),
+            MANAGED_IPXE_SCRIPT
+        );
+    }
+
+    #[test]
+    fn dispatcher_rejects_an_endpoint_that_could_inject_ipxe_commands() {
+        let package = tempfile::tempdir().unwrap();
+        std::fs::write(package.path().join("boot.ipxe"), MANAGED_IPXE_SCRIPT).unwrap();
+
+        let error = BootPackage::configure_control_dispatcher(
+            package.path(),
+            "http://192.0.2.10:7760\necho unsafe",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("HTTP socket address"));
+        assert_eq!(
+            std::fs::read_to_string(package.path().join("boot.ipxe")).unwrap(),
+            MANAGED_IPXE_SCRIPT
+        );
+    }
+
+    #[test]
     fn managed_ipxe_script_names_each_initrd_for_bios_and_uefi() {
         let initrds = MANAGED_IPXE_SCRIPT
             .lines()
@@ -2082,6 +2156,10 @@ const EDGELESS_MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-edgeless-pxe";
 const USM_MANAGED_LAYOUT_MARKER: &str = ".easydeploymesh-usm-pxe";
 const LEGACY_NATIVE_ISO_LAYOUT_MARKER: &str = ".easydeploymesh-native-iso-layout-v1";
 const NATIVE_ISO_LAYOUT_MARKER: &str = ".easydeploymesh-native-iso-layout-v2";
+const DYNAMIC_BOOT_LAYOUT_MARKER: &str = ".easydeploymesh-dynamic-boot-v1";
+const DYNAMIC_BOOT_SCRIPT_HEADER: &str =
+    "#!ipxe\n# EasyDeployMesh dynamic installer dispatcher v1\n";
+const WINDOWS_FALLBACK_IPXE_PATH: &str = "boot/easydeploymesh-winpe.ipxe";
 const NATIVE_ISO_PATH: &str = "boot/native.iso";
 const NATIVE_ISO_PLACEHOLDER_SCRIPT: &str =
     "#!ipxe\nsanboot http://${next-server}:0/boot/native.iso || shell\n";
@@ -2169,7 +2247,28 @@ pub struct BootPackage {
     pub uefi_x64_boot_file: String,
 }
 
+fn is_managed_winpe_ipxe_script(script: &[u8]) -> bool {
+    script == MANAGED_IPXE_SCRIPT.as_bytes()
+        || script == LEGACY_MANAGED_IPXE_SCRIPT.as_bytes()
+        || script == BROKEN_NAMED_MANAGED_IPXE_SCRIPT.as_bytes()
+        || script == V3_MANAGED_IPXE_SCRIPT.as_bytes()
+        || script == V4_MANAGED_IPXE_SCRIPT.as_bytes()
+        || script == V5_MANAGED_IPXE_SCRIPT.as_bytes()
+        || script == EDGELESS_MANAGED_IPXE_SCRIPT.as_bytes()
+        || script == USM_MANAGED_IPXE_SCRIPT.as_bytes()
+}
+
 impl BootPackage {
+    /// Returns whether a standard managed package currently routes boot decisions through the
+    /// control plane. This is used as a readiness check before a Linux installer job is queued.
+    pub fn has_control_dispatcher(root: impl AsRef<Path>) -> bool {
+        let root = root.as_ref();
+        root.join(DYNAMIC_BOOT_LAYOUT_MARKER).is_file()
+            && root.join(WINDOWS_FALLBACK_IPXE_PATH).is_file()
+            && fs::read(root.join("boot.ipxe"))
+                .is_ok_and(|script| script.starts_with(DYNAMIC_BOOT_SCRIPT_HEADER.as_bytes()))
+    }
+
     /// Refreshes the bundled network loaders for a package created by media import.
     ///
     /// The exact managed iPXE script identifies normalized packages without
@@ -2195,25 +2294,24 @@ impl BootPackage {
                     .into(),
             ));
         }
-        let script = fs::read(root.join("boot.ipxe")).ok();
-        if !matches!(
-            script.as_deref(),
-            Some(bytes) if bytes == MANAGED_IPXE_SCRIPT.as_bytes()
-                || bytes == LEGACY_MANAGED_IPXE_SCRIPT.as_bytes()
-                || bytes == BROKEN_NAMED_MANAGED_IPXE_SCRIPT.as_bytes()
-                || bytes == V3_MANAGED_IPXE_SCRIPT.as_bytes()
-                || bytes == V4_MANAGED_IPXE_SCRIPT.as_bytes()
-                || bytes == V5_MANAGED_IPXE_SCRIPT.as_bytes()
-                || bytes == EDGELESS_MANAGED_IPXE_SCRIPT.as_bytes()
-                || bytes == USM_MANAGED_IPXE_SCRIPT.as_bytes()
-        ) || ![
-            "boot/boot.sdi",
-            "boot/boot.wim",
-            "boot/bootmgr",
-            "boot/wimboot",
-        ]
-        .iter()
-        .all(|path| root.join(path).is_file())
+        let root_script = fs::read(root.join("boot.ipxe")).ok();
+        let dispatcher_active = Self::has_control_dispatcher(root);
+        let managed_script = if dispatcher_active {
+            fs::read(root.join(WINDOWS_FALLBACK_IPXE_PATH)).ok()
+        } else {
+            root_script
+        };
+        if !managed_script
+            .as_deref()
+            .is_some_and(is_managed_winpe_ipxe_script)
+            || ![
+                "boot/boot.sdi",
+                "boot/boot.wim",
+                "boot/bootmgr",
+                "boot/wimboot",
+            ]
+            .iter()
+            .all(|path| root.join(path).is_file())
         {
             return Ok(false);
         }
@@ -2259,12 +2357,68 @@ impl BootPackage {
         } else {
             MANAGED_IPXE_SCRIPT
         };
-        fs::write(root.join("boot.ipxe"), script)?;
+        let script_path = if dispatcher_active {
+            root.join(WINDOWS_FALLBACK_IPXE_PATH)
+        } else {
+            root.join("boot.ipxe")
+        };
+        fs::write(script_path, script)?;
         fs::write(root.join(MANAGED_LAYOUT_MARKER), b"6\n")?;
         let _ = fs::remove_file(root.join(LEGACY_MANAGED_LAYOUT_MARKER));
         let _ = fs::remove_file(root.join(V3_MANAGED_LAYOUT_MARKER));
         let _ = fs::remove_file(root.join(V4_MANAGED_LAYOUT_MARKER));
         let _ = fs::remove_file(root.join(V5_MANAGED_LAYOUT_MARKER));
+        Ok(true)
+    }
+
+    /// Configures a managed WinPE package to ask the control plane which installer to boot.
+    ///
+    /// The original, exact managed WinPE script is retained as a fail-closed fallback for
+    /// devices without a Linux assignment. Native ISO packages are intentionally excluded:
+    /// their fallback URL is allocated only when the PXE service starts and cannot be safely
+    /// captured in this static dispatcher.
+    pub fn configure_control_dispatcher(
+        root: impl AsRef<Path>,
+        control_endpoint: &str,
+    ) -> Result<bool, PxeServiceError> {
+        let root = root.as_ref();
+        if root.join(NATIVE_ISO_LAYOUT_MARKER).is_file() {
+            return Ok(false);
+        }
+        let address = control_endpoint
+            .strip_prefix("http://")
+            .and_then(|authority| authority.parse::<SocketAddr>().ok())
+            .ok_or_else(|| {
+                PxeServiceError::InvalidConfig(
+                    "control endpoint must be an HTTP socket address".to_owned(),
+                )
+            })?;
+        let normalized_endpoint = format!("http://{address}");
+
+        let current_script = fs::read(root.join("boot.ipxe")).ok();
+        let dispatcher_active = current_script
+            .as_deref()
+            .is_some_and(|script| script.starts_with(DYNAMIC_BOOT_SCRIPT_HEADER.as_bytes()))
+            && root.join(DYNAMIC_BOOT_LAYOUT_MARKER).is_file();
+        let fallback_script = if dispatcher_active {
+            fs::read(root.join(WINDOWS_FALLBACK_IPXE_PATH)).ok()
+        } else {
+            current_script
+        };
+        let Some(fallback_script) = fallback_script else {
+            return Ok(false);
+        };
+        if !is_managed_winpe_ipxe_script(&fallback_script) {
+            return Ok(false);
+        }
+
+        fs::create_dir_all(root.join("boot"))?;
+        fs::write(root.join(WINDOWS_FALLBACK_IPXE_PATH), &fallback_script)?;
+        let dispatcher = format!(
+            "{DYNAMIC_BOOT_SCRIPT_HEADER}chain {normalized_endpoint}/api/v1/install/boot.ipxe?mac=${{net0/mac}}&arch=${{buildarch}}&platform=${{platform}} || goto windows\nexit\n:windows\nchain tftp://${{next-server}}/{WINDOWS_FALLBACK_IPXE_PATH} || shell\n"
+        );
+        fs::write(root.join("boot.ipxe"), dispatcher)?;
+        fs::write(root.join(DYNAMIC_BOOT_LAYOUT_MARKER), b"1\n")?;
         Ok(true)
     }
 

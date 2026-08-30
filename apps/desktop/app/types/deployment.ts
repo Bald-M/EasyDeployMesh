@@ -1,4 +1,4 @@
-export type ImageFormat = 'gho' | 'wim' | 'esd' | 'swm'
+export type ImageFormat = 'gho' | 'wim' | 'esd' | 'swm' | 'iso'
 
 export interface ImageArtifact {
   id: string
@@ -10,7 +10,28 @@ export interface ImageArtifact {
   spans: string[]
   verified: boolean
   ghoCapability?: GhoImageCapability | null
+  installerCapability?: InstallerCapability | null
   createdAt: string
+}
+
+export interface InstallerBootAsset {
+  path: string
+  sizeBytes: number
+  sha256: string
+}
+
+export interface InstallerCapability {
+  deployable: boolean
+  distribution: 'ubuntu'
+  release: string
+  architecture: Architecture
+  profile: 'ubuntu_autoinstall'
+  profileVersion: number
+  kernel: InstallerBootAsset
+  initrd: InstallerBootAsset
+  minimumMemoryBytes: number
+  minimumDiskBytes: number
+  blockedReason: string | null
 }
 
 export interface GhoImageCapability {
@@ -33,7 +54,7 @@ export interface GhoPartitionCapability {
 }
 
 
-export type Operation = 'deploy_gho' | 'capture_gho' | 'deploy_wim'
+export type Operation = 'deploy_gho' | 'capture_gho' | 'deploy_wim' | 'install_linux'
 export type JobState =
   | 'draft'
   | 'waiting'
@@ -71,6 +92,13 @@ export interface PartitionPlan {
 export interface DeploymentOptions {
   imageIndex: number
   partitionPlan: PartitionPlan
+  linuxInstall?: LinuxInstallOptions | null
+}
+
+export interface LinuxInstallOptions {
+  hostname: string
+  username: string
+  sshAuthorizedKeys: string[]
 }
 
 export interface DeploymentJob {
@@ -101,11 +129,15 @@ export interface CreateDeploymentJob {
 
 export type DeploymentStage =
   | 'preflight'
+  | 'booting_installer'
+  | 'validating_target'
   | 'partitioning'
   | 'downloading_image'
   | 'applying_image'
+  | 'installing_system'
   | 'configuring_boot'
   | 'finalizing'
+  | 'awaiting_first_boot'
   | 'rebooting'
 
 export type Architecture = 'x86_64' | 'aarch64' | 'unknown'

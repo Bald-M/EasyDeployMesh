@@ -5,7 +5,7 @@
 
   <p>
     在局域网内发现计算机，并通过一个桌面应用<br>
-    安全、可重复地编排 Windows 镜像部署。
+    安全编排 Windows 镜像部署与受控的 Ubuntu Server ISO 安装。
   </p>
 
   <p>
@@ -45,9 +45,10 @@
 
 ## 为什么选择 EasyDeployMesh？
 
-EasyDeployMesh 将设备发现、PXE 启动、镜像验证、部署任务和 WinPE 执行整合到一个
-本地优先的工作流中。桌面端主机负责保存权威状态并批准任务；运行在目标机器上的轻量级
-Rust Agent 负责实际部署。
+EasyDeployMesh 将设备发现、PXE 启动、镜像验证、部署任务、WinPE 执行和受限的
+Ubuntu 安装器流程整合到一个本地优先的工作流中。桌面端主机负责保存权威状态并批准
+任务；Windows 部署由 Rust Agent 执行，Linux ISO 任务则通过目标侧磁盘门禁调用
+Ubuntu 原生安装器。
 
 项目采用失败关闭原则。镜像必须先复制到受管存储并完成验证；任务通过经过认证且具有
 有效期的租约下发；在分区操作开始前，还会再次核对目标磁盘指纹。
@@ -62,6 +63,8 @@ Rust Agent 负责实际部署。
   受管 `boot.wim` 中自动注入 Agent。
 - 持久化 WIM、ESD 和 SWM 镜像目录，并进行 SHA-256 校验。
 - 在 WinPE 中使用 DiskPart、DISM 和 BCDBoot 执行无人值守 WIM/ESD 部署。
+- 按 ISO 内容验证 Ubuntu Server 24.04 LTS live-server 媒体，并对 amd64/UEFI
+  目标执行 DHCP、整盘 GPT/ext4、仅 SSH 公钥登录的无人值守安装。
 - 具有暂停、重试、取消、进度、活动历史和持久化存储的受控部署状态机。
 - 提供机器可读的 WinPE 诊断，并进行令牌脱敏和完整性检查。
 
@@ -113,8 +116,16 @@ EasyDeployMesh Agent 无法注册或下载部署镜像。更换 VMware 网卡型
 | WIM | 是 | 是 | 导入时验证，部署前再次验证 |
 | ESD | 是 | 是 | 使用 WIM 部署操作和指定的镜像索引 |
 | SWM | 是 | 否 | 当前 Agent 仅支持编目 |
+| Ubuntu Server 24.04 LTS live-server ISO（amd64） | 是 | 预览 | 按内容检查，并在受控 UEFI autoinstall 前重新验证 kernel、initrd 与 ISO |
 | GHO | 否 | 否 | 不支持；请在导入前将镜像转换为 WIM 或 ESD |
 | GHS | 否 | 否 | 不支持 Ghost 分卷格式 |
+
+Linux ISO 首版有意收紧为：amd64 UEFI、关闭 Secure Boot、DHCP、一个具有唯一非空
+序列号的目标盘、整盘 GPT/direct ext4，以及一个仅允许 SSH 公钥登录的管理员用户。
+Ubuntu Desktop 或重制 ISO、Legacy BIOS、ARM、静态网络、RAID、LVM、ZFS、LUKS、
+保留现有分区、密码登录、原始 autoinstall YAML 和任意命令都会被拒绝。在将这一路径
+用于实际机器前，必须先用完全相同的 ISO 和硬件组合在可销毁的 QEMU/OVMF 或物理机
+上完成端到端验证。
 
 ### 为什么不支持 GHO
 
@@ -139,6 +150,13 @@ EasyDeployMesh。切勿在开发工作站或包含重要数据的磁盘上测试
 3. 导入 WinPE 媒体并启动 PXE，或者在目标机上手动运行 Agent。
 4. 确认目标机在 **Devices** 页面显示为在线。
 5. 导入受支持的镜像，准确选择目标磁盘，然后创建部署任务。
+
+部署 Linux ISO 时，应先让目标机完成注册，以便主机持有最近一次权威硬件清单。导入
+标准的受管 WinPE 网络启动包（原生 ISO PE 回退无法承载动态分流），启动控制服务和
+PXE，再导入 Ubuntu Server ISO；随后在 **Devices** 页面选择已验证 ISO、目标磁盘、
+Linux 用户名和 SSH 公钥。每台选中设备仍会创建一个独立任务。目标机下一次以 UEFI
+PXE 启动时，安装器会计算实际下载 ISO 的哈希并上报 Linux 侧磁盘清单；只有所选磁盘的
+序列号、型号和容量精确且唯一匹配后，服务端才会下发具有破坏性的存储配置。
 
 手动运行 Agent 诊断：
 

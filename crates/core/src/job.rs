@@ -1,6 +1,7 @@
 use crate::{BootMode, Disk, Operation};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -460,6 +461,8 @@ pub enum PartitionPlanError {
 pub struct DeploymentOptions {
     pub image_index: u32,
     pub partition_plan: PartitionPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_install: Option<LinuxInstallOptions>,
 }
 
 impl Default for DeploymentOptions {
@@ -467,8 +470,110 @@ impl Default for DeploymentOptions {
         Self {
             image_index: 1,
             partition_plan: PartitionPlan::legacy_bios_mbr(),
+            linux_install: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinuxInstallOptions {
+    pub hostname: String,
+    pub username: String,
+    #[serde(default)]
+    pub ssh_authorized_keys: Vec<String>,
+}
+
+impl LinuxInstallOptions {
+    pub fn validate(&self) -> Result<(), LinuxInstallOptionsError> {
+        if !valid_linux_hostname(&self.hostname) {
+            return Err(LinuxInstallOptionsError::InvalidHostname);
+        }
+        if !valid_linux_username(&self.username) {
+            return Err(LinuxInstallOptionsError::InvalidUsername);
+        }
+        if self.ssh_authorized_keys.is_empty() || self.ssh_authorized_keys.len() > 16 {
+            return Err(LinuxInstallOptionsError::InvalidSshKeyCount);
+        }
+        let mut distinct_keys = HashSet::with_capacity(self.ssh_authorized_keys.len());
+        for (index, key) in self.ssh_authorized_keys.iter().enumerate() {
+            if !valid_ssh_public_key(key) {
+                return Err(LinuxInstallOptionsError::InvalidSshKey { index });
+            }
+            if !distinct_keys.insert(key) {
+                return Err(LinuxInstallOptionsError::DuplicateSshKey { index });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum LinuxInstallOptionsError {
+    #[error("Linux hostname must be a lowercase RFC 1123 label between 1 and 63 bytes")]
+    InvalidHostname,
+    #[error("Linux username must be a non-root lowercase account name between 1 and 32 bytes")]
+    InvalidUsername,
+    #[error("Linux installation requires between 1 and 16 SSH public keys")]
+    InvalidSshKeyCount,
+    #[error("SSH public key at index {index} is invalid or unsupported")]
+    InvalidSshKey { index: usize },
+    #[error("SSH public key at index {index} is duplicated")]
+    DuplicateSshKey { index: usize },
+}
+
+fn valid_linux_hostname(hostname: &str) -> bool {
+    let bytes = hostname.as_bytes();
+    (1..=63).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+fn valid_linux_username(username: &str) -> bool {
+    let bytes = username.as_bytes();
+    (1..=32).contains(&bytes.len())
+        && username != "root"
+        && bytes.first().is_some_and(u8::is_ascii_lowercase)
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(*byte, b'_' | b'-')
+        })
+}
+
+fn valid_ssh_public_key(key: &str) -> bool {
+    if key.is_empty()
+        || key.len() > 16 * 1024
+        || !key.is_ascii()
+        || key
+            .bytes()
+            .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
+    {
+        return false;
+    }
+    let mut fields = key.split_ascii_whitespace();
+    let Some(algorithm) = fields.next() else {
+        return false;
+    };
+    let Some(encoded) = fields.next() else {
+        return false;
+    };
+    let supported_algorithm = matches!(
+        algorithm,
+        "ssh-ed25519"
+            | "ssh-rsa"
+            | "ecdsa-sha2-nistp256"
+            | "ecdsa-sha2-nistp384"
+            | "ecdsa-sha2-nistp521"
+            | "sk-ssh-ed25519@openssh.com"
+            | "sk-ecdsa-sha2-nistp256@openssh.com"
+    );
+    supported_algorithm
+        && encoded.len() >= 16
+        && encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,12 +616,92 @@ pub struct CreateDeploymentJob {
 #[serde(rename_all = "snake_case")]
 pub enum DeploymentStage {
     Preflight,
+    BootingInstaller,
+    ValidatingTarget,
     Partitioning,
     DownloadingImage,
     ApplyingImage,
+    InstallingSystem,
     ConfiguringBoot,
     Finalizing,
+    AwaitingFirstBoot,
     Rebooting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinuxInstallerObservedDisk {
+    pub path: String,
+    pub model: String,
+    pub serial: Option<String>,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinuxInstallerGuardRequest {
+    pub image_sha256: String,
+    pub disks: Vec<LinuxInstallerObservedDisk>,
+}
+
+impl LinuxInstallerGuardRequest {
+    pub fn validate(&self) -> Result<(), LinuxInstallerGuardError> {
+        if self.image_sha256.len() != 64
+            || !self
+                .image_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(LinuxInstallerGuardError::InvalidImageChecksum);
+        }
+        if self.disks.is_empty() || self.disks.len() > 128 {
+            return Err(LinuxInstallerGuardError::InvalidDiskCount);
+        }
+        let mut paths = HashSet::with_capacity(self.disks.len());
+        for (index, disk) in self.disks.iter().enumerate() {
+            if !valid_observed_disk(disk) {
+                return Err(LinuxInstallerGuardError::InvalidDisk { index });
+            }
+            if !paths.insert(disk.path.as_str()) {
+                return Err(LinuxInstallerGuardError::DuplicateDiskPath { index });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum LinuxInstallerGuardError {
+    #[error("installer ISO SHA-256 must contain exactly 64 hexadecimal characters")]
+    InvalidImageChecksum,
+    #[error("installer inventory must contain between 1 and 128 disks")]
+    InvalidDiskCount,
+    #[error("installer disk at index {index} has invalid or unbounded metadata")]
+    InvalidDisk { index: usize },
+    #[error("installer disk at index {index} repeats an earlier device path")]
+    DuplicateDiskPath { index: usize },
+}
+
+fn valid_observed_disk(disk: &LinuxInstallerObservedDisk) -> bool {
+    let valid_text = |value: &str, max: usize| {
+        !value.trim().is_empty() && value.len() <= max && !value.contains(['\r', '\n', '\0'])
+    };
+    let device_basename = disk.path.strip_prefix("/dev/");
+    let valid_device_path = device_basename.is_some_and(|basename| {
+        (1..=128).contains(&basename.len())
+            && !matches!(basename, "." | "..")
+            && basename
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    });
+    valid_device_path
+        && valid_text(&disk.path, 256)
+        && valid_text(&disk.model, 256)
+        && disk
+            .serial
+            .as_deref()
+            .is_none_or(|serial| valid_text(serial, 256))
+        && disk.size_bytes > 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -744,6 +929,88 @@ mod tests {
                 30 * 1024 * MIB_BYTES,
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn old_deployment_options_deserialize_without_linux_fields() {
+        let json = serde_json::json!({
+            "imageIndex": 2,
+            "partitionPlan": PartitionPlan::uefi_gpt()
+        });
+
+        let options: DeploymentOptions =
+            serde_json::from_value(json).expect("legacy options should remain readable");
+
+        assert_eq!(options.image_index, 2);
+        assert_eq!(options.linux_install, None);
+    }
+
+    #[test]
+    fn linux_install_options_require_safe_identity_and_ssh_keys() {
+        let valid = LinuxInstallOptions {
+            hostname: "worker-01".to_owned(),
+            username: "deployer".to_owned(),
+            ssh_authorized_keys: vec![
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEasyDeployMeshFixture deployer@example"
+                    .to_owned(),
+            ],
+        };
+        assert_eq!(valid.validate(), Ok(()));
+
+        let mut invalid = valid.clone();
+        invalid.hostname = "Worker_01".to_owned();
+        assert_eq!(
+            invalid.validate(),
+            Err(LinuxInstallOptionsError::InvalidHostname)
+        );
+
+        let mut invalid = valid.clone();
+        invalid.username = "root".to_owned();
+        assert_eq!(
+            invalid.validate(),
+            Err(LinuxInstallOptionsError::InvalidUsername)
+        );
+
+        let mut invalid = valid;
+        invalid.ssh_authorized_keys = vec!["not-a-public-key".to_owned()];
+        assert_eq!(
+            invalid.validate(),
+            Err(LinuxInstallOptionsError::InvalidSshKey { index: 0 })
+        );
+    }
+
+    #[test]
+    fn installer_guard_request_bounds_untrusted_inventory() {
+        let request = LinuxInstallerGuardRequest {
+            image_sha256: "ab".repeat(32),
+            disks: vec![LinuxInstallerObservedDisk {
+                path: "/dev/nvme0n1".to_owned(),
+                model: "Test NVMe".to_owned(),
+                serial: Some("SERIAL-01".to_owned()),
+                size_bytes: 64 * 1024 * 1024 * 1024,
+            }],
+        };
+        assert_eq!(request.validate(), Ok(()));
+
+        let mut duplicated = request;
+        duplicated.disks.push(duplicated.disks[0].clone());
+        assert_eq!(
+            duplicated.validate(),
+            Err(LinuxInstallerGuardError::DuplicateDiskPath { index: 1 })
+        );
+
+        duplicated.disks.truncate(1);
+        duplicated.disks[0].path = "/dev/../../sda".to_owned();
+        assert_eq!(
+            duplicated.validate(),
+            Err(LinuxInstallerGuardError::InvalidDisk { index: 0 })
+        );
+
+        duplicated.disks[0].path = "/dev/disk/by-id/example".to_owned();
+        assert_eq!(
+            duplicated.validate(),
+            Err(LinuxInstallerGuardError::InvalidDisk { index: 0 })
         );
     }
 }
