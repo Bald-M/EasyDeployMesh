@@ -422,7 +422,7 @@
       "jobQueued": "Deployment job is waiting for a device",
       "jobStarted": "A device started the deployment job",
       "jobImageValidating": "Revalidating the deployment image; the device starts once it passes (large images can take a few minutes)",
-      "jobImageValidationFailed": "Deployment image revalidation failed; the job will not be sent to the device",
+      "jobImageValidationFailed": "Deployment image revalidation failed; the job stays waiting and is revalidated again in about 2 minutes",
       "jobStageChanged": "Deployment job entered the {stage} stage",
       "jobPaused": "Deployment job paused",
       "jobResumed": "Deployment job resumed",

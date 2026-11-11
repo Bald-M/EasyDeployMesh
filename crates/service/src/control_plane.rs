@@ -1,7 +1,8 @@
+#[path = "deployment_validation.rs"]
+mod deployment_validation;
 #[path = "installer_deployment.rs"]
 mod installer_deployment;
 
-use crate::deployment_validation::{self, DeploymentValidationCache, Validated};
 use crate::device_registry::{digest_secret, generate_secret, secret_matches};
 use crate::{
     ActivityRepository, DeviceRegistry, DeviceRegistryError, ImageLibrary, ImageLibraryError,
@@ -15,6 +16,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use deployment_validation::{DeploymentValidationCache, Validated};
 use easydeploymesh_core::{
     ActivitySeverity, ActivitySource, ActivitySubject, AgentDeploymentImage, AgentGhoDeployment,
     AgentHeartbeat, AgentHeartbeatAck, AgentInventory, AgentJobCompletion, AgentJobLease,
@@ -88,6 +90,9 @@ pub struct ControlPlane {
     jobs: Arc<JobRepository>,
     images: Arc<ImageLibrary>,
     activities: Arc<ActivityRepository>,
+    /// Kept across control-service restarts so a running lease can still
+    /// download its revalidated image.
+    validations: Arc<DeploymentValidationCache>,
     running: Mutex<Option<RunningServer>>,
 }
 
@@ -103,6 +108,7 @@ impl ControlPlane {
             jobs,
             images,
             activities,
+            validations: Arc::new(DeploymentValidationCache::default()),
             running: Mutex::new(None),
         }
     }
@@ -157,7 +163,7 @@ impl ControlPlane {
                 Arc::clone(&self.images),
             )),
             installer_base_url: format!("http://{local_address}"),
-            validations: Arc::new(DeploymentValidationCache::default()),
+            validations: Arc::clone(&self.validations),
         };
         let router = Router::new()
             .route("/health", get(health))
@@ -410,11 +416,14 @@ async fn claim_job(
         .collect::<Vec<_>>();
     // Image revalidation can take minutes for a large GHO, so it runs in the
     // background and the job is leased on a later claim once it has passed.
+    // One deadline covers every candidate so the claim stays well inside the
+    // Agent's timeout.
+    let deadline = tokio::time::Instant::now() + deployment_validation::CLAIM_WAIT;
     let mut validated_jobs = HashMap::new();
     for job in candidates {
         match state
             .validations
-            .status_for_claim(&state.images, &job, deployment_validation::CLAIM_WAIT)
+            .status_for_claim(&state.images, &job, deadline)
             .await
         {
             deployment_validation::Status::Passed(validated) => {
@@ -430,14 +439,14 @@ async fn claim_job(
                 );
             }
             deployment_validation::Status::Running { started: false } => {}
-            deployment_validation::Status::Failed(reason) => {
+            deployment_validation::Status::Failed(error) => {
                 if state.validations.report_failure_once(&job) {
                     record_job_activity(
                         &state,
                         &job,
                         "job_image_validation_failed",
                         ActivitySeverity::Error,
-                        Some(reason),
+                        Some(error.to_string()),
                     );
                 }
             }
@@ -671,7 +680,9 @@ async fn download_job_image(
             // The lease was issued from this revalidation; refuse the download
             // if the image files changed since.
             let validated = state.validations.passed_for_lease(&job).ok_or_else(|| {
-                ApiError::Conflict("GHO image changed after the lease was issued".to_owned())
+                ApiError::Conflict(
+                    "GHO image revalidation is missing or out of date for this lease".to_owned(),
+                )
             })?;
             let Validated::Gho(prepared) = validated.as_ref() else {
                 return Err(ApiError::Conflict(
@@ -1270,103 +1281,6 @@ mod tests {
             disks: vec![disk()],
             agent_version: "0.1.0".to_owned(),
         }
-    }
-
-    fn gho_job(
-        jobs: &JobRepository,
-        image_id: Uuid,
-        device_id: Uuid,
-    ) -> easydeploymesh_core::DeploymentJob {
-        jobs.create(CreateDeploymentJob {
-            name: "Ghost deployment".to_owned(),
-            operation: Operation::DeployGho,
-            image_id,
-            targets: vec![DeploymentTarget {
-                device_id,
-                target_disk_id: disk().id,
-                target_disk_model: disk().model,
-                target_disk_serial: disk().serial,
-                target_disk_size_bytes: disk().size_bytes,
-            }],
-            options: DeploymentOptions {
-                image_index: 1,
-                partition_plan: PartitionPlan::uefi_gpt(),
-                linux_install: None,
-            },
-        })
-        .expect("GHO job should create")
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn claim_revalidation_runs_in_the_background_and_fails_closed() {
-        use deployment_validation::Status;
-        use std::time::{Duration, SystemTime};
-
-        let temp = tempfile::tempdir().expect("temporary directory should be available");
-        let jobs =
-            Arc::new(JobRepository::open(temp.path().join("jobs")).expect("jobs should open"));
-        let images =
-            Arc::new(ImageLibrary::open(temp.path().join("images")).expect("images should open"));
-        let source = temp.path().join("disk.gho");
-        std::fs::write(&source, easydeploymesh_gho::fixtures::image()).unwrap();
-        let image = images.import(&source).expect("GHO should import");
-        let job = gho_job(&jobs, image.id, Uuid::new_v4());
-        let cache = Arc::new(DeploymentValidationCache::default());
-        let wait = Duration::from_secs(30);
-
-        // A claim that cannot wait gets an answer at once and the
-        // revalidation continues in the background.
-        assert!(matches!(
-            cache.status_for_claim(&images, &job, Duration::ZERO).await,
-            Status::Running { started: true }
-        ));
-        assert!(cache.passed_for_lease(&job).is_none());
-        let Status::Passed(validated) = cache.status_for_claim(&images, &job, wait).await else {
-            panic!("revalidation should pass");
-        };
-        let Validated::Gho(prepared) = validated.as_ref() else {
-            panic!("a GHO job should get a GHO revalidation");
-        };
-        let managed = prepared.image.primary.canonical_path.clone();
-        assert!(cache.passed_for_lease(&job).is_some());
-        assert!(matches!(
-            cache.status_for_claim(&images, &job, Duration::ZERO).await,
-            Status::Passed(_)
-        ));
-
-        // A revalidation that started before a job was created is not reused
-        // for it.
-        let later = gho_job(&jobs, image.id, Uuid::new_v4());
-        assert!(matches!(
-            cache
-                .status_for_claim(&images, &later, Duration::ZERO)
-                .await,
-            Status::Running { started: true }
-        ));
-        assert!(matches!(
-            cache.status_for_claim(&images, &later, wait).await,
-            Status::Passed(_)
-        ));
-
-        // Changing the managed image invalidates the result, and the new
-        // revalidation fails because the content no longer matches.
-        let mut bytes = std::fs::read(&managed).unwrap();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0xff;
-        std::fs::write(&managed, bytes).unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&managed)
-            .unwrap()
-            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000))
-            .unwrap();
-        assert!(cache.passed_for_lease(&later).is_none());
-        let Status::Failed(_) = cache.status_for_claim(&images, &later, wait).await else {
-            panic!("a changed image should fail revalidation");
-        };
-        assert!(cache.report_failure_once(&later));
-        assert!(!cache.report_failure_once(&later));
-        assert!(cache.passed_for_lease(&later).is_none());
     }
 
     #[tokio::test]

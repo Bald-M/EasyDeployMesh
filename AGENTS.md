@@ -61,6 +61,9 @@ The following behavior is intentional and must not be bypassed:
   progress, control, completion, and image download.
 - Image format and operation must agree.
 - WIM/ESD and native GHO images are revalidated at job creation and job claim.
+  Claim-time revalidation runs in the background; a lease is issued only from
+  a passed revalidation that started after the job was created, finished less
+  than 30 minutes ago, and whose files kept their size and modification time.
 - Downloaded bytes are hashed again before application.
 - GHO restore requires the expected parser version, expanded size, expanded
   SHA-256, and a volume size that fits the real target partition; the target

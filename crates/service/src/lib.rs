@@ -7,7 +7,6 @@ use serde::Serialize;
 mod activity_repository;
 mod atomic_file;
 mod control_plane;
-mod deployment_validation;
 mod device_registry;
 mod image_library;
 mod job_repository;
