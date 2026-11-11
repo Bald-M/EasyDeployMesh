@@ -493,6 +493,11 @@ async fn claim_job(
                 expanded_sha256: prepared.capability.expanded_sha256.ok_or_else(|| {
                     ApiError::Conflict("GHO expanded checksum is missing".to_owned())
                 })?,
+                volume_size_bytes: prepared
+                    .capability
+                    .volume_size_bytes
+                    .filter(|size| *size > 0)
+                    .ok_or_else(|| ApiError::Conflict("GHO volume size is missing".to_owned()))?,
                 parser_version: prepared.capability.parser_version,
             };
         (
@@ -1731,28 +1736,8 @@ mod tests {
         control_plane.stop().await.unwrap();
     }
 
-    fn gho_fixture(partitions: &[&[u8]]) -> Vec<u8> {
-        let mut contents = vec![0_u8; 512];
-        contents[0..8].copy_from_slice(&[0xfe, 0xef, 1, 0, 1, 2, 3, 4]);
-        for partition in partitions {
-            contents.extend_from_slice(&0x0603_u32.to_le_bytes());
-            contents.extend_from_slice(&0x012f_18d8_u32.to_le_bytes());
-            contents.extend_from_slice(&20_u16.to_le_bytes());
-            contents.extend_from_slice(&[0; 20]);
-            let mut header = vec![0_u8; 512];
-            header[0..2].copy_from_slice(&0xeffe_u16.to_le_bytes());
-            contents.extend(header);
-            contents.extend_from_slice(&(partition.len() as u16 + 2).to_le_bytes());
-            contents.extend_from_slice(partition);
-        }
-        contents.extend_from_slice(&0x0023_u32.to_le_bytes());
-        contents.extend_from_slice(&0x012f_18d8_u32.to_le_bytes());
-        contents.extend_from_slice(&0_u16.to_le_bytes());
-        contents
-    }
-
     #[tokio::test]
-    async fn gho_lease_and_download_bind_the_selected_partition_and_normalized_spans() {
+    async fn gho_lease_and_download_bind_the_volume_and_normalized_spans() {
         use sha2::{Digest, Sha256};
 
         let temp = tempfile::tempdir().expect("temporary directory should be available");
@@ -1783,12 +1768,12 @@ mod tests {
             .await
             .unwrap();
 
-        let normalized = gho_fixture(&[b"\xebR\x90NTFS    reserved", b"\xebR\x90NTFS    windows"]);
+        let normalized = easydeploymesh_gho::fixtures::image();
         let split_at = 700;
         let primary = temp.path().join("disk.gho");
         std::fs::write(&primary, &normalized[..split_at]).unwrap();
         let mut span = vec![0_u8; 512];
-        span[0..8].copy_from_slice(&[0xfe, 0xef, 9, 0, 1, 2, 3, 4]);
+        span[0..8].copy_from_slice(&[0xfe, 0xef, 9, normalized[3], 1, 2, 3, 4]);
         span.extend_from_slice(&normalized[split_at..]);
         std::fs::write(temp.path().join("disk001.ghs"), span).unwrap();
         let image = images.import(&primary).expect("spanned GHO should import");
@@ -1805,7 +1790,7 @@ mod tests {
                     target_disk_size_bytes: disk().size_bytes,
                 }],
                 options: DeploymentOptions {
-                    image_index: 2,
+                    image_index: 1,
                     partition_plan: PartitionPlan::uefi_gpt(),
                     linux_install: None,
                 },
@@ -1827,7 +1812,13 @@ mod tests {
             .await
             .unwrap()
             .expect("GHO job should lease");
-        assert_eq!(lease.gho.as_ref().unwrap().source_partition, 2);
+        let gho = lease.gho.as_ref().unwrap();
+        assert_eq!(gho.source_partition, 1);
+        assert_eq!(
+            gho.volume_size_bytes,
+            easydeploymesh_gho::fixtures::VOLUME_BYTES
+        );
+        assert_eq!(gho.parser_version, easydeploymesh_gho::PARSER_VERSION);
         assert_eq!(lease.image.size_bytes, normalized.len() as u64);
         assert_eq!(
             lease.image.sha256,

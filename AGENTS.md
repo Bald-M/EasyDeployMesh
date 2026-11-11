@@ -62,8 +62,10 @@ The following behavior is intentional and must not be bypassed:
 - Image format and operation must agree.
 - WIM/ESD and native GHO images are revalidated at job creation and job claim.
 - Downloaded bytes are hashed again before application.
-- GHO restore requires the expected parser version, expanded size, and expanded
-  SHA-256; the target volume is locked and dismounted.
+- GHO restore requires the expected parser version, expanded size, expanded
+  SHA-256, and a volume size that fits the real target partition; the target
+  volume is locked and dismounted. Unverified Ghost variants (compression modes,
+  file systems, omitted attributes) must be rejected, not guessed at.
 - Image paths must remain canonical files below the managed object store. Do not
   permit symlink escapes or arbitrary download paths.
 - The target physical-drive ID, model, size, and optional serial are checked by
