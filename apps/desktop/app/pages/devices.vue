@@ -148,7 +148,7 @@ const selectedImageIndexIsValid = computed(() => {
 const ghoPartitionItems = computed(() => selectedGhoPartitions.value.map(partition => ({
   label: t('devices.ghoPartitionOption', {
     index: partition.sourcePartition,
-    size: formatBytes(partition.expandedSizeBytes, locale.value)
+    size: formatBytes(partition.volumeSizeBytes || partition.expandedSizeBytes, locale.value)
   }),
   value: partition.sourcePartition
 })))

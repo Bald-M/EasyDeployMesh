@@ -768,6 +768,9 @@ pub struct AgentGhoDeployment {
     pub source_partition: u32,
     pub expanded_size_bytes: u64,
     pub expanded_sha256: String,
+    /// Minimum target partition size; leases without it are rejected.
+    #[serde(default)]
+    pub volume_size_bytes: u64,
     pub parser_version: u32,
 }
 

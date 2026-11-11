@@ -16,12 +16,11 @@ machine—normally in Windows PE—and performs the destructive disk operations.
 The project currently supports:
 
 - WIM and ESD deployment through Windows DISM.
-- A deliberately narrow native GHO restore profile: Ghost 11.x–12.x,
-  password-free images containing one or more identifiable NTFS partition
-  streams, using Z0, Z1, or Z3–Z9 compression. Single-file images and validated
-  ordered GHS span sets are supported. The operator selects the source partition
-  explicitly when a disk image contains multiple NTFS streams; the original
-  disk layout is not restored.
+- A deliberately narrow native GHO restore profile: Ghost 11.x password-free
+  single-partition NTFS images with zlib compression (`-z2`–`-z9`), as a single
+  file or a validated ordered GHS span set. The NTFS volume is rebuilt from
+  Ghost's file-level stream at its original cluster layout. See
+  `docs/gho-format.md`.
 - GHO, GHS, WIM, ESD, and SWM cataloging. SWM remains catalog-only.
 - UEFI/GPT and legacy BIOS/MBR partition plans.
 - Standalone DHCP or ProxyDHCP PXE boot with TFTP.
@@ -79,10 +78,14 @@ persistence compatibility change.
 
 ### `crates/gho`
 
-The GHO module is a bounds-checked, streaming decoder. Its small interface is
-`inspect`, `verify`, and `decode_partition`; format parsing, compression, limits,
-and corruption checks remain behind that seam. It does not invoke or ship Ghost,
-Symantec, or Broadcom software.
+The GHO module is a bounds-checked, streaming reader and NTFS restorer. Its
+small interface is `inspect`, `verify`, `analyze_partition` (dry run plus a
+logical-stream sink), and `restore_partition` (writes a `Write + Seek` volume).
+Container parsing, zlib packets, the Ghost NTFS stream grammar, FILE record and
+mapping-pair parsing, overlap and bounds checks, `$MFTMirr` and backup boot
+sector regeneration all remain behind that seam. The format is documented in
+`docs/gho-format.md`. It does not invoke or ship Ghost, Symantec, or Broadcom
+software, and decompiled Ghost code must never enter the repository.
 
 `PARSER_VERSION` identifies the interpretation of verified metadata. If a parser
 change can alter accepted bytes or expanded output, bump this version so cached
@@ -194,11 +197,14 @@ staged directory into `library/objects/<uuid>`.
    is not leased again and never reaches the Agent.
 7. The Agent hashes the downloaded bytes before applying them.
 
-For native GHO, import and preflight also decode the supported partition stream
-to obtain an expanded byte count and SHA-256 for every restorable NTFS stream.
-Job creation binds an explicit source partition, and the Agent checks parser
-version, expanded byte count, and expanded SHA-256 while writing the locked
-volume. The expanded partition must fit the planned Windows volume.
+For native GHO, import and preflight run a full dry-run restore. It records
+the logical stream's byte count and SHA-256 and the minimum volume size (NTFS
+sectors plus the backup boot sector). Job creation binds the source partition.
+The restored volume size must fit the planned Windows volume. The Agent
+checks the parser version and the real partition length before writing. It
+locks, dismounts, and enables extended DASD I/O on `W:`. It recomputes the
+stream size and SHA-256 while writing, then runs `extend filesystem` if the
+partition is larger than the source volume.
 
 An ISO is never treated as a raw disk image. ISO import uses bounded filesystem
 inspection and accepts only the implemented Ubuntu Server live-server profile.

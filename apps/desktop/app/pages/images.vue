@@ -366,6 +366,10 @@ async function handleRemove(image: ImageArtifact) {
             <dl class="grid gap-3 text-xs md:grid-cols-2">
               <div><dt class="font-medium text-muted">{{ $t('common.status') }}</dt><dd class="mt-1">{{ readinessImage.ghoCapability.deployable ? $t('images.manualDeployment') : ghoBlockedReason(readinessImage.ghoCapability.blockedReason) }}</dd></div>
               <div v-if="readinessImage.ghoCapability.compression"><dt class="font-medium text-muted">{{ $t('images.ghoReadiness.compression') }}</dt><dd class="mt-1">{{ readinessImage.ghoCapability.compression.toUpperCase() }}</dd></div>
+              <div v-if="readinessImage.ghoCapability.volumeSizeBytes">
+                <dt class="font-medium text-muted">{{ $t('images.ghoReadiness.volumeSize') }}</dt>
+                <dd class="mt-1">{{ formatBytes(readinessImage.ghoCapability.volumeSizeBytes, locale) }}</dd>
+              </div>
               <div v-if="readinessImage.ghoCapability.expandedSizeBytes">
                 <dt class="font-medium text-muted">{{ $t('images.ghoReadiness.expandedSize') }}</dt>
                 <dd class="mt-1">{{ formatBytes(readinessImage.ghoCapability.expandedSizeBytes, locale) }}</dd>
@@ -376,7 +380,7 @@ async function handleRemove(image: ImageArtifact) {
               </div>
               <div v-for="partition in readinessImage.ghoCapability.partitions" :key="partition.sourcePartition">
                 <dt class="font-medium text-muted">{{ $t('images.ghoReadiness.partition', { index: partition.sourcePartition }) }}</dt>
-                <dd class="mt-1">NTFS · {{ formatBytes(partition.expandedSizeBytes, locale) }}</dd>
+                <dd class="mt-1">NTFS · {{ formatBytes(partition.volumeSizeBytes || partition.expandedSizeBytes, locale) }}</dd>
               </div>
             </dl>
           </div>

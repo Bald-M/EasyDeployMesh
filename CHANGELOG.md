@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Restored native GHO deployment as a preview. `crates/gho` now parses Ghost's
+  real file-level NTFS stream and rebuilds the volume at its original cluster
+  layout. It regenerates `$MFTMirr` and the backup boot sector and patches
+  hidden sectors. The Agent then extends the file system to fill the target
+  partition. Only zlib-compressed Ghost 11.x single-partition NTFS images are
+  accepted. Capabilities now record the minimum target volume size, and parser
+  version 4 forces earlier GHO verifications to be repeated.
+
 - Added a preview, content-verified Ubuntu Server 24.04 LTS live-server ISO
   workflow for amd64 UEFI targets. Batch selection still creates independent
   single-device jobs; the implemented profile is DHCP, whole-disk GPT/direct

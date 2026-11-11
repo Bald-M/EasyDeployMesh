@@ -591,7 +591,7 @@ impl DeploymentMutationCoordinator {
                 .map(|_| None),
             Operation::DeployGho => images
                 .prepare_gho_partition_deployment(image_id, image_index)
-                .map(|prepared| prepared.capability.expanded_size_bytes),
+                .map(|prepared| prepared.capability.volume_size_bytes),
             Operation::CaptureGho => Err(
                 easydeploymesh_service::ImageLibraryError::UnsupportedFormat(
                     "GHO capture is not supported".to_owned(),
