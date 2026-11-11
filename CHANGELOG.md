@@ -18,6 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   downloaded ISO and report a uniquely matching disk serial, model, and size
   before the control plane releases destructive autoinstall storage.
 
+### Fixed
+
+- A BIOS PXE ROM that answers the TFTP OACK with an error after a `tsize`
+  size probe is no longer reported as a failed boot-file transfer. Any other
+  client error now fails the transfer immediately instead of after four
+  retries, and rejected requests (missing file, access violation, write
+  request) are no longer recorded as successful sends.
+- TFTP replies are now sent from the PXE listener's address instead of an
+  address chosen by the routing table, so clients on multi-homed hosts accept
+  the OACK and data packets.
+
 ### Security
 
 - Linux installer attempts are bound to versioned media metadata and digested
