@@ -1249,6 +1249,186 @@ mod tests {
         assert!(package.path().join(DYNAMIC_BOOT_LAYOUT_MARKER).is_file());
     }
 
+    /// Resolves a TFTP path the way iPXE does after `chain`: the chained script's URI becomes
+    /// the base, so a relative reference is merged with the script's directory. Only covers
+    /// the absolute `tftp://${next-server}/` and plain relative forms the managed scripts use.
+    fn ipxe_tftp_path(base_path: &str, reference: &str) -> String {
+        if let Some(rest) = reference.strip_prefix("tftp://${next-server}/") {
+            return rest.to_owned();
+        }
+        match base_path.rsplit_once('/') {
+            Some((directory, _)) => format!("{directory}/{reference}"),
+            None => reference.to_owned(),
+        }
+    }
+
+    fn write_dispatcher_ready_package(root: &Path) {
+        std::fs::create_dir_all(root.join("boot")).unwrap();
+        std::fs::write(
+            root.join("boot/boot.wim"),
+            br"\Windows\System32\boot\winload.exe",
+        )
+        .unwrap();
+        for path in [
+            "boot/boot.sdi",
+            "boot/bootmgr",
+            "boot/wimboot",
+            "boot/easydeploymesh.bcd",
+            "boot/easydeploymesh-bootstrap.json",
+        ] {
+            std::fs::write(root.join(path), b"payload").unwrap();
+        }
+    }
+
+    fn assert_winpe_fallback_resolves_from_tftp_root(root: &Path) {
+        let dispatcher = std::fs::read_to_string(root.join("boot.ipxe")).unwrap();
+        let chain = dispatcher
+            .lines()
+            .find_map(|line| line.strip_prefix("chain tftp://"))
+            .expect("dispatcher must chain the WinPE fallback over TFTP");
+        let fallback_reference = format!("tftp://{}", chain.split_whitespace().next().unwrap());
+        let fallback_path = ipxe_tftp_path("boot.ipxe", &fallback_reference);
+        let fallback = std::fs::read_to_string(root.join(&fallback_path)).unwrap();
+        assert!(is_managed_winpe_ipxe_script(fallback.as_bytes()));
+        let references = fallback
+            .lines()
+            .filter(|line| line.starts_with("kernel ") || line.starts_with("initrd "))
+            .flat_map(str::split_whitespace)
+            .filter(|token| token.contains('/'))
+            .collect::<Vec<_>>();
+        assert!(references.contains(&"boot/wimboot"));
+        for reference in references {
+            let resolved = ipxe_tftp_path(&fallback_path, reference);
+            assert!(
+                root.join(&resolved).is_file(),
+                "iPXE resolves {reference} from {fallback_path} to missing {resolved}"
+            );
+        }
+    }
+
+    #[test]
+    fn winpe_fallback_relative_paths_resolve_to_existing_tftp_files() {
+        let package = tempfile::tempdir().unwrap();
+        write_dispatcher_ready_package(package.path());
+        std::fs::write(package.path().join("boot.ipxe"), MANAGED_IPXE_SCRIPT).unwrap();
+
+        assert!(
+            BootPackage::configure_control_dispatcher(package.path(), "http://192.0.2.10:7760")
+                .unwrap()
+        );
+
+        assert_winpe_fallback_resolves_from_tftp_root(package.path());
+        assert!(BootPackage::has_control_dispatcher(package.path()));
+    }
+
+    #[test]
+    fn legacy_boot_directory_fallback_is_moved_to_the_tftp_root() {
+        let package = tempfile::tempdir().unwrap();
+        write_dispatcher_ready_package(package.path());
+        write_legacy_dispatcher(package.path());
+
+        assert!(BootPackage::ensure_managed_network_boot(package.path()).unwrap());
+
+        assert_winpe_fallback_resolves_from_tftp_root(package.path());
+        assert!(BootPackage::has_control_dispatcher(package.path()));
+        assert!(
+            !package
+                .path()
+                .join(LEGACY_WINDOWS_FALLBACK_IPXE_PATH)
+                .exists()
+        );
+    }
+
+    fn write_legacy_dispatcher(root: &Path) {
+        std::fs::write(
+            root.join(LEGACY_WINDOWS_FALLBACK_IPXE_PATH),
+            MANAGED_IPXE_SCRIPT,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("boot.ipxe"),
+            format!(
+                "{DYNAMIC_BOOT_SCRIPT_HEADER}chain http://192.0.2.10:7760/api/v1/install/boot.ipxe?mac=${{net0/mac}}&arch=${{buildarch}}&platform=${{platform}} || goto windows\nexit\n:windows\nchain tftp://${{next-server}}/{LEGACY_WINDOWS_FALLBACK_IPXE_PATH} || shell\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join(DYNAMIC_BOOT_LAYOUT_MARKER), b"1\n").unwrap();
+    }
+
+    #[test]
+    fn configuring_the_dispatcher_moves_a_legacy_fallback_to_the_tftp_root() {
+        let package = tempfile::tempdir().unwrap();
+        write_dispatcher_ready_package(package.path());
+        write_legacy_dispatcher(package.path());
+
+        assert!(
+            BootPackage::configure_control_dispatcher(package.path(), "http://192.0.2.10:7760")
+                .unwrap()
+        );
+
+        assert_winpe_fallback_resolves_from_tftp_root(package.path());
+        assert!(
+            !package
+                .path()
+                .join(LEGACY_WINDOWS_FALLBACK_IPXE_PATH)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn legacy_migration_never_replaces_a_different_root_script() {
+        let package = tempfile::tempdir().unwrap();
+        write_dispatcher_ready_package(package.path());
+        write_legacy_dispatcher(package.path());
+        let dispatcher = std::fs::read(package.path().join("boot.ipxe")).unwrap();
+        std::fs::write(
+            package.path().join(WINDOWS_FALLBACK_IPXE_PATH),
+            b"#!ipxe\necho custom\n",
+        )
+        .unwrap();
+
+        assert!(!BootPackage::ensure_managed_network_boot(package.path()).unwrap());
+
+        assert_eq!(
+            std::fs::read(package.path().join(WINDOWS_FALLBACK_IPXE_PATH)).unwrap(),
+            b"#!ipxe\necho custom\n"
+        );
+        assert_eq!(
+            std::fs::read(package.path().join("boot.ipxe")).unwrap(),
+            dispatcher
+        );
+        assert!(
+            package
+                .path()
+                .join(LEGACY_WINDOWS_FALLBACK_IPXE_PATH)
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn legacy_fallback_that_is_not_a_managed_script_is_not_migrated() {
+        let package = tempfile::tempdir().unwrap();
+        write_dispatcher_ready_package(package.path());
+        std::fs::write(
+            package.path().join(LEGACY_WINDOWS_FALLBACK_IPXE_PATH),
+            b"#!ipxe\necho custom\n",
+        )
+        .unwrap();
+        let dispatcher = format!(
+            "{DYNAMIC_BOOT_SCRIPT_HEADER}chain tftp://${{next-server}}/{LEGACY_WINDOWS_FALLBACK_IPXE_PATH} || shell\n"
+        );
+        std::fs::write(package.path().join("boot.ipxe"), &dispatcher).unwrap();
+        std::fs::write(package.path().join(DYNAMIC_BOOT_LAYOUT_MARKER), b"1\n").unwrap();
+
+        assert!(!BootPackage::ensure_managed_network_boot(package.path()).unwrap());
+
+        assert_eq!(
+            std::fs::read_to_string(package.path().join("boot.ipxe")).unwrap(),
+            dispatcher
+        );
+        assert!(!package.path().join(WINDOWS_FALLBACK_IPXE_PATH).exists());
+    }
+
     #[test]
     fn managed_loader_refresh_preserves_an_active_control_dispatcher() {
         let package = tempfile::tempdir().unwrap();
@@ -2355,7 +2535,12 @@ const NATIVE_ISO_LAYOUT_MARKER: &str = ".easydeploymesh-native-iso-layout-v2";
 const DYNAMIC_BOOT_LAYOUT_MARKER: &str = ".easydeploymesh-dynamic-boot-v1";
 const DYNAMIC_BOOT_SCRIPT_HEADER: &str =
     "#!ipxe\n# EasyDeployMesh dynamic installer dispatcher v1\n";
-const WINDOWS_FALLBACK_IPXE_PATH: &str = "boot/easydeploymesh-winpe.ipxe";
+/// The managed WinPE script uses paths relative to the TFTP root (`boot/wimboot`, ...), and
+/// iPXE resolves them against the URI of the script it chained. The fallback must therefore
+/// live in the TFTP root itself.
+pub(crate) const WINDOWS_FALLBACK_IPXE_PATH: &str = "easydeploymesh-winpe.ipxe";
+/// Where the first dispatcher layout stored the fallback; iPXE resolved its paths to `boot/boot/`.
+const LEGACY_WINDOWS_FALLBACK_IPXE_PATH: &str = "boot/easydeploymesh-winpe.ipxe";
 const NATIVE_ISO_PATH: &str = "boot/native.iso";
 const NATIVE_ISO_PLACEHOLDER_SCRIPT: &str =
     "#!ipxe\nsanboot http://${next-server}:0/boot/native.iso || shell\n";
@@ -2454,6 +2639,44 @@ fn is_managed_winpe_ipxe_script(script: &[u8]) -> bool {
         || script == USM_MANAGED_IPXE_SCRIPT.as_bytes()
 }
 
+/// Moves a WinPE fallback written by the first dispatcher layout from `boot/` to the TFTP root
+/// and repoints the dispatcher at it. Anything that is not exactly that layout is left alone.
+fn migrate_legacy_winpe_fallback(root: &Path) -> Result<(), PxeServiceError> {
+    let legacy = root.join(LEGACY_WINDOWS_FALLBACK_IPXE_PATH);
+    if !root.join(DYNAMIC_BOOT_LAYOUT_MARKER).is_file() || !legacy.is_file() {
+        return Ok(());
+    }
+    let Ok(dispatcher) = fs::read_to_string(root.join("boot.ipxe")) else {
+        return Ok(());
+    };
+    let legacy_chain =
+        format!("chain tftp://${{next-server}}/{LEGACY_WINDOWS_FALLBACK_IPXE_PATH} ");
+    if !dispatcher.starts_with(DYNAMIC_BOOT_SCRIPT_HEADER) || !dispatcher.contains(&legacy_chain) {
+        return Ok(());
+    }
+    let fallback = fs::read(&legacy)?;
+    if !is_managed_winpe_ipxe_script(&fallback) {
+        return Ok(());
+    }
+    let target = root.join(WINDOWS_FALLBACK_IPXE_PATH);
+    if fs::read(&target).is_ok_and(|existing| existing != fallback) {
+        // Never replace a root-level script this layout did not write.
+        return Ok(());
+    }
+    let current_chain = format!("chain tftp://${{next-server}}/{WINDOWS_FALLBACK_IPXE_PATH} ");
+    fs::write(&target, &fallback)?;
+    // Replace the dispatcher by rename so a partial write cannot leave an unparseable boot.ipxe.
+    let staged = root.join(format!(".boot.ipxe-{}", uuid::Uuid::new_v4()));
+    if let Err(error) = fs::write(&staged, dispatcher.replace(&legacy_chain, &current_chain))
+        .and_then(|()| fs::rename(&staged, root.join("boot.ipxe")))
+    {
+        let _ = fs::remove_file(&staged);
+        return Err(error.into());
+    }
+    fs::remove_file(legacy)?;
+    Ok(())
+}
+
 impl BootPackage {
     /// Returns whether a standard managed package currently routes boot decisions through the
     /// control plane. This is used as a readiness check before a Linux installer job is queued.
@@ -2490,6 +2713,7 @@ impl BootPackage {
                     .into(),
             ));
         }
+        migrate_legacy_winpe_fallback(root)?;
         let root_script = fs::read(root.join("boot.ipxe")).ok();
         let dispatcher_active = Self::has_control_dispatcher(root);
         let managed_script = if dispatcher_active {
@@ -2581,6 +2805,7 @@ impl BootPackage {
         if root.join(NATIVE_ISO_LAYOUT_MARKER).is_file() {
             return Ok(false);
         }
+        migrate_legacy_winpe_fallback(root)?;
         let address = control_endpoint
             .strip_prefix("http://")
             .and_then(|authority| authority.parse::<SocketAddr>().ok())
@@ -2608,7 +2833,6 @@ impl BootPackage {
             return Ok(false);
         }
 
-        fs::create_dir_all(root.join("boot"))?;
         fs::write(root.join(WINDOWS_FALLBACK_IPXE_PATH), &fallback_script)?;
         let dispatcher = format!(
             "{DYNAMIC_BOOT_SCRIPT_HEADER}chain {normalized_endpoint}/api/v1/install/boot.ipxe?mac=${{net0/mac}}&arch=${{buildarch}}&platform=${{platform}} || goto windows\nexit\n:windows\nchain tftp://${{next-server}}/{WINDOWS_FALLBACK_IPXE_PATH} || shell\n"
