@@ -1,0 +1,59 @@
+name: Bug
+description: 已有功能表现与预期不符 / Existing behavior does not match expectations
+title: "[Bug][P?]"
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        标题直接写「在什么条件下出现什么现象」，并把 `[P?]` 换成 P0–P3（数字越小越紧急），优先级标签会自动同步；不确定时保留 `[P?]`，由维护者分诊。
+
+        Title: describe the condition and the symptom, and replace `[P?]` with P0–P3 (lower is more urgent). Keep `[P?]` if unsure.
+
+        安全漏洞不要公开提交，请按 [CONTRIBUTING.md](https://github.com/Bald-M/EasyDeployMesh/blob/main/CONTRIBUTING.md#safety-requirements) 私下联系维护者。
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / Version
+      placeholder: v0.2.6，或从源码运行时的提交 SHA
+    validations:
+      required: true
+  - type: checkboxes
+    id: environment
+    attributes:
+      label: 出现问题的环境 / Environment
+      options:
+        - label: 浏览器开发模式（pnpm dev）
+        - label: 桌面应用 · Windows
+        - label: 桌面应用 · macOS
+        - label: 桌面应用 · Linux
+        - label: 目标机 WinPE / Agent
+        - label: 目标机 Ubuntu 安装器
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤 / Steps to reproduce
+      placeholder: |
+        1. 导入…
+        2. 选择设备和磁盘…
+        3. 开始部署…
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果 / Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果 / Actual behavior
+      description: 可附截图、脱敏后的日志或诊断脚本输出；不要粘贴注册令牌、设备令牌、内网地址或个人数据。
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: 环境与补充 / Additional context
+      placeholder: 宿主操作系统、镜像格式与来源、PE 介质、UEFI/Legacy、磁盘与分区方案、网络拓扑（DHCP/ProxyDHCP）、相关代码位置等
