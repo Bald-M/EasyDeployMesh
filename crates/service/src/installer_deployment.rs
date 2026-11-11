@@ -2,6 +2,7 @@ use crate::{
     DeviceRegistry, DeviceRegistryError, ImageLibrary, JobRepository, JobRepositoryError,
     device_registry::{digest_secret, generate_secret, secret_matches},
     image_library::PreparedLinuxIsoAsset,
+    pxe::WINDOWS_FALLBACK_IPXE_PATH,
 };
 use easydeploymesh_core::{
     Architecture, BootMode, DeploymentJob, DeploymentStage, DeploymentTarget, JobState,
@@ -757,12 +758,9 @@ fn installer_event_message(kind: InstallerEventKind) -> &'static str {
 
 pub(super) fn render_boot_script(outcome: BootOutcome) -> String {
     match outcome {
-        BootOutcome::NoAssignment => concat!(
-            "#!ipxe\n",
-            "# EasyDeployMesh no Linux assignment\n",
-            "chain tftp://${next-server}/boot/easydeploymesh-winpe.ipxe || exit\n"
-        )
-        .to_owned(),
+        BootOutcome::NoAssignment => format!(
+            "#!ipxe\n# EasyDeployMesh no Linux assignment\nchain tftp://${{next-server}}/{WINDOWS_FALLBACK_IPXE_PATH} || exit\n"
+        ),
         BootOutcome::Denied => concat!(
             "#!ipxe\n",
             "# EasyDeployMesh assignment denied; do not fall back to destructive media\n",
@@ -1142,7 +1140,9 @@ mod tests {
         let no_assignment = render_boot_script(BootOutcome::NoAssignment);
         let denied = render_boot_script(BootOutcome::Denied);
 
-        assert!(no_assignment.contains("easydeploymesh-winpe.ipxe"));
+        assert!(no_assignment.contains(&format!(
+            "chain tftp://${{next-server}}/{WINDOWS_FALLBACK_IPXE_PATH} || exit\n"
+        )));
         assert!(!denied.contains("easydeploymesh-winpe.ipxe"));
         assert!(denied.contains("assignment denied"));
         assert!(denied.ends_with("exit\n"));
