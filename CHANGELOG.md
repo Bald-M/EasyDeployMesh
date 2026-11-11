@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TFTP replies are now sent from the PXE listener's address instead of an
   address chosen by the routing table, so clients on multi-homed hosts accept
   the OACK and data packets.
+- The dynamic iPXE dispatcher now chains unregistered devices to the managed
+  WinPE script instead of refusing them, so first-time BIOS and UEFI clients
+  can boot WinPE and enroll.
 
 ### Security
 
