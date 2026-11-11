@@ -1,0 +1,40 @@
+name: Enhancement
+description: 新功能、体验优化或技术改进 / New feature, UX improvement, or technical change
+title: "[Enhancement][P?]"
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        标题写「要达成什么」，并把 `[P?]` 换成 P0–P3（数字越小越紧急），优先级标签会自动同步；不确定时保留 `[P?]`，由维护者分诊。较大的功能或架构改动请先在 issue 中讨论方案再实现。
+
+        Title: describe the outcome, and replace `[P?]` with P0–P3 (lower is more urgent). Keep `[P?]` if unsure. Discuss substantial features or architectural changes here before implementing them.
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景 / Background
+      description: 现状和要解决的问题。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 方案 / Proposal
+      description: 期望的行为或可选方案；涉及磁盘写入、分区、引导配置、PXE、协议或持久化格式时说明安全与兼容影响。
+  - type: textarea
+    id: scope
+    attributes:
+      label: 范围 / Scope
+      description: 明确范围内与范围外的内容。
+      placeholder: |
+        范围内：…
+        范围外：…
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准 / Acceptance criteria
+      placeholder: |
+        - [ ] …
+        - [ ] 在一次性虚拟机中完成 UEFI / Legacy 部署验证
+    validations:
+      required: true

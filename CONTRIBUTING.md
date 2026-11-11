@@ -122,7 +122,52 @@ If you discover a security vulnerability, do not publish exploit details or
 sensitive data in a public issue. Contact the maintainer privately through their
 GitHub profile first.
 
-## Bug reports
+## Issues
+
+Open issues through the forms in `.github/ISSUE_TEMPLATE`; blank issues are
+disabled.
+
+**Title**: `[Type][Priority]One-line description`, with no spaces between the
+prefixes or before the description. Chinese or English descriptions are both
+fine.
+
+```text
+[Bug][P1]Legacy BIOS boot fails when boot.wim TFTP transfer times out
+[Enhancement][P2]Restore file-system-based GHO images on NTFS partitions
+[Documentation][P3]Align GHO support statements across README and DESIGN
+```
+
+- A bug describes the condition and the symptom; an enhancement describes the
+  outcome to reach.
+- Do not use Conventional Commits prefixes such as `feat(...)` in issue titles;
+  they are only for commits and pull request titles.
+- Leave `[P?]` when unsure; a maintainer triages it and edits the title.
+- A closed issue that was never triaged may keep only the type prefix.
+
+**Labels**: every open issue carries one type label and one priority label that
+match its title.
+
+- The issue form adds the type label.
+- `.github/workflows/issue-priority-label.yml` syncs the priority label from
+  `[P0]`–`[P3]` in the title, so changing priority only needs a title edit.
+
+| Type label      | Meaning                                       |
+| --------------- | --------------------------------------------- |
+| `bug`           | Existing behavior does not match expectations |
+| `enhancement`   | New feature or improvement                    |
+| `documentation` | Documentation problem                         |
+
+| Priority | Meaning                                                                                                |
+| -------- | ------------------------------------------------------------------------------------------------------ |
+| `P0`     | Urgent: wrong-disk writes, data loss, or a security issue; handle immediately                          |
+| `P1`     | High: a core flow (discovery, PXE boot, enrollment, deployment) is broken; handle in the current cycle |
+| `P2`     | Medium: a workaround exists or the impact is limited; schedule it                                      |
+| `P3`     | Low: UX polish or technical debt; handle when time allows                                              |
+
+GitHub's default labels such as `duplicate`, `invalid`, `wontfix`, and
+`question` keep their usual meaning for triage and closing.
+
+### Bug reports
 
 A useful bug report includes:
 
@@ -139,21 +184,33 @@ other secrets before attaching logs.
 
 ## Pull requests
 
-Pull requests should include:
+Commit messages and pull request titles use
+[Conventional Commits](https://www.conventionalcommits.org/) in the imperative
+mood:
+
+```text
+<type>(<scope>): <summary>
+```
+
+Common types are `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, and
+`release`. Scopes follow the affected area, such as `pxe`, `deployment`,
+`partition`, `agent`, `desktop`, `images`, or `gho`. For example:
+
+```text
+fix(partition): prevent invalid target disk layouts
+feat(pxe): add macOS WinPE import
+release: v0.2.6
+```
+
+Fill in `.github/pull_request_template.md`. A pull request should include:
 
 - A concise explanation of the problem and solution
-- Links to related issues
+- Links to related issues (`Closes #123` or `Refs #123`)
 - Tests added or updated
 - Commands run and their results
 - Screenshots for visible UI changes
 - Manual verification details for Windows, WinPE, PXE, or destructive workflows
 - Any compatibility, migration, or security implications
-
-Use clear commit messages written in the imperative mood, for example:
-
-```text
-Validate target disks before starting deployment
-```
 
 Maintainers may request changes to keep the project safe, maintainable, and
 within its supported scope.

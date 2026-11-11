@@ -1,0 +1,24 @@
+name: Documentation
+description: 文档缺失、过时或有误 / Missing, outdated, or incorrect documentation
+title: "[Documentation][P?]"
+labels: [documentation]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        标题写「哪份文档的什么问题」，并把 `[P?]` 换成 P0–P3（数字越小越紧急），优先级标签会自动同步；不确定时保留 `[P?]`，由维护者分诊。
+
+        Title: name the document and the problem, and replace `[P?]` with P0–P3 (lower is more urgent). Keep `[P?]` if unsure.
+  - type: textarea
+    id: location
+    attributes:
+      label: 涉及文档 / Affected documents
+      placeholder: 文件路径或章节，例如 README.md#supported-images、DESIGN.md
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题与建议修改 / Problem and suggested change
+    validations:
+      required: true
