@@ -56,6 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   WinPE `X:` RAM disk), it marks every disk as a system disk so deployment
   fails closed. The device page no longer preselects or offers the system
   disk, and a device with only system disks is not offered as a target.
+- A restored Windows 7 GHO stopped at Boot Manager with `winload.exe`
+  `0xc0000001`. Its own boot store disables boot integrity checks, and the new
+  store BCDBoot creates did not. The Agent now reads the
+  restored volume's `\Boot\BCD` and, if its default Windows loader entry
+  disables integrity checks, re-applies `nointegritychecks` and the
+  `DISABLE_INTEGRITY_CHECKS` load option to the new default entry.
 - Large images can be leased again. Claim-time revalidation of a GHO (hash,
   full decode, hash) took minutes, so every Agent claim hit its 15-second
   timeout, the job stayed waiting, and blocked workers delayed heartbeats until

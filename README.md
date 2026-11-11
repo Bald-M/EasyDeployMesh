@@ -155,7 +155,9 @@ Supported: password-free single-partition NTFS images made by Ghost 11.x with
 zlib compression (`-z2` to `-z9`), stored as one file or as an ordered GHS
 span set. The target Windows partition must be at least as large as the
 source volume. BCDBoot then configures booting, so the image must contain a
-Windows version that BCDBoot supports (Windows 7 or later).
+Windows version that BCDBoot supports (Windows 7 or later). If the image's own
+boot store disables boot integrity checks, as some repackaged Windows 7 images
+do, the new boot entry keeps that setting and the job progress says so.
 
 Rejected before any disk is touched: uncompressed or "fast" (`-z1`) images,
 encrypted images, disk images or multi-partition images, FAT and other file

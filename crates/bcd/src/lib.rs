@@ -385,6 +385,73 @@ pub fn validate_winpe_bcd_with_policy(
     Ok(())
 }
 
+/// Boot-integrity settings of an offline Windows installation's default
+/// loader entry, read so they can be carried into a newly created store.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LoaderIntegrityPolicy {
+    /// The entry disables boot-image integrity checks, either with
+    /// `nointegritychecks` or with the legacy `DISABLE_INTEGRITY_CHECKS` load
+    /// option. Some repackaged Windows 7 images need this to start.
+    pub disable_integrity_checks: bool,
+}
+
+const LOADER_PATH_ELEMENT: &str = "12000002";
+const LOAD_OPTIONS_ELEMENT: &str = "12000030";
+const DEFAULT_OBJECT_ELEMENT: &str = "23000003";
+const NO_INTEGRITY_CHECKS_ELEMENT: &str = "16000048";
+
+/// Reads the integrity policy of the store's default `winload.exe` entry.
+/// A store whose default entry is missing or is not the standard Windows
+/// loader has no policy to carry over.
+pub fn windows_loader_integrity_policy(bytes: &[u8]) -> Result<LoaderIntegrityPolicy, BcdError> {
+    let hive = checked_hive(bytes)?;
+    let element = |id: &str, element: &str| {
+        raw_value(
+            &hive,
+            &object_path(id, &format!(r"Elements\{element}")),
+            "Element",
+        )
+        .ok()
+    };
+    let Some(default) = element(BOOT_MANAGER_ID, DEFAULT_OBJECT_ELEMENT)
+        .and_then(|bytes| utf16_string(&bytes))
+        .map(|id| id.to_ascii_lowercase())
+    else {
+        return Ok(LoaderIntegrityPolicy::default());
+    };
+    guid_bytes(&default)?;
+    let is_windows_loader = element(&default, LOADER_PATH_ELEMENT)
+        .and_then(|bytes| utf16_string(&bytes))
+        .is_some_and(|path| path.eq_ignore_ascii_case(STANDARD_LOADER_PATH));
+    if !is_windows_loader {
+        return Ok(LoaderIntegrityPolicy::default());
+    }
+    let no_integrity_checks = element(&default, NO_INTEGRITY_CHECKS_ELEMENT)
+        .is_some_and(|bytes| bytes.first().is_some_and(|value| *value != 0));
+    let legacy_option = element(&default, LOAD_OPTIONS_ELEMENT)
+        .and_then(|bytes| utf16_string(&bytes))
+        .is_some_and(|options| {
+            options
+                .split_whitespace()
+                .any(|option| option.eq_ignore_ascii_case("DISABLE_INTEGRITY_CHECKS"))
+        });
+    Ok(LoaderIntegrityPolicy {
+        disable_integrity_checks: no_integrity_checks || legacy_option,
+    })
+}
+
+fn utf16_string(bytes: &[u8]) -> Option<String> {
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let units = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take_while(|unit| *unit != 0)
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).ok()
+}
+
 /// Reads the one offline SYSTEM value used by the shell-hook fallback.
 pub fn setup_cmdline(bytes: &[u8]) -> Result<String, BcdError> {
     let hive = checked_hive(bytes)?;
@@ -511,6 +578,85 @@ fn find_free_cell(bytes: &[u8], required: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn os_store(loader_path: &str, elements: &[(&str, DataType, Vec<u8>)]) -> Vec<u8> {
+        const LOADER: &str = "{0d9c6439-fafd-11e8-bad5-f2486375e117}";
+        let mut root = KeyTreeNode::new("ROOT");
+        describe(&mut root, BOOT_MANAGER_ID, 0x10100002);
+        put(
+            &mut root,
+            &object_path(BOOT_MANAGER_ID, r"Elements\23000003"),
+            DataType::String,
+            utf16(&LOADER.to_ascii_uppercase()),
+        );
+        describe(&mut root, LOADER, 0x10200003);
+        put(
+            &mut root,
+            &object_path(LOADER, r"Elements\12000002"),
+            DataType::String,
+            utf16(loader_path),
+        );
+        for (element, data_type, data) in elements {
+            put(
+                &mut root,
+                &object_path(LOADER, &format!(r"Elements\{element}")),
+                *data_type,
+                data.clone(),
+            );
+        }
+        HiveBuilder::from_tree(root).build().unwrap()
+    }
+
+    #[test]
+    fn reads_the_default_windows_loader_integrity_policy() {
+        let disabled = LoaderIntegrityPolicy {
+            disable_integrity_checks: true,
+        };
+        let legacy = os_store(
+            r"\Windows\system32\winload.exe",
+            &[(
+                "12000030",
+                DataType::String,
+                utf16("DISABLE_INTEGRITY_CHECKS"),
+            )],
+        );
+        assert_eq!(windows_loader_integrity_policy(&legacy).unwrap(), disabled);
+        let boolean = os_store(
+            STANDARD_LOADER_PATH,
+            &[("16000048", DataType::Binary, vec![1])],
+        );
+        assert_eq!(windows_loader_integrity_policy(&boolean).unwrap(), disabled);
+
+        let plain = os_store(STANDARD_LOADER_PATH, &[]);
+        assert_eq!(
+            windows_loader_integrity_policy(&plain).unwrap(),
+            LoaderIntegrityPolicy::default()
+        );
+        let other_option = os_store(
+            STANDARD_LOADER_PATH,
+            &[("12000030", DataType::String, utf16("NOEXECUTE=OPTIN"))],
+        );
+        assert_eq!(
+            windows_loader_integrity_policy(&other_option).unwrap(),
+            LoaderIntegrityPolicy::default()
+        );
+        // A default entry that is not the Windows loader carries nothing.
+        let other_loader = os_store(
+            r"\Windows\system32\winresume.exe",
+            &[("16000048", DataType::Binary, vec![1])],
+        );
+        assert_eq!(
+            windows_loader_integrity_policy(&other_loader).unwrap(),
+            LoaderIntegrityPolicy::default()
+        );
+        // The WinPE store has no default Windows loader entry.
+        let winpe = create_winpe_bcd(STANDARD_LOADER_PATH).unwrap();
+        assert_eq!(
+            windows_loader_integrity_policy(&winpe).unwrap(),
+            LoaderIntegrityPolicy::default()
+        );
+        assert!(windows_loader_integrity_policy(b"not a hive").is_err());
+    }
 
     #[test]
     fn canonical_bcd_round_trips_and_rejects_unknown_loader() {

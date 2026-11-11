@@ -215,7 +215,13 @@ The restored volume size must fit the planned Windows volume. The Agent
 checks the parser version and the real partition length before writing. It
 locks, dismounts, and enables extended DASD I/O on `W:`. It recomputes the
 stream size and SHA-256 while writing, then runs `extend filesystem` if the
-partition is larger than the source volume.
+partition is larger than the source volume. BCDBoot then creates a new boot
+store on `S:`. If the restored volume's own `\Boot\BCD` default entry is the
+standard `winload.exe` loader and disables boot integrity checks
+(`nointegritychecks` or the legacy `DISABLE_INTEGRITY_CHECKS` load option), the
+Agent re-applies both settings to the new default entry and reports it in the
+job progress. Some repackaged Windows 7 images ship a loader that their own
+Boot Manager starts only with checks disabled. No other boot setting is copied.
 
 An ISO is never treated as a raw disk image. ISO import uses bounded filesystem
 inspection and accepts only the implemented Ubuntu Server live-server profile.
