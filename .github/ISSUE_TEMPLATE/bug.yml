@@ -1,16 +1,28 @@
 name: Bug
 description: 已有功能表现与预期不符 / Existing behavior does not match expectations
-title: "[Bug][P?]"
+title: "[Bug]"
 labels: [bug]
 body:
   - type: markdown
     attributes:
       value: |
-        标题直接写「在什么条件下出现什么现象」，并把 `[P?]` 换成 P0–P3（数字越小越紧急），优先级标签会自动同步；不确定时保留 `[P?]`，由维护者分诊。
+        标题直接写「在什么条件下出现什么现象」，不用写优先级前缀：在下方选择优先级，提交后会自动写入标题并添加标签。
 
-        Title: describe the condition and the symptom, and replace `[P?]` with P0–P3 (lower is more urgent). Keep `[P?]` if unsure.
+        Title: describe the condition and the symptom. Pick a priority below instead of typing one; it is added to the title and labels automatically.
 
         安全漏洞不要公开提交，请按 [CONTRIBUTING.md](https://github.com/Bald-M/EasyDeployMesh/blob/main/CONTRIBUTING.md#safety-requirements) 私下联系维护者。
+  - type: dropdown
+    id: priority
+    attributes:
+      label: 优先级 / Priority
+      description: 提交后会自动写入标题并添加对应标签。 / Added to the title and labels automatically after submission.
+      options:
+        - P0 紧急：误写磁盘、数据丢失或安全问题 / Urgent: wrong-disk writes, data loss, or security
+        - P1 高：核心流程受损 / High: a core flow is broken
+        - P2 中：有绕过方式或影响有限 / Medium: workaround exists or limited impact
+        - P3 低：体验优化或技术债 / Low: polish or technical debt
+    validations:
+      required: true
   - type: input
     id: version
     attributes:

@@ -141,15 +141,19 @@ fine.
   outcome to reach.
 - Do not use Conventional Commits prefixes such as `feat(...)` in issue titles;
   they are only for commits and pull request titles.
-- Leave `[P?]` when unsure; a maintainer triages it and edits the title.
-- A closed issue that was never triaged may keep only the type prefix.
+- Do not type the priority into the title. Every issue form has a required
+  priority dropdown, and the priority is written into the title automatically
+  after submission.
+- A closed issue that was never prioritized may keep only the type prefix.
 
 **Labels**: every open issue carries one type label and one priority label that
 match its title.
 
 - The issue form adds the type label.
-- `.github/workflows/issue-priority-label.yml` syncs the priority label from
-  `[P0]`–`[P3]` in the title, so changing priority only needs a title edit.
+- `.github/workflows/issue-priority-label.yml` inserts the priority chosen in
+  the form into a title that has none, then syncs the priority label from
+  `[P0]`–`[P3]` in the title. After that the title is the source of truth, so
+  changing priority only needs a title edit.
 
 | Type label      | Meaning                                       |
 | --------------- | --------------------------------------------- |
