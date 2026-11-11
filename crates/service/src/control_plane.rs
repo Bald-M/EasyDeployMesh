@@ -1285,7 +1285,10 @@ mod tests {
             .text()
             .await
             .expect("boot script should decode");
-        assert!(no_assignment.contains("easydeploymesh-winpe.ipxe"));
+        assert!(no_assignment.contains(&format!(
+            "chain tftp://${{next-server}}/{} || exit\n",
+            crate::pxe::WINDOWS_FALLBACK_IPXE_PATH
+        )));
 
         // A first-time BIOS or UEFI client is not registered yet; it must reach
         // WinPE so the Agent can enroll it.
@@ -1303,7 +1306,10 @@ mod tests {
                 .await
                 .expect("boot script should decode");
             assert!(
-                unregistered.contains("easydeploymesh-winpe.ipxe"),
+                unregistered.contains(&format!(
+                    "chain tftp://${{next-server}}/{} || exit\n",
+                    crate::pxe::WINDOWS_FALLBACK_IPXE_PATH
+                )),
                 "unregistered {platform} client should chain to WinPE"
             );
         }
