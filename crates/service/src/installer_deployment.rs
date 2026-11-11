@@ -185,7 +185,9 @@ impl InstallerDeployment {
             .find_by_mac(mac_address)
             .map_err(InstallerDeploymentError::Registry)?
         else {
-            return Ok(BootOutcome::Denied);
+            // An unregistered device cannot have a Linux assignment; it must
+            // reach WinPE so the Agent can enroll it.
+            return Ok(BootOutcome::NoAssignment);
         };
 
         let active_jobs = self

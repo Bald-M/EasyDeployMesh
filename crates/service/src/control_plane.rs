@@ -1287,6 +1287,27 @@ mod tests {
             .expect("boot script should decode");
         assert!(no_assignment.contains("easydeploymesh-winpe.ipxe"));
 
+        // A first-time BIOS or UEFI client is not registered yet; it must reach
+        // WinPE so the Agent can enroll it.
+        for (arch, platform) in [("i386", "pcbios"), ("x86_64", "efi")] {
+            let unregistered = client
+                .get(format!(
+                    "{endpoint}/api/v1/install/boot.ipxe?mac=00:0c:29:b9:ab:76&arch={arch}&platform={platform}"
+                ))
+                .send()
+                .await
+                .expect("boot request should complete")
+                .error_for_status()
+                .expect("boot request should be accepted")
+                .text()
+                .await
+                .expect("boot script should decode");
+            assert!(
+                unregistered.contains("easydeploymesh-winpe.ipxe"),
+                "unregistered {platform} client should chain to WinPE"
+            );
+        }
+
         let queued = jobs
             .enqueue(CreateDeploymentJob {
                 name: "Refused Linux assignment".to_owned(),
