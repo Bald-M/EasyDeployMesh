@@ -429,7 +429,9 @@ async fn claim_job(
             deployment_validation::Status::Passed(validated) => {
                 validated_jobs.insert(job.id, validated);
             }
-            deployment_validation::Status::Running { started: true } => {
+            deployment_validation::Status::Running { started: true }
+                if state.validations.announce_once(&job) =>
+            {
                 record_job_activity(
                     &state,
                     &job,
@@ -438,15 +440,16 @@ async fn claim_job(
                     None,
                 );
             }
-            deployment_validation::Status::Running { started: false } => {}
+            deployment_validation::Status::Running { .. } => {}
             deployment_validation::Status::Failed(error) => {
-                if state.validations.report_failure_once(&job) {
+                let message = error.to_string();
+                if state.validations.report_failure_once(&job, &message) {
                     record_job_activity(
                         &state,
                         &job,
                         "job_image_validation_failed",
                         ActivitySeverity::Error,
-                        Some(error.to_string()),
+                        Some(message),
                     );
                 }
             }

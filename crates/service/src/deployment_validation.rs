@@ -13,7 +13,8 @@
 //!   after the revalidation, and still has them now.
 //!
 //! Anything else starts a new revalidation, so the claim fails closed. A
-//! failed revalidation is retried after [`FAILURE_RETRY`].
+//! failed revalidation is retried after [`FAILURE_RETRY`], backing off while
+//! it keeps failing.
 //!
 //! Size and modification time cannot detect a change that preserves both.
 //! The Agent's SHA-256 check of the downloaded bytes against the lease is the
@@ -35,7 +36,8 @@ use uuid::Uuid;
 
 /// How long after it finished a passed revalidation may issue a lease.
 pub(crate) const FRESHNESS: Duration = Duration::from_secs(30 * 60);
-/// How long a failed revalidation is reported before it is retried.
+/// How long a failed revalidation is reported before it is first retried.
+/// Each further consecutive failure doubles the wait, up to [`FRESHNESS`].
 pub(crate) const FAILURE_RETRY: Duration = Duration::from_secs(2 * 60);
 /// How long a claim waits for revalidation before answering. Well below the
 /// Agent's 15-second claim timeout.
@@ -94,6 +96,8 @@ type Outcome = Result<(Validated, Vec<FileStamp>), RevalidationError>;
 struct Entry {
     started_at: DateTime<Utc>,
     finished: Instant,
+    /// How long a failure is reported before it is retried.
+    retry_after: Duration,
     stamps: Vec<FileStamp>,
     outcome: Result<Arc<Validated>, Arc<RevalidationError>>,
 }
@@ -102,8 +106,12 @@ struct Entry {
 struct Slot {
     done: Option<Arc<Entry>>,
     in_flight: Option<watch::Receiver<bool>>,
-    /// Jobs whose claim already reported that `done` failed.
-    reported_failures: HashSet<Uuid>,
+    consecutive_failures: u32,
+    /// The last failure message logged for each job, so a failure that keeps
+    /// repeating is logged once.
+    reported_failures: HashMap<Uuid, String>,
+    /// Jobs already told that their image is being revalidated.
+    announced: HashSet<Uuid>,
 }
 
 /// A job's image revalidation as seen by a claim.
@@ -148,7 +156,7 @@ impl DeploymentValidationCache {
         F: FnOnce() -> Outcome + Send + 'static,
     {
         let key = Key::for_job(job);
-        if let Some(done) = self.done(key).filter(|entry| entry.usable_for_claim(job)) {
+        if let Some(done) = self.usable(key, job) {
             return done.status();
         }
         let (started, mut receiver) = {
@@ -156,20 +164,29 @@ impl DeploymentValidationCache {
             let slot = slots.entry(key).or_default();
             match slot.in_flight.clone() {
                 Some(receiver) => (false, receiver),
-                None => (true, self.start(key, slot, check)),
+                // A run may have finished since the check above; re-check
+                // under the lock (rare, so the file stats here are cheap).
+                None => match slot
+                    .done
+                    .clone()
+                    .filter(|entry| entry.usable_for_claim(job, Instant::now()))
+                {
+                    Some(done) => return done.status(),
+                    None => (true, self.start(key, slot, check)),
+                },
             }
         };
         let running = Status::Running { started };
-        if tokio::time::timeout_at(deadline, receiver.wait_for(|finished| *finished))
-            .await
-            .is_err()
-        {
-            return running;
-        }
-        match self.done(key).filter(|entry| entry.usable_for_claim(job)) {
+        let _ = tokio::time::timeout_at(deadline, receiver.wait_for(|finished| *finished)).await;
+        match self.usable(key, job) {
             Some(done) => done.status(),
             None => running,
         }
+    }
+
+    fn usable(&self, key: Key, job: &DeploymentJob) -> Option<Arc<Entry>> {
+        self.done(key)
+            .filter(|entry| entry.usable_for_claim(job, Instant::now()))
     }
 
     /// Returns the passed revalidation for the job's current lease, if it
@@ -187,12 +204,23 @@ impl DeploymentValidationCache {
         entry.outcome.as_ref().ok().cloned()
     }
 
-    /// Returns true the first time it is called for a job after its current
-    /// revalidation failed.
-    pub(crate) fn report_failure_once(&self, job: &DeploymentJob) -> bool {
+    /// Returns true when this failure should be logged for the job: the
+    /// first time it fails, and again only when the failure changes.
+    pub(crate) fn report_failure_once(&self, job: &DeploymentJob, error: &str) -> bool {
+        self.lock().get_mut(&Key::for_job(job)).is_some_and(|slot| {
+            let changed = slot.reported_failures.get(&job.id).map(String::as_str) != Some(error);
+            if changed {
+                slot.reported_failures.insert(job.id, error.to_owned());
+            }
+            changed
+        })
+    }
+
+    /// Returns true the first time a revalidation starts for the job.
+    pub(crate) fn announce_once(&self, job: &DeploymentJob) -> bool {
         self.lock()
             .get_mut(&Key::for_job(job))
-            .is_some_and(|slot| slot.reported_failures.insert(job.id))
+            .is_some_and(|slot| slot.announced.insert(job.id))
     }
 
     fn done(&self, key: Key) -> Option<Arc<Entry>> {
@@ -241,34 +269,46 @@ impl Drop for Completion {
             Some(Err(error)) => (Vec::new(), Err(Arc::new(error))),
             None => (Vec::new(), Err(Arc::new(RevalidationError::Interrupted))),
         };
-        let entry = Entry {
-            started_at: self.started_at,
-            finished: Instant::now(),
-            stamps,
-            outcome,
+        let mut slots = self.cache.lock();
+        let slot = slots.entry(self.key).or_default();
+        slot.consecutive_failures = match outcome {
+            Ok(_) => 0,
+            Err(_) => slot.consecutive_failures.saturating_add(1),
         };
-        {
-            let mut slots = self.cache.lock();
-            let slot = slots.entry(self.key).or_default();
-            slot.done = Some(Arc::new(entry));
-            slot.in_flight = None;
+        if outcome.is_ok() {
             slot.reported_failures.clear();
         }
+        slot.done = Some(Arc::new(Entry {
+            started_at: self.started_at,
+            finished: Instant::now(),
+            retry_after: failure_backoff(slot.consecutive_failures),
+            stamps,
+            outcome,
+        }));
+        slot.in_flight = None;
+        drop(slots);
         if let Some(sender) = self.sender.take() {
             let _ = sender.send(true);
         }
     }
 }
 
+/// The retry wait after `failures` consecutive failures: [`FAILURE_RETRY`],
+/// doubling each time, capped at [`FRESHNESS`].
+fn failure_backoff(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(8);
+    (FAILURE_RETRY * 2_u32.pow(doublings)).min(FRESHNESS)
+}
+
 impl Entry {
-    fn usable_for_claim(&self, job: &DeploymentJob) -> bool {
+    fn usable_for_claim(&self, job: &DeploymentJob, now: Instant) -> bool {
         if self.started_at < job.created_at {
             return false;
         }
-        let age = self.finished.elapsed();
+        let age = now.saturating_duration_since(self.finished);
         match self.outcome {
             Ok(_) => age <= FRESHNESS && self.files_unchanged(),
-            Err(_) => age <= FAILURE_RETRY,
+            Err(_) => age <= self.retry_after,
         }
     }
 
@@ -462,10 +502,19 @@ mod tests {
 
         // A revalidation that started before a job was created is not reused.
         let newer = job(&fixture.jobs, fixture.image_id);
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let images = Arc::clone(&fixture.images);
+        let key = Key::for_job(&newer);
         assert!(matches!(
-            cache.status_for_claim(&fixture.images, &newer, now()).await,
+            cache
+                .status_with(&newer, now(), move || {
+                    gate.recv().unwrap();
+                    revalidate(&images, key)
+                })
+                .await,
             Status::Running { started: true }
         ));
+        release.send(()).unwrap();
         assert!(matches!(
             cache
                 .status_for_claim(&fixture.images, &newer, soon())
@@ -492,8 +541,9 @@ mod tests {
                 .await,
             Status::Failed(_)
         ));
-        assert!(cache.report_failure_once(&newer));
-        assert!(!cache.report_failure_once(&newer));
+        assert!(cache.report_failure_once(&newer, "hash mismatch"));
+        assert!(!cache.report_failure_once(&newer, "hash mismatch"));
+        assert!(cache.report_failure_once(&newer, "file unavailable"));
         assert!(cache.passed_for_lease(&newer).is_none());
     }
 
@@ -523,24 +573,31 @@ mod tests {
     fn passes_expire_after_freshness_and_failures_after_the_retry_interval() {
         let fixture = fixture();
         let job = job(&fixture.jobs, fixture.image_id);
-        let entry = |age: Duration, outcome| Entry {
+        let finished = Instant::now();
+        let entry = |failures, outcome| Entry {
             started_at: Utc::now(),
-            finished: Instant::now().checked_sub(age).unwrap(),
+            finished,
+            retry_after: failure_backoff(failures),
             stamps: Vec::new(),
             outcome,
         };
         let passed = || Ok(Arc::new(Validated::Wim));
         let failed = || Err(Arc::new(RevalidationError::Interrupted));
         let minute = Duration::from_secs(60);
+        let at = |age: Duration| finished + age;
 
-        assert!(entry(FRESHNESS - minute, passed()).usable_for_claim(&job));
-        assert!(!entry(FRESHNESS + minute, passed()).usable_for_claim(&job));
-        assert!(entry(FAILURE_RETRY - minute, failed()).usable_for_claim(&job));
-        assert!(!entry(FAILURE_RETRY + minute, failed()).usable_for_claim(&job));
+        assert!(entry(0, passed()).usable_for_claim(&job, at(FRESHNESS - minute)));
+        assert!(!entry(0, passed()).usable_for_claim(&job, at(FRESHNESS + minute)));
+        assert!(entry(1, failed()).usable_for_claim(&job, at(FAILURE_RETRY - minute)));
+        assert!(!entry(1, failed()).usable_for_claim(&job, at(FAILURE_RETRY + minute)));
+        // Repeated failures back off, up to the freshness window.
+        assert!(entry(2, failed()).usable_for_claim(&job, at(FAILURE_RETRY + minute)));
+        assert_eq!(failure_backoff(3), FAILURE_RETRY * 4);
+        assert_eq!(failure_backoff(u32::MAX), FRESHNESS);
 
-        let mut before_job = entry(Duration::ZERO, passed());
+        let mut before_job = entry(0, passed());
         before_job.started_at = job.created_at - chrono::Duration::seconds(1);
-        assert!(!before_job.usable_for_claim(&job));
+        assert!(!before_job.usable_for_claim(&job, finished));
     }
 
     #[test]

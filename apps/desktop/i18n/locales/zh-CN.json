@@ -422,7 +422,7 @@
       "jobQueued": "部署任务正在等待客户机",
       "jobStarted": "客户机已开始执行部署任务",
       "jobImageValidating": "正在复核部署镜像，完成后客户机会自动开始（大镜像可能需要几分钟）",
-      "jobImageValidationFailed": "部署镜像复核失败，任务保持等待，约 2 分钟后重新复核",
+      "jobImageValidationFailed": "部署镜像复核失败，任务保持等待，稍后会自动重新复核",
       "jobStageChanged": "部署任务进入“{stage}”阶段",
       "jobPaused": "部署任务已暂停",
       "jobResumed": "部署任务已继续",
