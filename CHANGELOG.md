@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whether the disk was left untouched or was partly written. Text is Chinese
   when the WinPE media has a CJK font and English otherwise. The reported
   progress and deployment flow are unchanged.
+- The image library labels a verified, deployable GHO as eligible for
+  automatic deployment instead of "manual deployment only". A verified GHO
+  that the native restorer refuses (for example a Windows XP image without
+  `winload.exe`) is labelled catalog only.
 
 ### Fixed
 
@@ -52,6 +56,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   WinPE `X:` RAM disk), it marks every disk as a system disk so deployment
   fails closed. The device page no longer preselects or offers the system
   disk, and a device with only system disks is not offered as a target.
+- Large images can be leased again. Claim-time revalidation of a GHO (hash,
+  full decode, hash) took minutes, so every Agent claim hit its 15-second
+  timeout, the job stayed waiting, and blocked workers delayed heartbeats until
+  the device appeared to reconnect repeatedly. A claim now starts the
+  revalidation in the background and the job is leased on a later claim once
+  it has passed. WIM/ESD revalidation, which also hashes the whole image, uses
+  the same path. The GHO download reuses the passed revalidation instead of
+  decoding the image again. Revalidation start and failure are logged.
 - A BIOS PXE ROM that answers the TFTP OACK with an error after a `tsize`
   size probe is no longer reported as a failed boot-file transfer. Any other
   client error now fails the transfer immediately instead of after four

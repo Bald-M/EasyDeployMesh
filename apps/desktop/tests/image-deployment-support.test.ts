@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import type { GhoImageCapability } from '../app/types/deployment'
 import {
   classifyImageDeploymentSupport,
   deploymentOperationForImageFormat
@@ -35,7 +36,7 @@ describe('image deployment support classification', () => {
   )
 
   it('classifies only a verified deployable GHO image as automatic', () => {
-    const capability = {
+    const capability: GhoImageCapability = {
       deployable: true,
       compression: 'high',
       expandedSizeBytes: 16_013_124_300,

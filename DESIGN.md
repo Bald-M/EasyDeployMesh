@@ -194,7 +194,17 @@ staged directory into `library/objects/<uuid>`.
 5. Job creation repeats deployment preflight while holding the mutation lock.
 6. Job claim repeats image validation again before issuing a lease. It also
    re-runs partition plan validation, so a job stored before a stricter rule
-   is not leased again and never reaches the Agent.
+   is not leased again and never reaches the Agent. Because a
+   full revalidation of a large image takes minutes and the Agent's claim
+   timeout is 15 seconds, the claim starts the revalidation in the background,
+   waits at most 5 seconds, and the job is leased on a later claim. A lease is
+   issued only from a passed revalidation that started after the job was
+   created and finished less than 30 minutes ago, and only while every image
+   file has the size and modification time it had both before and after that
+   revalidation. A failed revalidation is logged and retried after 2 minutes.
+   The GHO download is served from the same passed revalidation. Size and
+   modification time cannot detect a change that preserves both; step 7 is the
+   backstop.
 7. The Agent hashes the downloaded bytes before applying them.
 
 For native GHO, import and preflight run a full dry-run restore. It records
@@ -230,7 +240,7 @@ sequenceDiagram
     Host->>Jobs: enqueue single-target job
     Agent->>CP: authenticated heartbeat
     Agent->>CP: claim job
-    CP->>CP: revalidate image, partition plan and disk fingerprint
+    CP->>CP: match disk fingerprint and partition plan; use or start background image revalidation
     CP->>Jobs: issue expiring lease
     CP-->>Agent: lease + image + partition plan
     Agent->>Agent: re-read inventory and match disk
@@ -305,7 +315,8 @@ draft -> waiting -> running -> succeeded
 
 Windows Agent jobs are leased for two hours. Progress and control polling renew
 the lease. An expired running Windows lease may be claimed again, but only after
-current image and disk eligibility checks pass. Linux installer attempts are
+current image and disk eligibility checks pass; because a lease outlives the
+30-minute revalidation window, a re-claim always waits for a new revalidation. Linux installer attempts are
 not automatically reclaimed after destructive authorization. Image download requires both device
 authentication and a valid, unexpired lease for that job.
 
