@@ -201,7 +201,8 @@ staged directory into `library/objects/<uuid>`.
    issued only from a passed revalidation that started after the job was
    created and finished less than 30 minutes ago, and only while every image
    file has the size and modification time it had both before and after that
-   revalidation. A failed revalidation is logged and retried after 2 minutes.
+   revalidation. A failed revalidation is logged and retried after 2 minutes,
+   doubling the wait while it keeps failing, up to 30 minutes.
    The GHO download is served from the same passed revalidation. Size and
    modification time cannot detect a change that preserves both; step 7 is the
    backstop.
@@ -315,8 +316,8 @@ draft -> waiting -> running -> succeeded
 
 Windows Agent jobs are leased for two hours. Progress and control polling renew
 the lease. An expired running Windows lease may be claimed again, but only after
-current image and disk eligibility checks pass; because a lease outlives the
-30-minute revalidation window, a re-claim always waits for a new revalidation. Linux installer attempts are
+current image and disk eligibility checks pass; a re-claim normally waits for a
+new revalidation, because a lease outlives the 30-minute revalidation window. Linux installer attempts are
 not automatically reclaimed after destructive authorization. Image download requires both device
 authentication and a valid, unexpired lease for that job.
 
