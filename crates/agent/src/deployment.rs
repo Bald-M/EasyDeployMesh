@@ -1,3 +1,4 @@
+use easydeploymesh_bcd::LoaderIntegrityPolicy;
 #[cfg(target_os = "windows")]
 use easydeploymesh_core::WINPE_DRIVE_LETTER;
 use easydeploymesh_core::{
@@ -168,6 +169,7 @@ pub fn execute(
             45,
             "Applying the Windows image",
         )?;
+        let mut image_boot_policy = LoaderIntegrityPolicy::default();
         if lease.operation == Operation::DeployGho {
             let gho = lease
                 .gho
@@ -176,6 +178,9 @@ pub fn execute(
             await_running(&mut control_state)?;
             let grow_file_system =
                 restore_gho_partition(&layout.image_path, gho, &mut control_state, &mut local)?;
+            // The restored volume may carry its own boot store from the
+            // machine it was captured on; bcdboot below builds a new one.
+            image_boot_policy = read_image_boot_policy(Path::new(r"W:\Boot\BCD"));
             if grow_file_system {
                 // The restored NTFS keeps its original size; let Windows grow
                 // it to fill the target partition.
@@ -224,6 +229,18 @@ pub fn execute(
             ],
             &mut control_state,
         )?;
+        let policy_commands = boot_policy_commands(layout.firmware, image_boot_policy);
+        if !policy_commands.is_empty() {
+            progress(
+                DeploymentStage::ConfiguringBoot,
+                90,
+                "Keeping the image's boot policy: boot integrity checks disabled",
+            )?;
+            for arguments in policy_commands {
+                await_running(&mut control_state)?;
+                run_checked("bcdedit.exe", arguments, &mut control_state)?;
+            }
+        }
 
         progress(
             DeploymentStage::Finalizing,
@@ -243,6 +260,44 @@ pub fn execute(
         )?;
         Ok(())
     }
+}
+
+/// Reads the boot-integrity policy of a restored image's own boot store. A
+/// missing or unreadable store means there is nothing to carry over.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn read_image_boot_policy(path: &std::path::Path) -> LoaderIntegrityPolicy {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| easydeploymesh_bcd::windows_loader_integrity_policy(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// `bcdedit` arguments that re-apply the image's boot-integrity policy to the
+/// store bcdboot created on the system partition. Some repackaged Windows 7
+/// images ship a boot loader that the image's own Boot Manager only starts
+/// with integrity checks disabled, and record that in their original store.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn boot_policy_commands(firmware: &str, policy: LoaderIntegrityPolicy) -> Vec<Vec<String>> {
+    if !policy.disable_integrity_checks {
+        return Vec::new();
+    }
+    let store = if firmware == "UEFI" {
+        r"S:\EFI\Microsoft\Boot\BCD"
+    } else {
+        r"S:\Boot\BCD"
+    };
+    [
+        ["loadoptions", "DISABLE_INTEGRITY_CHECKS"],
+        ["nointegritychecks", "Yes"],
+    ]
+    .into_iter()
+    .map(|[name, value]| {
+        ["/store", store, "/set", "{default}", name, value]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    })
+    .collect()
 }
 
 fn matching_disk<'a>(lease: &AgentJobLease, disks: &'a [Disk]) -> Result<&'a Disk, Box<dyn Error>> {
@@ -1034,6 +1089,58 @@ mod tests {
         AgentDeploymentImage, AgentGhoDeployment, DeploymentTarget, PartitionPlan,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn image_boot_policy_is_reapplied_to_the_new_store_only_when_present() {
+        let disabled = LoaderIntegrityPolicy {
+            disable_integrity_checks: true,
+        };
+        assert!(boot_policy_commands("BIOS", LoaderIntegrityPolicy::default()).is_empty());
+        assert_eq!(
+            boot_policy_commands("BIOS", disabled),
+            vec![
+                vec![
+                    "/store",
+                    r"S:\Boot\BCD",
+                    "/set",
+                    "{default}",
+                    "loadoptions",
+                    "DISABLE_INTEGRITY_CHECKS"
+                ],
+                vec![
+                    "/store",
+                    r"S:\Boot\BCD",
+                    "/set",
+                    "{default}",
+                    "nointegritychecks",
+                    "Yes"
+                ],
+            ]
+        );
+        assert!(
+            boot_policy_commands("UEFI", disabled)
+                .iter()
+                .all(|arguments| arguments[1] == r"S:\EFI\Microsoft\Boot\BCD")
+        );
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_image_boot_store_carries_no_policy() {
+        let directory = std::env::temp_dir().join(format!("edm-bcd-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let missing = directory.join("missing");
+        assert_eq!(
+            read_image_boot_policy(&missing),
+            LoaderIntegrityPolicy::default()
+        );
+        let garbage = directory.join("BCD");
+        std::fs::write(&garbage, b"not a registry hive").unwrap();
+        assert_eq!(
+            read_image_boot_policy(&garbage),
+            LoaderIntegrityPolicy::default()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn lease(plan: PartitionPlan) -> AgentJobLease {
         AgentJobLease {
