@@ -1,6 +1,7 @@
 #[path = "installer_deployment.rs"]
 mod installer_deployment;
 
+use crate::deployment_validation::{self, DeploymentValidationCache, Validated};
 use crate::device_registry::{digest_secret, generate_secret, secret_matches};
 use crate::{
     ActivityRepository, DeviceRegistry, DeviceRegistryError, ImageLibrary, ImageLibraryError,
@@ -26,7 +27,7 @@ use installer_deployment::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     str::FromStr,
@@ -73,6 +74,7 @@ struct ApiState {
     activities: Arc<ActivityRepository>,
     installer: Arc<InstallerDeployment>,
     installer_base_url: String,
+    validations: Arc<DeploymentValidationCache>,
 }
 
 struct RunningServer {
@@ -155,6 +157,7 @@ impl ControlPlane {
                 Arc::clone(&self.images),
             )),
             installer_base_url: format!("http://{local_address}"),
+            validations: Arc::new(DeploymentValidationCache::default()),
         };
         let router = Router::new()
             .route("/health", get(health))
@@ -405,34 +408,41 @@ async fn claim_job(
                 && job.options.partition_plan.validate().is_ok()
         })
         .collect::<Vec<_>>();
-    let images = Arc::clone(&state.images);
-    let eligible_job_ids = tokio::task::spawn_blocking(move || {
-        let mut validation_results = HashMap::new();
-        candidates
-            .into_iter()
-            .filter_map(|job| {
-                let validation_key = (job.image_id, job.options.image_index, job.operation);
-                let eligible =
-                    *validation_results.entry(validation_key).or_insert_with(|| {
-                        match job.operation {
-                            Operation::DeployWim => images
-                                .revalidate_for_deployment(job.image_id, job.options.image_index)
-                                .is_ok(),
-                            Operation::DeployGho => images
-                                .prepare_gho_partition_deployment(
-                                    job.image_id,
-                                    job.options.image_index,
-                                )
-                                .is_ok(),
-                            Operation::CaptureGho | Operation::InstallLinux => false,
-                        }
-                    });
-                eligible.then_some(job.id)
-            })
-            .collect::<HashSet<_>>()
-    })
-    .await
-    .map_err(|error| ApiError::Conflict(format!("image validation task failed: {error}")))?;
+    // Image revalidation can take minutes for a large GHO, so it runs in the
+    // background and the job is leased on a later claim once it has passed.
+    let mut validated_jobs = HashMap::new();
+    for job in candidates {
+        match state
+            .validations
+            .status_for_claim(&state.images, &job, deployment_validation::CLAIM_WAIT)
+            .await
+        {
+            deployment_validation::Status::Passed(validated) => {
+                validated_jobs.insert(job.id, validated);
+            }
+            deployment_validation::Status::Running { started: true } => {
+                record_job_activity(
+                    &state,
+                    &job,
+                    "job_image_validating",
+                    ActivitySeverity::Info,
+                    None,
+                );
+            }
+            deployment_validation::Status::Running { started: false } => {}
+            deployment_validation::Status::Failed(reason) => {
+                if state.validations.report_failure_once(&job) {
+                    record_job_activity(
+                        &state,
+                        &job,
+                        "job_image_validation_failed",
+                        ActivitySeverity::Error,
+                        Some(reason),
+                    );
+                }
+            }
+        }
+    }
     let lease_result = state
         .registry
         .with_current(device_id, |current_device| {
@@ -440,7 +450,7 @@ async fn claim_job(
                 device_id,
                 chrono::Duration::minutes(JOB_LEASE_MINUTES),
                 |job| {
-                    eligible_job_ids.contains(&job.id)
+                    validated_jobs.contains_key(&job.id)
                         && matches!(job.operation, Operation::DeployWim | Operation::DeployGho)
                         && job.targets.len() == 1
                         && job.targets[0].device_id == device_id
@@ -476,13 +486,15 @@ async fn claim_job(
         "/api/v1/agents/{device_id}/jobs/{}/image?leaseId={lease_id}",
         job.id
     );
-    let (gho, download_size_bytes, download_sha256) = if job.operation == Operation::DeployGho {
-        let prepared = state
-            .images
-            .prepare_gho_partition_deployment(job.image_id, job.options.image_index)
-            .map_err(ApiError::Images)?;
-        let metadata =
-            AgentGhoDeployment {
+    let validated = validated_jobs
+        .get(&job.id)
+        .cloned()
+        .ok_or(ApiError::Conflict(
+            "leased job has no revalidated image".to_owned(),
+        ))?;
+    let (gho, download_size_bytes, download_sha256) =
+        if let Validated::Gho(prepared) = validated.as_ref() {
+            let metadata = AgentGhoDeployment {
                 source_partition: prepared.capability.source_partition.ok_or_else(|| {
                     ApiError::Conflict("GHO source partition is missing".to_owned())
                 })?,
@@ -490,7 +502,7 @@ async fn claim_job(
                     .capability
                     .expanded_size_bytes
                     .ok_or_else(|| ApiError::Conflict("GHO expanded size is missing".to_owned()))?,
-                expanded_sha256: prepared.capability.expanded_sha256.ok_or_else(|| {
+                expanded_sha256: prepared.capability.expanded_sha256.clone().ok_or_else(|| {
                     ApiError::Conflict("GHO expanded checksum is missing".to_owned())
                 })?,
                 volume_size_bytes: prepared
@@ -500,20 +512,20 @@ async fn claim_job(
                     .ok_or_else(|| ApiError::Conflict("GHO volume size is missing".to_owned()))?,
                 parser_version: prepared.capability.parser_version,
             };
-        (
-            Some(metadata),
-            prepared.download_size_bytes,
-            prepared.download_sha256,
-        )
-    } else {
-        (
-            None,
-            image.size_bytes,
-            image.sha256.clone().ok_or(ApiError::Conflict(
-                "deployment image has no checksum".to_owned(),
-            ))?,
-        )
-    };
+            (
+                Some(metadata),
+                prepared.download_size_bytes,
+                prepared.download_sha256.clone(),
+            )
+        } else {
+            (
+                None,
+                image.size_bytes,
+                image.sha256.clone().ok_or(ApiError::Conflict(
+                    "deployment image has no checksum".to_owned(),
+                ))?,
+            )
+        };
     Ok(Json(Some(AgentJobLease {
         job_id: job.id,
         lease_id,
@@ -656,15 +668,21 @@ async fn download_job_image(
         .ok_or(ApiError::NotFound)?;
     let (reader, length): (Box<dyn AsyncRead + Unpin + Send>, u64) =
         if job.operation == Operation::DeployGho {
-            let prepared = state
-                .images
-                .prepare_gho_partition_deployment(job.image_id, job.options.image_index)
-                .map_err(ApiError::Images)?;
+            // The lease was issued from this revalidation; refuse the download
+            // if the image files changed since.
+            let validated = state.validations.passed_for_lease(&job).ok_or_else(|| {
+                ApiError::Conflict("GHO image changed after the lease was issued".to_owned())
+            })?;
+            let Validated::Gho(prepared) = validated.as_ref() else {
+                return Err(ApiError::Conflict(
+                    "leased GHO job has no GHO revalidation".to_owned(),
+                ));
+            };
             let primary = tokio::fs::File::open(&prepared.image.primary.canonical_path)
                 .await
                 .map_err(|_| ApiError::NotFound)?;
             let mut reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(primary);
-            for span in prepared.image.spans {
+            for span in &prepared.image.spans {
                 let mut file = tokio::fs::File::open(&span.canonical_path)
                     .await
                     .map_err(|_| ApiError::NotFound)?;
@@ -1252,6 +1270,103 @@ mod tests {
             disks: vec![disk()],
             agent_version: "0.1.0".to_owned(),
         }
+    }
+
+    fn gho_job(
+        jobs: &JobRepository,
+        image_id: Uuid,
+        device_id: Uuid,
+    ) -> easydeploymesh_core::DeploymentJob {
+        jobs.create(CreateDeploymentJob {
+            name: "Ghost deployment".to_owned(),
+            operation: Operation::DeployGho,
+            image_id,
+            targets: vec![DeploymentTarget {
+                device_id,
+                target_disk_id: disk().id,
+                target_disk_model: disk().model,
+                target_disk_serial: disk().serial,
+                target_disk_size_bytes: disk().size_bytes,
+            }],
+            options: DeploymentOptions {
+                image_index: 1,
+                partition_plan: PartitionPlan::uefi_gpt(),
+                linux_install: None,
+            },
+        })
+        .expect("GHO job should create")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn claim_revalidation_runs_in_the_background_and_fails_closed() {
+        use deployment_validation::Status;
+        use std::time::{Duration, SystemTime};
+
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let jobs =
+            Arc::new(JobRepository::open(temp.path().join("jobs")).expect("jobs should open"));
+        let images =
+            Arc::new(ImageLibrary::open(temp.path().join("images")).expect("images should open"));
+        let source = temp.path().join("disk.gho");
+        std::fs::write(&source, easydeploymesh_gho::fixtures::image()).unwrap();
+        let image = images.import(&source).expect("GHO should import");
+        let job = gho_job(&jobs, image.id, Uuid::new_v4());
+        let cache = Arc::new(DeploymentValidationCache::default());
+        let wait = Duration::from_secs(30);
+
+        // A claim that cannot wait gets an answer at once and the
+        // revalidation continues in the background.
+        assert!(matches!(
+            cache.status_for_claim(&images, &job, Duration::ZERO).await,
+            Status::Running { started: true }
+        ));
+        assert!(cache.passed_for_lease(&job).is_none());
+        let Status::Passed(validated) = cache.status_for_claim(&images, &job, wait).await else {
+            panic!("revalidation should pass");
+        };
+        let Validated::Gho(prepared) = validated.as_ref() else {
+            panic!("a GHO job should get a GHO revalidation");
+        };
+        let managed = prepared.image.primary.canonical_path.clone();
+        assert!(cache.passed_for_lease(&job).is_some());
+        assert!(matches!(
+            cache.status_for_claim(&images, &job, Duration::ZERO).await,
+            Status::Passed(_)
+        ));
+
+        // A revalidation that started before a job was created is not reused
+        // for it.
+        let later = gho_job(&jobs, image.id, Uuid::new_v4());
+        assert!(matches!(
+            cache
+                .status_for_claim(&images, &later, Duration::ZERO)
+                .await,
+            Status::Running { started: true }
+        ));
+        assert!(matches!(
+            cache.status_for_claim(&images, &later, wait).await,
+            Status::Passed(_)
+        ));
+
+        // Changing the managed image invalidates the result, and the new
+        // revalidation fails because the content no longer matches.
+        let mut bytes = std::fs::read(&managed).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&managed, bytes).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&managed)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000))
+            .unwrap();
+        assert!(cache.passed_for_lease(&later).is_none());
+        let Status::Failed(_) = cache.status_for_claim(&images, &later, wait).await else {
+            panic!("a changed image should fail revalidation");
+        };
+        assert!(cache.report_failure_once(&later));
+        assert!(!cache.report_failure_once(&later));
+        assert!(cache.passed_for_lease(&later).is_none());
     }
 
     #[tokio::test]
