@@ -97,7 +97,7 @@ const summaries: Record<string, string> = {
   pxe_service_started: 'pxeStarted', pxe_service_stopped: 'pxeStopped', pxe_service_failed: 'pxeFailed',
   pxe_request_accepted: 'pxeAccepted', boot_file_sent: 'bootFileSent', tftp_failed: 'tftpFailed',
   device_registered: 'deviceRegistered', device_reconnected: 'deviceReconnected', device_offline: 'deviceOffline',
-  job_created: 'jobCreated', job_queued: 'jobQueued', job_started: 'jobStarted', job_stage_changed: 'jobStageChanged',
+  job_created: 'jobCreated', job_queued: 'jobQueued', job_started: 'jobStarted', job_image_validating: 'jobImageValidating', job_image_validation_failed: 'jobImageValidationFailed', job_stage_changed: 'jobStageChanged',
   job_paused: 'jobPaused', job_resumed: 'jobResumed', job_succeeded: 'jobSucceeded', job_failed: 'jobFailed', job_cancelled: 'jobCancelled'
 }
 

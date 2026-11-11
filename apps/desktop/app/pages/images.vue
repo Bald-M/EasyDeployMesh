@@ -29,7 +29,8 @@ const imageRows = computed(() => imageStore.images.map(image => ({
   deploymentSupport: classifyImageDeploymentSupport(
     image.format,
     image.verified,
-    image.installerCapability ?? null
+    image.installerCapability ?? null,
+    image.ghoCapability ?? null
   )
 })))
 
@@ -201,8 +202,6 @@ async function handleRemove(image: ImageArtifact) {
                   class="shrink-0"
                   :color="deploymentSupport === 'automatic'
                     ? 'success'
-                    : deploymentSupport === 'manual'
-                      ? 'info'
                     : deploymentSupport === 'verification-required'
                       ? 'neutral'
                       : 'warning'"
@@ -210,16 +209,12 @@ async function handleRemove(image: ImageArtifact) {
                   size="sm"
                   :title="$t(deploymentSupport === 'automatic'
                     ? 'images.automaticDeploymentHint'
-                    : deploymentSupport === 'manual'
-                      ? 'images.manualDeploymentHint'
                     : deploymentSupport === 'verification-required'
                       ? 'images.verificationRequiredHint'
                       : 'images.catalogOnlyHint')"
                 >
                   {{ $t(deploymentSupport === 'automatic'
                     ? 'images.automaticDeployment'
-                    : deploymentSupport === 'manual'
-                      ? 'images.manualDeployment'
                     : deploymentSupport === 'verification-required'
                       ? 'images.verificationRequired'
                       : 'images.catalogOnly') }}
@@ -364,7 +359,7 @@ async function handleRemove(image: ImageArtifact) {
 
           <div v-if="readinessImage?.ghoCapability" class="rounded-xl border border-default p-4">
             <dl class="grid gap-3 text-xs md:grid-cols-2">
-              <div><dt class="font-medium text-muted">{{ $t('common.status') }}</dt><dd class="mt-1">{{ readinessImage.ghoCapability.deployable ? $t('images.manualDeployment') : ghoBlockedReason(readinessImage.ghoCapability.blockedReason) }}</dd></div>
+              <div><dt class="font-medium text-muted">{{ $t('common.status') }}</dt><dd class="mt-1">{{ readinessImage.ghoCapability.deployable ? $t('images.automaticDeployment') : ghoBlockedReason(readinessImage.ghoCapability.blockedReason) }}</dd></div>
               <div v-if="readinessImage.ghoCapability.compression"><dt class="font-medium text-muted">{{ $t('images.ghoReadiness.compression') }}</dt><dd class="mt-1">{{ readinessImage.ghoCapability.compression.toUpperCase() }}</dd></div>
               <div v-if="readinessImage.ghoCapability.volumeSizeBytes">
                 <dt class="font-medium text-muted">{{ $t('images.ghoReadiness.volumeSize') }}</dt>
