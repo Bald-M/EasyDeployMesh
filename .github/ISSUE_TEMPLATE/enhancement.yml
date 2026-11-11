@@ -1,14 +1,26 @@
 name: Enhancement
 description: 新功能、体验优化或技术改进 / New feature, UX improvement, or technical change
-title: "[Enhancement][P?]"
+title: "[Enhancement]"
 labels: [enhancement]
 body:
   - type: markdown
     attributes:
       value: |
-        标题写「要达成什么」，并把 `[P?]` 换成 P0–P3（数字越小越紧急），优先级标签会自动同步；不确定时保留 `[P?]`，由维护者分诊。较大的功能或架构改动请先在 issue 中讨论方案再实现。
+        标题写「要达成什么」，不用写优先级前缀：在下方选择优先级，提交后会自动写入标题并添加标签。较大的功能或架构改动请先在 issue 中讨论方案再实现。
 
-        Title: describe the outcome, and replace `[P?]` with P0–P3 (lower is more urgent). Keep `[P?]` if unsure. Discuss substantial features or architectural changes here before implementing them.
+        Title: describe the outcome. Pick a priority below instead of typing one; it is added to the title and labels automatically. Discuss substantial features or architectural changes here before implementing them.
+  - type: dropdown
+    id: priority
+    attributes:
+      label: 优先级 / Priority
+      description: 提交后会自动写入标题并添加对应标签。 / Added to the title and labels automatically after submission.
+      options:
+        - P0 紧急：误写磁盘、数据丢失或安全问题 / Urgent: wrong-disk writes, data loss, or security
+        - P1 高：核心流程受损 / High: a core flow is broken
+        - P2 中：有绕过方式或影响有限 / Medium: workaround exists or limited impact
+        - P3 低：体验优化或技术债 / Low: polish or technical debt
+    validations:
+      required: true
   - type: textarea
     id: background
     attributes:

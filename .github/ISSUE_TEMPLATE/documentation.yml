@@ -1,14 +1,26 @@
 name: Documentation
 description: 文档缺失、过时或有误 / Missing, outdated, or incorrect documentation
-title: "[Documentation][P?]"
+title: "[Documentation]"
 labels: [documentation]
 body:
   - type: markdown
     attributes:
       value: |
-        标题写「哪份文档的什么问题」，并把 `[P?]` 换成 P0–P3（数字越小越紧急），优先级标签会自动同步；不确定时保留 `[P?]`，由维护者分诊。
+        标题写「哪份文档的什么问题」，不用写优先级前缀：在下方选择优先级，提交后会自动写入标题并添加标签。
 
-        Title: name the document and the problem, and replace `[P?]` with P0–P3 (lower is more urgent). Keep `[P?]` if unsure.
+        Title: name the document and the problem. Pick a priority below instead of typing one; it is added to the title and labels automatically.
+  - type: dropdown
+    id: priority
+    attributes:
+      label: 优先级 / Priority
+      description: 提交后会自动写入标题并添加对应标签。 / Added to the title and labels automatically after submission.
+      options:
+        - P0 紧急：误写磁盘、数据丢失或安全问题 / Urgent: wrong-disk writes, data loss, or security
+        - P1 高：核心流程受损 / High: a core flow is broken
+        - P2 中：有绕过方式或影响有限 / Medium: workaround exists or limited impact
+        - P3 低：体验优化或技术债 / Low: polish or technical debt
+    validations:
+      required: true
   - type: textarea
     id: location
     attributes:
