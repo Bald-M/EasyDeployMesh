@@ -22,7 +22,7 @@
     "generate": "pnpm --filter @easydeploymesh/desktop generate",
     "typecheck": "pnpm --filter @easydeploymesh/desktop typecheck",
     "test": "pnpm test:diagnostics && pnpm --filter @easydeploymesh/desktop test && cargo test --workspace",
-    "test:diagnostics": "node --test scripts/analyze-winpe-runtime.test.mjs scripts/desktop-targets.test.mjs scripts/stage-wimlib.test.mjs scripts/winpe-diagnostics.test.mjs",
+    "test:diagnostics": "node --test scripts/analyze-winpe-runtime.test.mjs scripts/desktop-targets.test.mjs scripts/generate-agent-brand-icon.test.mjs scripts/stage-wimlib.test.mjs scripts/winpe-diagnostics.test.mjs",
     "assets:update:ipxe": "node scripts/update-ipxe-assets.mjs",
     "test:rust": "cargo test --workspace",
     "check": "pnpm typecheck && pnpm test && pnpm generate"

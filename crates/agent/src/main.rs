@@ -24,6 +24,8 @@ use sysinfo::{Disks, System};
 
 mod deployment;
 #[cfg(any(target_os = "windows", test))]
+mod progress_view;
+#[cfg(any(target_os = "windows", test))]
 mod windows_inventory;
 #[cfg(target_os = "windows")]
 mod winpe_progress;
@@ -74,7 +76,12 @@ struct ControlHealth {
     _version: String,
 }
 
+#[cfg(target_os = "windows")]
+const AGENT_LOG_FILE: &str = "easydeploymesh-agent.log";
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// How long the WinPE success screen counts down before restarting unattended.
+#[cfg(target_os = "windows")]
+const SUCCESS_REBOOT_DELAY: Duration = Duration::from_secs(10);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 struct RetryBackoff {
@@ -165,7 +172,7 @@ fn run_shell_launcher() -> Result<(), Box<dyn Error>> {
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(directory.join("easydeploymesh-agent.log"))?;
+        .open(directory.join(AGENT_LOG_FILE))?;
     let original_shell = directory.join("easydeploymesh-original-shell.cmd");
     let has_original_shell = original_shell.is_file();
     let network_stdout = log.try_clone()?;
@@ -618,13 +625,26 @@ fn execute_lease(
 ) -> Result<(), Box<dyn Error>> {
     println!("Claimed deployment job {}", lease.job_id);
     #[cfg(target_os = "windows")]
-    let progress_window = winpe_progress::ProgressWindow::open();
+    let progress_window = {
+        let window = winpe_progress::ProgressWindow::open();
+        window.begin_job(progress_view::JobInfo::for_lease(
+            lease,
+            server,
+            hostname::get()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            agent_log_path(),
+        ));
+        window
+    };
     let progress = |stage: DeploymentStage,
                     progress_percent: u8,
                     message: &str|
      -> Result<(), Box<dyn Error>> {
+        // Update the screen before reporting, so it records the disk as possibly
+        // modified even if the report itself fails.
         #[cfg(target_os = "windows")]
-        progress_window.update(progress_percent, message);
+        progress_window.stage(stage, progress_percent);
         client
             .post(format!(
                 "{server}/api/v1/agents/{}/jobs/{}/progress",
@@ -654,6 +674,10 @@ fn execute_lease(
             .error_for_status()?
             .json()?)
     };
+    let local_progress = |_event: deployment::LocalProgress| {
+        #[cfg(target_os = "windows")]
+        progress_window.local(&_event);
+    };
     let result = collect_inventory().and_then(|inventory| {
         deployment::execute(
             lease,
@@ -663,6 +687,7 @@ fn execute_lease(
             client,
             progress,
             control_state,
+            local_progress,
         )
     });
     let completion = AgentJobCompletion {
@@ -670,6 +695,11 @@ fn execute_lease(
         succeeded: result.is_ok(),
         error_message: result.as_ref().err().map(ToString::to_string),
     };
+    // Show the failure while the completion report is still being retried.
+    #[cfg(target_os = "windows")]
+    if let Err(error) = &result {
+        progress_window.failed(&error.to_string());
+    }
     let mut completion_backoff = RetryBackoff::new();
     loop {
         let response = client
@@ -699,7 +729,7 @@ fn execute_lease(
     println!("{}", job_completion_marker(result.is_ok()));
     if let Err(error) = result {
         #[cfg(target_os = "windows")]
-        progress_window.failed(&error.to_string());
+        progress_window.failure_reported();
         eprintln!(
             "Deployment job {} failed and was reported to EasyDeployMesh: {error}; continuing agent loop",
             lease.job_id
@@ -707,15 +737,24 @@ fn execute_lease(
         return Ok(());
     }
     #[cfg(target_os = "windows")]
-    progress_window.update(100, "Deployment complete; rebooting");
-    #[cfg(target_os = "windows")]
     {
-        let status = Command::new("wpeutil.exe").arg("reboot").status()?;
-        if !status.success() {
-            return Err(format!("wpeutil reboot failed: {status}").into());
-        }
+        let action = progress_window.succeeded(SUCCESS_REBOOT_DELAY);
+        winpe_progress::run_power_action(action)?;
     }
     Ok(())
+}
+
+/// Log written by the WinPE shell launcher next to the Agent executable.
+#[cfg(target_os = "windows")]
+fn agent_log_path() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.parent()
+                .map(|directory| directory.join(AGENT_LOG_FILE))
+        })
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| AGENT_LOG_FILE.to_owned())
 }
 
 fn job_completion_marker(succeeded: bool) -> &'static str {

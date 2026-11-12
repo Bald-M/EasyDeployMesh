@@ -18,6 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   downloaded ISO and report a uniquely matching disk serial, model, and size
   before the control plane releases destructive autoinstall storage.
 
+### Changed
+
+- The WinPE deployment progress window is now a full-screen panel with three
+  states. While deploying it shows the step, percent, bytes, speed, elapsed
+  and remaining time, image, and target. On success it shows a summary and
+  restarts after a 10-second countdown, with Shut down / Restart now buttons.
+  On failure it shows the failed step, reason, error code, and log path, and
+  whether the disk was left untouched or was partly written. Text is Chinese
+  when the WinPE media has a CJK font and English otherwise. The reported
+  progress and deployment flow are unchanged.
+
 ### Fixed
 
 - Device, job, image, activity, PXE configuration, DHCP lease, and WinPE

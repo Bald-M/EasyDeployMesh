@@ -37,8 +37,47 @@ struct PreparedLayout {
     firmware: &'static str,
     disk_number: u32,
     windows_partition: u32,
+    windows_partition_bytes: u64,
+    windows_file_system: Option<PartitionFileSystem>,
 }
 
+/// Which local byte counter a [`LocalProgress::Transfer`] describes.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferPhase {
+    Download,
+    Verify,
+    Restore,
+}
+
+/// Where the Windows partition will be written, for display only.
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetLayout {
+    pub disk_number: u32,
+    pub disk_model: String,
+    pub windows_partition: u32,
+    pub windows_partition_bytes: u64,
+    pub file_system: Option<PartitionFileSystem>,
+}
+
+/// Progress that only drives the on-screen window. It is never sent to the
+/// control service, so the reported stages and percentages stay unchanged.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalProgress {
+    /// The validated partition layout, emitted before any disk is touched.
+    Layout(TargetLayout),
+    /// Emitted immediately before the first command that writes to the disk.
+    DiskWriteStarting,
+    Transfer {
+        phase: TransferPhase,
+        done: u64,
+        total: u64,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn execute(
     lease: &AgentJobLease,
     inventory_disks: &[Disk],
@@ -47,6 +86,7 @@ pub fn execute(
     client: &Client,
     mut progress: impl FnMut(DeploymentStage, u8, &str) -> Result<(), Box<dyn Error>>,
     #[allow(unused_mut)] mut control_state: impl FnMut() -> Result<JobState, Box<dyn Error>>,
+    mut local: impl FnMut(LocalProgress),
 ) -> Result<(), Box<dyn Error>> {
     if !matches!(
         (lease.operation, lease.image.format),
@@ -65,6 +105,13 @@ pub fn execute(
     )?;
     let disk = matching_disk(lease, inventory_disks)?;
     let layout = prepare_layout(lease, disk)?;
+    local(LocalProgress::Layout(TargetLayout {
+        disk_number: layout.disk_number,
+        disk_model: disk.model.clone(),
+        windows_partition: layout.windows_partition,
+        windows_partition_bytes: layout.windows_partition_bytes,
+        file_system: layout.windows_file_system,
+    }));
 
     #[cfg(not(target_os = "windows"))]
     {
@@ -88,6 +135,7 @@ pub fn execute(
             "Partitioning the selected disk",
         )?;
         await_running(&mut control_state)?;
+        local(LocalProgress::DiskWriteStarting);
         run_checked(
             "diskpart.exe",
             [OsStr::new("/s"), prepare_script.as_os_str()],
@@ -106,8 +154,14 @@ pub fn execute(
             client,
             &layout.image_path,
             &mut control_state,
+            &mut local,
         )?;
-        verify_image(&layout.image_path, &lease.image.sha256, &mut control_state)?;
+        verify_image(
+            &layout.image_path,
+            &lease.image.sha256,
+            &mut control_state,
+            &mut local,
+        )?;
 
         progress(
             DeploymentStage::ApplyingImage,
@@ -120,7 +174,7 @@ pub fn execute(
                 .as_ref()
                 .ok_or("GHO deployment metadata is missing")?;
             await_running(&mut control_state)?;
-            restore_gho_partition(&layout.image_path, gho, &mut control_state)?;
+            restore_gho_partition(&layout.image_path, gho, &mut control_state, &mut local)?;
         } else {
             let mut image_argument = OsString::from("/ImageFile:");
             image_argument.push(layout.image_path.as_os_str());
@@ -273,10 +327,17 @@ fn prepare_layout(lease: &AgentJobLease, disk: &Disk) -> Result<PreparedLayout, 
         }
     );
     let mut windows_partition = 0_u32;
+    let mut windows_partition_bytes = 0_u64;
+    let mut windows_file_system = None;
     let mut created_extended_partition = false;
     for (index, partition) in lease.partition_plan.partitions.iter().enumerate() {
         if partition.role == PartitionRole::Windows {
             windows_partition = u32::try_from(index + 1)?;
+            windows_partition_bytes = partition
+                .size_mib
+                .unwrap_or(remaining_mib)
+                .saturating_mul(MIB_BYTES);
+            windows_file_system = partition.file_system;
         }
         let partition_kind = if use_mbr_extended_partition && partition.role == PartitionRole::Data
         {
@@ -372,6 +433,8 @@ fn prepare_layout(lease: &AgentJobLease, disk: &Disk) -> Result<PreparedLayout, 
         },
         disk_number,
         windows_partition,
+        windows_partition_bytes,
+        windows_file_system,
     })
 }
 
@@ -385,6 +448,49 @@ fn physical_drive_number(id: &str) -> Result<u32, Box<dyn Error>> {
     Ok(digits.parse()?)
 }
 
+/// Throttles local byte counters so the progress window repaints a few times a
+/// second at most, while always reporting the first and final values.
+#[cfg(target_os = "windows")]
+struct TransferReporter<'a> {
+    local: &'a mut dyn FnMut(LocalProgress),
+    phase: TransferPhase,
+    total: u64,
+    last_report: Option<std::time::Instant>,
+}
+
+#[cfg(target_os = "windows")]
+impl<'a> TransferReporter<'a> {
+    const INTERVAL: Duration = Duration::from_millis(250);
+
+    fn new(local: &'a mut dyn FnMut(LocalProgress), phase: TransferPhase, total: u64) -> Self {
+        let mut reporter = Self {
+            local,
+            phase,
+            total,
+            last_report: None,
+        };
+        reporter.report(0, true);
+        reporter
+    }
+
+    fn report(&mut self, done: u64, force: bool) {
+        let now = std::time::Instant::now();
+        if !force
+            && self
+                .last_report
+                .is_some_and(|last| now.duration_since(last) < Self::INTERVAL)
+        {
+            return;
+        }
+        self.last_report = Some(now);
+        (self.local)(LocalProgress::Transfer {
+            phase: self.phase,
+            done,
+            total: self.total,
+        });
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn download_image(
     lease: &AgentJobLease,
@@ -393,6 +499,7 @@ fn download_image(
     client: &Client,
     destination: &Path,
     control_state: &mut impl FnMut() -> Result<JobState, Box<dyn Error>>,
+    local: &mut dyn FnMut(LocalProgress),
 ) -> Result<(), Box<dyn Error>> {
     download_file(
         &lease.image.download_url,
@@ -401,6 +508,7 @@ fn download_image(
         client,
         destination,
         control_state,
+        TransferReporter::new(local, TransferPhase::Download, lease.image.size_bytes),
     )
 }
 
@@ -412,6 +520,7 @@ fn download_file(
     client: &Client,
     destination: &Path,
     control_state: &mut impl FnMut() -> Result<JobState, Box<dyn Error>>,
+    mut reporter: TransferReporter<'_>,
 ) -> Result<(), Box<dyn Error>> {
     let parent = destination
         .parent()
@@ -429,6 +538,7 @@ fn download_file(
         .error_for_status()?;
     let mut output = File::create(destination)?;
     let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut downloaded = 0_u64;
     loop {
         await_running(control_state)?;
         let read = response.read(&mut buffer)?;
@@ -436,8 +546,11 @@ fn download_file(
             break;
         }
         output.write_all(&buffer[..read])?;
+        downloaded = downloaded.saturating_add(read as u64);
+        reporter.report(downloaded, false);
     }
     output.flush()?;
+    reporter.report(downloaded, true);
     Ok(())
 }
 
@@ -446,10 +559,18 @@ fn verify_image(
     path: &Path,
     expected_sha256: &str,
     control_state: &mut impl FnMut() -> Result<JobState, Box<dyn Error>>,
+    local: &mut dyn FnMut(LocalProgress),
 ) -> Result<(), Box<dyn Error>> {
     let mut file = File::open(path)?;
+    let mut reporter = TransferReporter::new(
+        local,
+        TransferPhase::Verify,
+        // Display only: an unreadable size must not fail the job.
+        file.metadata().map_or(0, |metadata| metadata.len()),
+    );
     let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut verified = 0_u64;
     loop {
         await_running(control_state)?;
         let read = file.read(&mut buffer)?;
@@ -457,7 +578,10 @@ fn verify_image(
             break;
         }
         digest.update(&buffer[..read]);
+        verified = verified.saturating_add(read as u64);
+        reporter.report(verified, false);
     }
+    reporter.report(verified, true);
     let actual = format!("{:x}", digest.finalize());
     if !actual.eq_ignore_ascii_case(expected_sha256) {
         return Err("downloaded image checksum does not match the approved image".into());
@@ -471,6 +595,7 @@ struct DigestWriter<'a, W, C> {
     digest: Sha256,
     written: u64,
     control_state: &'a mut C,
+    reporter: TransferReporter<'a>,
 }
 
 #[cfg(target_os = "windows")]
@@ -483,6 +608,7 @@ where
         let count = self.inner.write(bytes)?;
         self.digest.update(&bytes[..count]);
         self.written = self.written.saturating_add(count as u64);
+        self.reporter.report(self.written, false);
         Ok(count)
     }
 
@@ -496,6 +622,7 @@ fn restore_gho_partition(
     image_path: &Path,
     metadata: &easydeploymesh_core::AgentGhoDeployment,
     control_state: &mut impl FnMut() -> Result<JobState, Box<dyn Error>>,
+    local: &mut dyn FnMut(LocalProgress),
 ) -> Result<(), Box<dyn Error>> {
     use std::fs::OpenOptions;
 
@@ -510,6 +637,11 @@ fn restore_gho_partition(
         digest: Sha256::new(),
         written: 0,
         control_state,
+        reporter: TransferReporter::new(
+            local,
+            TransferPhase::Restore,
+            metadata.expanded_size_bytes,
+        ),
     };
     let (_, decoded) = easydeploymesh_gho::decode_partition(
         &mut image,
@@ -519,6 +651,7 @@ fn restore_gho_partition(
     )?;
     output.flush()?;
     output.inner.sync_all()?;
+    output.reporter.report(output.written, true);
     let actual_sha256 = format!("{:x}", output.digest.finalize());
     if decoded != metadata.expanded_size_bytes || output.written != metadata.expanded_size_bytes {
         return Err(format!(
