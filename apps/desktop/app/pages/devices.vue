@@ -948,7 +948,7 @@ onBeforeUnmount(() => {
         <div class="-mx-6 -my-5 divide-y divide-default">
           <article v-for="client in deviceStore.pendingPxeClients" :key="client.macAddress" class="grid grid-cols-4 items-center gap-5 px-6 py-4">
             <div><p class="font-mono text-sm font-semibold">{{ client.macAddress }}</p><p class="mt-1 text-xs text-dimmed">{{ client.ipAddress || '—' }}</p></div>
-            <UBadge color="warning" variant="subtle">{{ $t(`devices.pxeStages.${client.stage}`) }}</UBadge>
+            <UBadge class="shrink-0 whitespace-nowrap" color="warning" variant="subtle">{{ $t(`devices.pxeStages.${client.stage}`) }}</UBadge>
             <p class="text-sm">{{ $t(`devices.architectures.${client.architecture}`) }}</p>
             <p class="text-right text-xs text-muted">{{ formatLastSeen(client.lastSeenAt) }}</p>
           </article>
@@ -1020,7 +1020,7 @@ onBeforeUnmount(() => {
                 :disabled="!eligibleDevices.length"
                 size="sm"
               />
-              <UBadge color="primary" variant="subtle">
+              <UBadge class="shrink-0 whitespace-nowrap" color="primary" variant="subtle">
                 {{ $t('devices.selectedOfDeployable', {
                   selected: selectedDeviceCount,
                   total: eligibleDevices.length
@@ -1035,6 +1035,7 @@ onBeforeUnmount(() => {
                 @click="clearDeviceSelection"
               />
               <UBadge
+                class="shrink-0 whitespace-nowrap"
                 :color="runtimeStore.controlStatus.state === 'running' ? 'success' : 'neutral'"
                 variant="subtle"
               >
@@ -1073,11 +1074,12 @@ onBeforeUnmount(() => {
               </div>
               <div class="min-w-0">
                 <div class="flex items-center gap-2">
-                  <p class="truncate text-sm font-semibold">
+                  <p class="min-w-0 truncate text-sm font-semibold">
                     {{ displayName(entry) }}
                   </p>
                   <UTooltip :text="$t(`devices.statusHints.${operationalStatus(entry)}`)">
                     <UBadge
+                      class="shrink-0 whitespace-nowrap"
                       :color="statusColor(operationalStatus(entry))"
                       variant="subtle"
                       size="sm"
@@ -1319,7 +1321,7 @@ onBeforeUnmount(() => {
                 <p class="font-medium">{{ batchTargetsTitle }}</p>
                 <p class="mt-1 text-xs text-muted">{{ batchDiskHint }}</p>
               </div>
-              <UBadge color="primary" variant="subtle">
+              <UBadge class="shrink-0 whitespace-nowrap" color="primary" variant="subtle">
                 {{ batchTargetCountLabel }}
               </UBadge>
             </div>
@@ -1390,7 +1392,7 @@ onBeforeUnmount(() => {
                     {{ group.plan.table.toUpperCase() }} · {{ bootModeSummary(group.bootModes) }}
                   </p>
                 </div>
-                <UBadge color="warning" variant="subtle">{{ $t('devices.erasesDisk') }}</UBadge>
+                <UBadge class="shrink-0 whitespace-nowrap" color="warning" variant="subtle">{{ $t('devices.erasesDisk') }}</UBadge>
               </div>
               <div class="divide-y divide-default">
                 <div v-for="(partition, partitionIndex) in group.plan.partitions" :key="`${partition.role}-${partitionIndex}`" class="flex items-center justify-between gap-4 px-4 py-3 text-sm">
@@ -1429,7 +1431,7 @@ onBeforeUnmount(() => {
                 <h3 class="text-sm font-semibold">{{ $t('devices.linuxInstall.confirmationTitle') }}</h3>
                 <p class="mt-1 text-xs text-muted">{{ $t('devices.linuxInstall.confirmationHint') }}</p>
               </div>
-              <UBadge color="warning" variant="subtle">{{ $t('devices.erasesDisk') }}</UBadge>
+              <UBadge class="shrink-0 whitespace-nowrap" color="warning" variant="subtle">{{ $t('devices.erasesDisk') }}</UBadge>
             </div>
             <dl class="mt-4 grid gap-3 text-xs md:grid-cols-2">
               <div>
@@ -1495,7 +1497,7 @@ onBeforeUnmount(() => {
                 <UIcon name="i-lucide-hard-drive" class="size-4 text-primary" />
                 <p class="text-sm font-semibold">{{ $t('devices.detectedDisks') }}</p>
               </div>
-              <UBadge color="neutral" variant="subtle">
+              <UBadge class="shrink-0 whitespace-nowrap" color="neutral" variant="subtle">
                 {{ $t('devices.targetDeviceCount', { count: templateTargetDiskGroups.length }) }}
               </UBadge>
             </div>
@@ -1589,7 +1591,7 @@ onBeforeUnmount(() => {
           <div>
             <div class="mb-2 flex items-center justify-between">
               <p class="flex items-center gap-2 text-sm font-semibold"><UIcon name="i-lucide-hard-drive" class="size-4 text-primary" />{{ $t('devices.diskDetails') }}</p>
-              <UBadge color="neutral" variant="subtle">{{ $t('devices.diskCount', { count: hardwareTarget.device.disks.length }) }}</UBadge>
+              <UBadge class="shrink-0 whitespace-nowrap" color="neutral" variant="subtle">{{ $t('devices.diskCount', { count: hardwareTarget.device.disks.length }) }}</UBadge>
             </div>
             <div v-if="hardwareTarget.device.disks.length" class="divide-y divide-default overflow-hidden rounded-xl border border-default">
               <div v-for="disk in hardwareTarget.device.disks" :key="disk.id" class="flex items-center justify-between gap-4 p-3">
