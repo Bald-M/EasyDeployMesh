@@ -11,11 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Restored native GHO deployment as a preview. `crates/gho` now parses Ghost's
   real file-level NTFS stream and rebuilds the volume at its original cluster
-  layout. It regenerates `$MFTMirr` and the backup boot sector and patches
+  layout. It rebuilds the cluster bitmap (`$Bitmap`), which Ghost leaves
+  out of the image, and regenerates `$MFTMirr` and the backup boot sector and patches
   hidden sectors. The Agent then extends the file system to fill the target
   partition. Only zlib-compressed Ghost 11.x single-partition NTFS images are
   accepted. Capabilities now record the minimum target volume size, and parser
-  version 4 forces earlier GHO verifications to be repeated.
+  version 5 forces earlier GHO verifications to be repeated and refuses leases
+  to Agents built with an earlier restorer.
 - After a GHO restore, the Agent reads every written region back from the
   locked target volume and fails the job unless it matches a SHA-256 of the
   bytes it wrote.
