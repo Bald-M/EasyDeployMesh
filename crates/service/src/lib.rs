@@ -5,6 +5,7 @@ use if_addrs::IfAddr;
 use serde::Serialize;
 
 mod activity_repository;
+mod atomic_file;
 mod control_plane;
 mod device_registry;
 mod image_library;
@@ -15,6 +16,7 @@ mod pxe;
 mod wimlib;
 
 pub use activity_repository::{ActivityQuery, ActivityRepository, ActivityRepositoryError};
+pub use atomic_file::write_file_atomic;
 pub use control_plane::{ControlPlane, ControlPlaneError};
 pub use device_registry::{DEVICE_VERIFICATION_WINDOW, DeviceRegistry, DeviceRegistryError};
 pub use image_library::{

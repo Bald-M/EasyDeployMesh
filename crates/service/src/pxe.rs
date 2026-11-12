@@ -2461,6 +2461,7 @@ mod tests {
     }
 }
 use crate::ActivityRepository;
+use crate::atomic_file::write_file_atomic;
 #[cfg(all(target_os = "macos", not(test)))]
 use crate::wimlib;
 use axum::{
@@ -5690,10 +5691,7 @@ async fn persist_leases(
         fs::create_dir_all(parent)?
     }
     let bytes = serde_json::to_vec_pretty(&*leases.read().await).map_err(std::io::Error::other)?;
-    let temp = path.with_extension("json.tmp");
-    fs::write(&temp, bytes)?;
-    fs::rename(temp, path)?;
-    Ok(())
+    write_file_atomic(path, &bytes)
 }
 
 fn build_dhcp_reply(

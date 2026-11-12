@@ -451,8 +451,17 @@ All durable state lives below Tauri's platform application-data directory:
 
 Repository manifests carry a schema version. Most mutations clone in-memory
 state, validate and persist the proposed state, then replace the in-memory copy.
-Activity and PXE configuration writes use temporary-file replacement. Image and
-boot-package imports use staged directories so incomplete copies do not become
+Every JSON manifest (`activities.json`, `devices.json`, `jobs.json`,
+`images.json`, `pxe-config.json`, `pxe-leases.json`) is written through
+`write_file_atomic`: a uniquely named temporary file in the same directory is
+flushed with `sync_all`, renamed over the destination, and the directory is
+synced on Unix, so a crash leaves either the previous or the new complete file.
+If an authoritative manifest (`devices.json`, `jobs.json`, `images.json`,
+`pxe-config.json`) still fails to parse, loading fails closed and leaves the
+file untouched for manual recovery instead of replacing it with an empty state.
+Activity history and DHCP leases are disposable and start empty when invalid.
+The served WinPE bootstrap file is written the same way. Image and boot-package
+imports use staged directories so incomplete copies do not become
 authoritative.
 
 Activity history retains at most 10,000 events and 30 days. Device, image, and
