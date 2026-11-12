@@ -214,7 +214,12 @@ sectors plus the backup boot sector). Job creation binds the source partition.
 The restored volume size must fit the planned Windows volume. The Agent
 checks the parser version and the real partition length before writing. It
 locks, dismounts, and enables extended DASD I/O on `W:`. It recomputes the
-stream size and SHA-256 while writing, then runs `extend filesystem` if the
+stream size and SHA-256 while writing. Restore writes never overlap, so the
+Agent records each written region and a SHA-256 of the written bytes; after
+flushing, it reads every region back through the same still-locked, buffered
+volume handle and fails the job on any difference. This proves what the
+volume stack returns at those offsets; it is not a media-level read that
+bypasses the cache. It then runs `extend filesystem` if the
 partition is larger than the source volume. BCDBoot then creates a new boot
 store on `S:`. If the restored volume's own `\Boot\BCD` default entry is the
 standard `winload.exe` loader and disables boot integrity checks

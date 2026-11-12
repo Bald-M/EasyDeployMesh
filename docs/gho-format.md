@@ -132,3 +132,11 @@ configures boot with BCDBoot, which needs Windows Vista or later.
 The service runs the same algorithm as a dry run at import and before every
 lease. That run records the logical stream's size and SHA-256 and the minimum
 volume size. The Agent recomputes those values while it writes.
+
+Restore writes are disjoint: each run is reserved before it is written,
+`$MFTMirr` is reserved the same way, and the backup boot sector lies past the
+last cluster. The restorer therefore records the written regions in write
+order with a SHA-256 of the written bytes. After flushing, the Agent reads
+those regions back through the same buffered volume handle and requires the
+same digest. This checks what the volume stack returns, not the physical
+media, and not Ghost's own image CRC, whose algorithm is still unidentified.
