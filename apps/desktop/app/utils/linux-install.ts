@@ -48,7 +48,7 @@ export interface LinuxDeploymentTargetSelection {
 export function defaultLinuxTargetDisk(disks: readonly Disk[]): Disk | null {
   if (disks.length !== 1) return null
   const disk = disks[0]
-  return disk?.serial?.trim() ? disk : null
+  return disk && !disk.isSystem && disk.serial?.trim() ? disk : null
 }
 
 function installerAssetIsValid(asset: InstallerBootAsset) {

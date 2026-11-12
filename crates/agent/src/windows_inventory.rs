@@ -239,12 +239,20 @@ $result | ConvertTo-Json -Depth 6 -Compress
 #[cfg(target_os = "windows")]
 pub(crate) fn collect_disks() -> Result<Vec<Disk>, Box<dyn Error>> {
     let numbers = enumerate_disk_numbers()?;
-    let system_disks = system_disk_numbers().unwrap_or_default();
+    let system_drive = std::env::var("SystemDrive").ok();
+    let probe = system_disk_numbers().map_err(|error| error.to_string());
+    if let Err(error) = &probe {
+        eprintln!("System disk detection failed: {error}");
+    }
+    let system_disks = classify_system_disks(system_drive.as_deref(), probe);
+    if system_disks == SystemDiskSet::Unknown {
+        eprintln!("Marking every disk as a system disk because the system disk is unknown");
+    }
     let mut disks = Vec::with_capacity(numbers.len());
     let mut last_error = None;
 
     for number in numbers {
-        match read_disk(number, system_disks.contains(&number)) {
+        match read_disk(number, system_disks.contains(number)) {
             Ok(disk) => disks.push(disk),
             Err(error) => {
                 eprintln!("Skipping PhysicalDrive{number} during inventory: {error}");
@@ -507,6 +515,45 @@ fn starts_with_word_ignore_ascii_case(value: &str, prefix: &str) -> bool {
             .is_none_or(u8::is_ascii_whitespace)
 }
 
+/// Physical disks that host the running operating system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SystemDiskSet {
+    Known(BTreeSet<u32>),
+    /// Detection failed on a disk-backed system; every disk must be treated as unsafe.
+    Unknown,
+}
+
+impl SystemDiskSet {
+    fn contains(&self, number: u32) -> bool {
+        match self {
+            Self::Known(numbers) => numbers.contains(&number),
+            Self::Unknown => true,
+        }
+    }
+}
+
+/// Fails closed: a failed probe is only harmless when WinPE runs from the X: RAM disk,
+/// which is never a physical disk in the inventory.
+fn classify_system_disks(
+    system_drive: Option<&str>,
+    probe: Result<BTreeSet<u32>, String>,
+) -> SystemDiskSet {
+    match probe {
+        Ok(numbers) => SystemDiskSet::Known(numbers),
+        Err(_) if system_drive.is_some_and(is_ram_disk_system_drive) => {
+            SystemDiskSet::Known(BTreeSet::new())
+        }
+        Err(_) => SystemDiskSet::Unknown,
+    }
+}
+
+fn is_ram_disk_system_drive(system_drive: &str) -> bool {
+    system_drive
+        .trim()
+        .trim_end_matches(['\\', '/'])
+        .eq_ignore_ascii_case("X:")
+}
+
 #[cfg(target_os = "windows")]
 fn system_disk_numbers() -> Result<BTreeSet<u32>, Box<dyn Error>> {
     let system_drive = std::env::var("SystemDrive")?;
@@ -733,6 +780,39 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_disk_probe_success_marks_only_reported_disks() {
+        let detected = classify_system_disks(Some("C:"), Ok(BTreeSet::from([1])));
+
+        assert!(detected.contains(1));
+        assert!(!detected.contains(0));
+    }
+
+    #[test]
+    fn system_disk_probe_failure_on_a_disk_backed_system_marks_every_disk() {
+        for system_drive in [Some("C:"), Some("D:\\"), Some("not-a-drive"), None] {
+            let detected = classify_system_disks(system_drive, Err("probe failed".to_owned()));
+
+            assert_eq!(detected, SystemDiskSet::Unknown, "{system_drive:?}");
+            assert!(detected.contains(0));
+            assert!(detected.contains(7));
+        }
+    }
+
+    #[test]
+    fn system_disk_probe_failure_on_the_winpe_ram_disk_marks_no_disk() {
+        for system_drive in ["X:", "x:", "X:\\", " X:/ "] {
+            let detected = classify_system_disks(Some(system_drive), Err("no extents".to_owned()));
+
+            assert_eq!(
+                detected,
+                SystemDiskSet::Known(BTreeSet::new()),
+                "{system_drive}"
+            );
+            assert!(!detected.contains(0));
+        }
+    }
 
     #[test]
     fn parses_english_diskpart_output_without_banner_numbers() {

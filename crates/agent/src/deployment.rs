@@ -184,6 +184,11 @@ fn matching_disk<'a>(lease: &AgentJobLease, disks: &'a [Disk]) -> Result<&'a Dis
     if !target.matches_disk(disk) {
         return Err("target disk fingerprint changed after the deployment was confirmed".into());
     }
+    if !target.can_deploy_to(disk) {
+        return Err(
+            "the selected physical disk hosts the running system and cannot be deployed to".into(),
+        );
+    }
     Ok(disk)
 }
 
@@ -959,5 +964,18 @@ mod tests {
         changed.serial = Some("OTHER".to_owned());
         let lease = lease(PartitionPlan::legacy_bios_mbr());
         assert!(matching_disk(&lease, &[changed]).is_err());
+    }
+
+    #[test]
+    fn system_disk_is_rejected_before_partitioning() {
+        let mut system = disk();
+        system.is_system = true;
+        let lease = lease(PartitionPlan::legacy_bios_mbr());
+
+        let error = matching_disk(&lease, &[system])
+            .expect_err("the running system disk must never be selected for deployment");
+
+        assert!(error.to_string().contains("running system"));
+        assert!(matching_disk(&lease, &[disk()]).is_ok());
     }
 }

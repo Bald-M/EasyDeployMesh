@@ -519,6 +519,7 @@ impl DeploymentMutationCoordinator {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("deployment image was not found: {}", request.image_id))?;
         validate_deployment_compatibility(request.operation, &image)?;
+        self.reject_system_disk_targets(&request.targets)?;
         if request.operation == Operation::InstallLinux {
             if request.targets.len() != 1 {
                 return Err("a Linux installer job requires exactly one target".to_owned());
@@ -624,6 +625,25 @@ impl DeploymentMutationCoordinator {
         self.jobs
             .enqueue(request)
             .map_err(|error| error.to_string())
+    }
+
+    /// Refuses targets whose current inventory reports the disk hosting the running system.
+    /// The Agent and lease issuance repeat this check, so the UI is never the only guard.
+    fn reject_system_disk_targets(&self, targets: &[DeploymentTarget]) -> Result<(), String> {
+        let registered = self.devices.list().map_err(|error| error.to_string())?;
+        for target in targets {
+            let is_system_disk = registered
+                .iter()
+                .filter(|registered| registered.device.id == target.device_id)
+                .any(|registered| target.targets_system_disk(&registered.device.disks));
+            if is_system_disk {
+                return Err(format!(
+                    "the target disk {} ({}) hosts the running system and cannot be deployed to",
+                    target.target_disk_model, target.target_disk_id
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn remove_job(&self, id: Uuid) -> Result<bool, String> {
@@ -1287,6 +1307,82 @@ mod tests {
             !image_is_referenced || image_exists,
             "a deployment job must never reference a removed image"
         );
+    }
+
+    #[tokio::test]
+    async fn job_creation_rejects_the_running_system_disk() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let images = Arc::new(
+            ImageLibrary::open(temp.path().join("images")).expect("image library should open"),
+        );
+        let jobs = Arc::new(
+            JobRepository::open(temp.path().join("jobs")).expect("job repository should open"),
+        );
+        let devices = Arc::new(
+            DeviceRegistry::open(temp.path().join("devices")).expect("device registry should open"),
+        );
+        let system_disk = Disk {
+            id: r"\\.\PhysicalDrive0".to_owned(),
+            model: "Boot SSD".to_owned(),
+            serial: Some("BOOT-SERIAL".to_owned()),
+            size_bytes: 64 * 1024 * 1024 * 1024,
+            is_system: true,
+        };
+        let template = linux_registered_device(vec![system_disk.clone()]).device;
+        let (registered, _) = devices
+            .register(
+                easydeploymesh_core::AgentInventory {
+                    hostname: template.hostname,
+                    mac_address: template.mac_address,
+                    model: None,
+                    serial: None,
+                    cpu_model: None,
+                    physical_core_count: None,
+                    logical_processor_count: template.logical_processor_count,
+                    memory_bytes: template.memory_bytes,
+                    system_details: SystemDetails::default(),
+                    architecture: template.architecture,
+                    boot_mode: template.boot_mode,
+                    disks: template.disks,
+                    agent_version: "0.2.6".to_owned(),
+                },
+                "192.0.2.30".parse().expect("test IP should parse"),
+            )
+            .expect("device should register");
+        let coordinator = DeploymentMutationCoordinator::new(
+            devices,
+            Arc::clone(&images),
+            Arc::clone(&jobs),
+            temp.path().join("pxe"),
+        );
+        let source = temp.path().join("windows.wim");
+        fs::write(&source, wim_fixture(b"system-disk-preflight"))
+            .expect("WIM fixture should write");
+        let image = images.import(&source).expect("WIM fixture should import");
+
+        let error = coordinator
+            .create_job(CreateDeploymentJob {
+                name: "System disk".to_owned(),
+                operation: Operation::DeployWim,
+                image_id: image.id,
+                targets: vec![DeploymentTarget {
+                    device_id: registered.device.id,
+                    target_disk_id: r"\\.\PHYSICALDRIVE0".to_owned(),
+                    target_disk_model: system_disk.model.clone(),
+                    target_disk_serial: system_disk.serial.clone(),
+                    target_disk_size_bytes: system_disk.size_bytes,
+                }],
+                options: DeploymentOptions {
+                    image_index: 1,
+                    partition_plan: PartitionPlan::uefi_gpt(),
+                    linux_install: None,
+                },
+            })
+            .await
+            .expect_err("the running system disk must be refused before the job is persisted");
+
+        assert!(error.contains("hosts the running system"));
+        assert!(jobs.list().expect("jobs should list").is_empty());
     }
 
     #[tokio::test]

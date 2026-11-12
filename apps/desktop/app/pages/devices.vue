@@ -5,6 +5,7 @@ import { compactHash, formatBytes } from '~/utils/files'
 import { deploymentOperationForImageFormat } from '~/utils/image-deployment-support'
 import {
   batchDeploymentTargets,
+  defaultWindowsTargetDisk,
   deploymentLaunchBlocker,
   deployableDeviceIds,
   deviceSelectionState,
@@ -392,7 +393,7 @@ function defaultDisk(entry: RegisteredDevice) {
   if (selectedImageIsLinux.value) {
     return defaultLinuxTargetDisk(entry.device.disks)
   }
-  return entry.device.disks.find(disk => !disk.isSystem) ?? entry.device.disks[0]
+  return defaultWindowsTargetDisk(entry.device.disks)
 }
 
 function selectedDisk(entry: RegisteredDevice) {
@@ -410,7 +411,8 @@ function initializeTargetDisks(entries: readonly RegisteredDevice[]) {
 function targetDiskItems(entry: RegisteredDevice) {
   return entry.device.disks.map(disk => ({
     label: `${disk.model || t('devices.unknownDisk')} · ${formatBytes(disk.sizeBytes, locale.value)} · ${disk.serial?.trim() ? t('devices.diskSerial', { serial: disk.serial }) : t('devices.diskSerialMissing')}${disk.isSystem ? ` · ${t('devices.systemDisk')}` : ''}`,
-    value: disk.id
+    value: disk.id,
+    disabled: disk.isSystem
   }))
 }
 

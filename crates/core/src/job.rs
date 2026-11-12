@@ -92,6 +92,20 @@ impl DeploymentTarget {
                     .is_some_and(|actual| actual.trim().eq_ignore_ascii_case(expected.trim()))
             })
     }
+
+    /// Confirms that a destructive deployment may write to this disk: the fingerprint must
+    /// still match and the disk must not host the running operating system.
+    pub fn can_deploy_to(&self, disk: &Disk) -> bool {
+        !disk.is_system && self.matches_disk(disk)
+    }
+
+    /// Reports whether the inventory marks the selected disk ID as the running system disk.
+    pub fn targets_system_disk(&self, disks: &[Disk]) -> bool {
+        let target_id = self.target_disk_id.trim();
+        disks
+            .iter()
+            .any(|disk| disk.is_system && disk.id.trim().eq_ignore_ascii_case(target_id))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -845,6 +859,31 @@ mod tests {
         let mut changed = disk;
         changed.serial = Some("OTHER".to_owned());
         assert!(!target.matches_disk(&changed));
+    }
+
+    #[test]
+    fn deployment_target_rejects_the_running_system_disk() {
+        let target = DeploymentTarget {
+            device_id: Uuid::new_v4(),
+            target_disk_id: r"\\.\PhysicalDrive0".to_owned(),
+            target_disk_model: "Test SSD".to_owned(),
+            target_disk_serial: Some("SERIAL-01".to_owned()),
+            target_disk_size_bytes: 64 * 1024 * 1024 * 1024,
+        };
+        let mut disk = Disk {
+            id: r"\\.\PHYSICALDRIVE0".to_owned(),
+            model: "Test SSD".to_owned(),
+            serial: Some("SERIAL-01".to_owned()),
+            size_bytes: target.target_disk_size_bytes,
+            is_system: false,
+        };
+        assert!(target.can_deploy_to(&disk));
+        assert!(!target.targets_system_disk(std::slice::from_ref(&disk)));
+
+        disk.is_system = true;
+        assert!(target.matches_disk(&disk));
+        assert!(!target.can_deploy_to(&disk));
+        assert!(target.targets_system_disk(&[disk]));
     }
 
     #[test]
