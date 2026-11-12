@@ -318,7 +318,12 @@ leasing, and the Agent matches it again immediately before partitioning.
 Partition plans must contain exactly one Windows partition and exactly one
 Windows or data partition that consumes remaining space. GPT plans require EFI
 and MSR partitions; MBR plans require a system partition. Labels, filesystems,
-sizes, and data drive letters are constrained. The executor additionally rejects
+sizes, and data drive letters are constrained: a data partition without a letter
+resolves to `D`, resolved letters must be unique, and the letters the Agent uses
+internally (`S` system/EFI, `W` Windows, `R` image cache, `X` WinPE) are reserved.
+Core owns these letter rules, and the Agent takes both the reserved letters and
+the implicit default from Core when it validates the plan and builds the DiskPart
+script. The executor additionally rejects
 unsupported recovery partitions and disks too small for Windows plus the image
 cache and alignment headroom. Capacity validation is a shared Core invariant
 used by the desktop host before job creation and by the Agent before it builds
