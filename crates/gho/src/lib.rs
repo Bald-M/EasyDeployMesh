@@ -10,8 +10,10 @@ mod container;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 mod ntfs;
+mod readback;
 
 pub use ntfs::{NtfsGeometry, RestoreOptions};
+pub use readback::WrittenRegions;
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use thiserror::Error;
@@ -98,6 +100,8 @@ pub enum Error {
     TargetTooSmall { required: u64, available: u64 },
     #[error("GHO expanded data exceeds the configured limit")]
     ExpandedLimit,
+    #[error("restored volume does not read back the bytes that were written")]
+    ReadBackMismatch,
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -256,6 +260,14 @@ pub fn analyze_partition<R: Read + Seek, S: Write>(
     )
 }
 
+/// Result of a restore: the validated partition and a record of every region
+/// written, for read-back verification once the writes are durable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredPartition {
+    pub partition: VerifiedPartition,
+    pub written: WrittenRegions,
+}
+
 /// Restores the partition onto `target`, which must address the target
 /// volume from its first byte. Every logical stream byte is also copied into
 /// `sink`. On error the target may be partially written.
@@ -265,11 +277,12 @@ pub fn restore_partition<R: Read + Seek, W: Write + Seek, S: Write>(
     target: &mut W,
     sink: &mut S,
     options: RestoreOptions,
-) -> Result<VerifiedPartition, Error> {
-    let mut target = ntfs::SeekTarget { inner: target };
-    let verified = process(reader, source_partition, sink, &mut target, options)?;
+) -> Result<RestoredPartition, Error> {
+    let mut target = readback::Recording::new(ntfs::SeekTarget { inner: target });
+    let partition = process(reader, source_partition, sink, &mut target, options)?;
+    let (target, written) = target.finish();
     target.inner.flush()?;
-    Ok(verified)
+    Ok(RestoredPartition { partition, written })
 }
 
 fn process<R: Read + Seek, S: Write, T: ntfs::Target>(
@@ -325,14 +338,19 @@ mod tests {
     fn restore(bytes: Vec<u8>) -> Result<(VerifiedPartition, Vec<u8>, Vec<u8>), Error> {
         let mut target = Cursor::new(vec![0xcc_u8; VOLUME_BYTES as usize]);
         let mut logical = Vec::new();
-        let verified = restore_partition(
+        let restored = restore_partition(
             &mut Cursor::new(bytes),
             1,
             &mut target,
             &mut logical,
             options(VOLUME_BYTES),
         )?;
-        Ok((verified, target.into_inner(), logical))
+        let mut volume = Cursor::new(target.into_inner());
+        restored
+            .written
+            .verify(&mut volume, &mut |_| Ok(()))
+            .expect("a restored volume must read back what was written");
+        Ok((restored.partition, volume.into_inner(), logical))
     }
 
     fn cluster(volume: &[u8], lcn: u64, count: u64) -> &[u8] {
@@ -364,6 +382,45 @@ mod tests {
         assert_eq!(&volume[512..2 * CLUSTER as usize], &parts.boot_data[512..]);
         let backup = (TOTAL_SECTORS * 512) as usize;
         assert_eq!(&volume[backup..backup + 512], expected_boot.as_slice());
+    }
+
+    #[test]
+    fn read_back_covers_runs_mirror_and_backup_boot_sector() {
+        let parts = parts();
+        let mut target = Cursor::new(vec![0xcc_u8; VOLUME_BYTES as usize]);
+        let restored = restore_partition(
+            &mut Cursor::new(image_with(&body(&parts))),
+            1,
+            &mut target,
+            &mut io::sink(),
+            options(VOLUME_BYTES),
+        )
+        .unwrap();
+        let intact = target.into_inner();
+        let backup = (TOTAL_SECTORS * 512) as usize;
+        // A user-data run, the regenerated $MFTMirr, the patched boot sector
+        // and its backup are all covered by the read-back.
+        for offset in [
+            (20 * CLUSTER) as usize,
+            (2 * CLUSTER) as usize,
+            0x1c,
+            backup + 0x1c,
+        ] {
+            let mut volume = intact.clone();
+            volume[offset] ^= 0xff;
+            let error = restored
+                .written
+                .verify(&mut Cursor::new(volume), &mut |_| Ok(()))
+                .unwrap_err();
+            assert!(matches!(error, Error::ReadBackMismatch), "{offset}");
+        }
+        // Sparse and unallocated clusters were never written.
+        let mut volume = intact.clone();
+        volume[(11 * CLUSTER) as usize] ^= 0xff;
+        restored
+            .written
+            .verify(&mut Cursor::new(volume), &mut |_| Ok(()))
+            .unwrap();
     }
 
     #[test]
@@ -670,5 +727,42 @@ mod tests {
         let verified = verify(&mut file, u64::MAX).unwrap();
         assert_eq!(verified.file_system, FileSystem::Ntfs);
         assert!(verified.volume_size_bytes() > 0);
+    }
+
+    /// Restores a real image into a file in the temp directory (sparse on
+    /// APFS) and reads every written region back.
+    #[test]
+    #[ignore = "requires EASYDEPLOYMESH_GHO_PATH and free space for the restored data"]
+    fn restores_and_reads_back_a_real_ghost_image() {
+        let path =
+            std::env::var_os("EASYDEPLOYMESH_GHO_PATH").expect("set EASYDEPLOYMESH_GHO_PATH");
+        let volume_path = std::env::temp_dir().join(format!(
+            "easydeploymesh-gho-readback-{}.img",
+            std::process::id()
+        ));
+        let mut volume = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&volume_path)
+            .unwrap();
+        let result = (|| {
+            let restored = restore_partition(
+                &mut std::fs::File::open(&path)?,
+                1,
+                &mut volume,
+                &mut io::sink(),
+                RestoreOptions {
+                    target_size_bytes: u64::MAX,
+                    hidden_sectors: Some(2048),
+                    expanded_limit: u64::MAX,
+                },
+            )?;
+            volume.sync_all()?;
+            restored.written.verify(&mut volume, &mut |_| Ok(()))?;
+            Ok::<_, Error>(restored.written.bytes())
+        })();
+        std::fs::remove_file(&volume_path).unwrap();
+        assert!(result.unwrap() > 0);
     }
 }

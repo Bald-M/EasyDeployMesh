@@ -749,7 +749,7 @@ fn restore_gho_partition(
             metadata.expanded_size_bytes,
         ),
     };
-    let verified = easydeploymesh_gho::restore_partition(
+    let restored = easydeploymesh_gho::restore_partition(
         &mut image,
         metadata.source_partition,
         &mut volume,
@@ -760,6 +760,7 @@ fn restore_gho_partition(
             expanded_limit: metadata.expanded_size_bytes,
         },
     )?;
+    let verified = restored.partition;
     volume.sync_all()?;
     sink.reporter.report(sink.consumed, true);
     let actual_sha256 = format!("{:x}", sink.digest.finalize());
@@ -778,6 +779,25 @@ fn restore_gho_partition(
     if verified.volume_size_bytes() != metadata.volume_size_bytes {
         return Err("GHO restored volume size differs from the approved image".into());
     }
+    // Read every written region back through the still-locked volume before
+    // anything else touches it.
+    let mut last_check = 0_u64;
+    restored
+        .written
+        .verify(&mut volume, &mut |done| {
+            if done - last_check >= CONTROL_CHECK_INTERVAL_BYTES {
+                last_check = done;
+                await_running(sink.control_state)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+            }
+            Ok(())
+        })
+        .map_err(|error| match error {
+            easydeploymesh_gho::Error::ReadBackMismatch => {
+                format!("GHO read-back verification failed: {error}")
+            }
+            other => other.to_string(),
+        })?;
     drop(volume_lock);
     Ok(extent.length_bytes > verified.volume_size_bytes() + verified.geometry.cluster_size)
 }
