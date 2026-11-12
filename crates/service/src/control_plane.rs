@@ -399,7 +399,7 @@ async fn claim_job(
                 && device_snapshot
                     .disks
                     .iter()
-                    .any(|disk| job.targets[0].matches_disk(disk))
+                    .any(|disk| job.targets[0].can_deploy_to(disk))
                 && matches!(job.operation, Operation::DeployWim | Operation::DeployGho)
         })
         .collect::<Vec<_>>();
@@ -445,7 +445,7 @@ async fn claim_job(
                         && current_device
                             .disks
                             .iter()
-                            .any(|disk| job.targets[0].matches_disk(disk))
+                            .any(|disk| job.targets[0].can_deploy_to(disk))
                 },
             )
         })
@@ -1473,6 +1473,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn linux_installer_assignment_is_denied_for_the_running_system_disk() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let registry = Arc::new(DeviceRegistry::open(temp.path()).expect("registry should open"));
+        let jobs =
+            Arc::new(JobRepository::open(temp.path().join("jobs")).expect("jobs should open"));
+        let images =
+            Arc::new(ImageLibrary::open(temp.path().join("images")).expect("images should open"));
+        let mut system_inventory = inventory();
+        system_inventory.disks[0].is_system = true;
+        let (registered, _) = registry
+            .register(
+                system_inventory,
+                "192.0.2.22".parse().expect("test IP should parse"),
+            )
+            .expect("device should register");
+        let iso_path = temp.path().join("ubuntu-server.iso");
+        create_ubuntu_iso(&iso_path);
+        let image = images.import(&iso_path).expect("Ubuntu ISO should import");
+        let queued = jobs
+            .enqueue(CreateDeploymentJob {
+                name: "System disk Ubuntu deployment".to_owned(),
+                operation: Operation::InstallLinux,
+                image_id: image.id,
+                targets: vec![DeploymentTarget {
+                    device_id: registered.device.id,
+                    target_disk_id: disk().id,
+                    target_disk_model: disk().model,
+                    target_disk_serial: disk().serial,
+                    target_disk_size_bytes: disk().size_bytes,
+                }],
+                options: DeploymentOptions {
+                    linux_install: Some(LinuxInstallOptions {
+                        hostname: "lab-linux-01".to_owned(),
+                        username: "operator".to_owned(),
+                        ssh_authorized_keys: vec![
+                            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestSystemDiskKey".to_owned(),
+                        ],
+                    }),
+                    ..DeploymentOptions::default()
+                },
+            })
+            .expect("Linux job should enqueue");
+        let control_plane = ControlPlane::new(
+            registry,
+            Arc::clone(&jobs),
+            images,
+            Arc::new(ActivityRepository::open(temp.path().join("activities.json")).unwrap()),
+        );
+        let status = control_plane.start("127.0.0.1", 0).await.unwrap();
+        let endpoint = status.endpoint.expect("endpoint should be available");
+
+        let script = reqwest::Client::new()
+            .get(format!(
+                "{endpoint}/api/v1/install/boot.ipxe?mac={}&arch=x86_64&platform=efi",
+                registered.device.mac_address
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        assert!(script.contains("assignment denied"));
+        assert!(!script.contains("boot=casper"));
+        assert_eq!(
+            jobs.list()
+                .expect("jobs should list")
+                .into_iter()
+                .find(|job| job.id == queued.id)
+                .expect("job should remain")
+                .state,
+            JobState::Waiting
+        );
+        control_plane.stop().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn linux_installer_session_guards_storage_and_requires_matching_first_boot_attempt() {
         let temp = tempfile::tempdir().expect("temporary directory should be available");
         let registry = Arc::new(DeviceRegistry::open(temp.path()).expect("registry should open"));
@@ -1905,6 +1985,105 @@ mod tests {
             .expect("job should lease after a disk heartbeat");
         assert_eq!(disk_claim.job_id, job.id);
         assert_ne!(disk_claim.lease_id, expired_lease_id);
+
+        control_plane
+            .stop()
+            .await
+            .expect("control service should stop");
+    }
+
+    #[tokio::test]
+    async fn destructive_job_is_never_leased_for_the_running_system_disk() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let registry = Arc::new(DeviceRegistry::open(temp.path()).expect("registry should open"));
+        let jobs =
+            Arc::new(JobRepository::open(temp.path().join("jobs")).expect("jobs should open"));
+        let images =
+            Arc::new(ImageLibrary::open(temp.path().join("images")).expect("images should open"));
+        let mut system_inventory = inventory();
+        system_inventory.disks[0].is_system = true;
+        let (registered, registration) = registry
+            .register(
+                system_inventory.clone(),
+                "192.0.2.21".parse().expect("test IP should parse"),
+            )
+            .expect("device should register");
+        let control_plane = ControlPlane::new(
+            Arc::clone(&registry),
+            Arc::clone(&jobs),
+            Arc::clone(&images),
+            Arc::new(
+                ActivityRepository::open(temp.path().join("activities.json"))
+                    .expect("activities should open"),
+            ),
+        );
+        let status = control_plane
+            .start("127.0.0.1", 0)
+            .await
+            .expect("control service should start");
+        let endpoint = status.endpoint.expect("endpoint should be available");
+        let client = reqwest::Client::new();
+
+        let image_path = temp.path().join("windows.wim");
+        std::fs::write(&image_path, wim_fixture(b"easydeploymesh-system-disk"))
+            .expect("image should write");
+        let image = images.import(&image_path).expect("image should import");
+        let job = jobs
+            .enqueue(CreateDeploymentJob {
+                name: "System disk deployment".to_owned(),
+                operation: Operation::DeployWim,
+                image_id: image.id,
+                targets: vec![DeploymentTarget {
+                    device_id: registered.device.id,
+                    target_disk_id: disk().id,
+                    target_disk_model: disk().model,
+                    target_disk_serial: disk().serial,
+                    target_disk_size_bytes: disk().size_bytes,
+                }],
+                options: DeploymentOptions::default(),
+            })
+            .expect("job should enqueue");
+        let claim = || async {
+            client
+                .post(format!(
+                    "{endpoint}/api/v1/agents/{}/jobs/claim",
+                    registered.device.id
+                ))
+                .bearer_auth(&registration.device_token)
+                .send()
+                .await
+                .expect("claim should complete")
+                .error_for_status()
+                .expect("claim should be accepted")
+                .json::<Option<AgentJobLease>>()
+                .await
+                .expect("claim response should decode")
+        };
+
+        assert!(claim().await.is_none());
+        assert_eq!(
+            jobs.list().expect("jobs should list")[0].state,
+            JobState::Waiting
+        );
+
+        client
+            .post(format!(
+                "{endpoint}/api/v1/agents/{}/heartbeat",
+                registered.device.id
+            ))
+            .bearer_auth(&registration.device_token)
+            .json(&AgentHeartbeat {
+                inventory: inventory(),
+            })
+            .send()
+            .await
+            .expect("heartbeat should complete")
+            .error_for_status()
+            .expect("heartbeat should be accepted");
+        let lease = claim()
+            .await
+            .expect("the same disk should lease once it no longer hosts the system");
+        assert_eq!(lease.job_id, job.id);
 
         control_plane
             .stop()

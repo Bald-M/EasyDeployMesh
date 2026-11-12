@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { RegisteredDevice } from '../app/types/deployment'
 import {
   batchDeploymentTargets,
+  defaultWindowsTargetDisk,
   deploymentLaunchBlocker,
   deployableDeviceIds,
   deviceSelectionState,
@@ -44,7 +45,7 @@ function device(
         model: 'Disk',
         serial: null,
         sizeBytes: 64_000_000_000,
-        isSystem: index === 0
+        isSystem: index === 1
       })),
       lastSeenAt: '2026-08-17T00:00:00Z'
     },
@@ -55,6 +56,22 @@ function device(
 }
 
 describe('device deployment selection', () => {
+  it('never defaults the Windows target to the running system disk', () => {
+    const [dataDisk, systemDisk] = device('two-disks', { disks: 2 }).device.disks
+    expect(systemDisk?.isSystem).toBe(true)
+
+    expect(defaultWindowsTargetDisk([systemDisk!, dataDisk!])).toBe(dataDisk)
+    expect(defaultWindowsTargetDisk([systemDisk!])).toBeNull()
+    expect(defaultWindowsTargetDisk([])).toBeNull()
+  })
+
+  it('does not offer a device whose only disks host the running system', () => {
+    const systemOnly = device('system-only')
+    systemOnly.device.disks = systemOnly.device.disks.map(disk => ({ ...disk, isSystem: true }))
+
+    expect(deployableDeviceIds([device('ready'), systemOnly])).toEqual(['ready'])
+  })
+
   it('only includes online devices that reported a disk', () => {
     const entries = [
       device('ready'),

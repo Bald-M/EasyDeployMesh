@@ -5,6 +5,7 @@ import { compactHash, formatBytes } from '~/utils/files'
 import { deploymentOperationForImageFormat } from '~/utils/image-deployment-support'
 import {
   batchDeploymentTargets,
+  defaultWindowsTargetDisk,
   deploymentLaunchBlocker,
   deployableDeviceIds,
   deviceSelectionState,
@@ -392,7 +393,7 @@ function defaultDisk(entry: RegisteredDevice) {
   if (selectedImageIsLinux.value) {
     return defaultLinuxTargetDisk(entry.device.disks)
   }
-  return entry.device.disks.find(disk => !disk.isSystem) ?? entry.device.disks[0]
+  return defaultWindowsTargetDisk(entry.device.disks)
 }
 
 function selectedDisk(entry: RegisteredDevice) {
@@ -410,7 +411,8 @@ function initializeTargetDisks(entries: readonly RegisteredDevice[]) {
 function targetDiskItems(entry: RegisteredDevice) {
   return entry.device.disks.map(disk => ({
     label: `${disk.model || t('devices.unknownDisk')} · ${formatBytes(disk.sizeBytes, locale.value)} · ${disk.serial?.trim() ? t('devices.diskSerial', { serial: disk.serial }) : t('devices.diskSerialMissing')}${disk.isSystem ? ` · ${t('devices.systemDisk')}` : ''}`,
-    value: disk.id
+    value: disk.id,
+    disabled: disk.isSystem
   }))
 }
 
@@ -854,10 +856,13 @@ watch(sendTargets, (targets) => {
   const next = { ...selectedDiskIds.value }
   let changed = false
   for (const entry of targets) {
-    if (entry.device.disks.some(disk => disk.id === next[entry.device.id])) continue
+    if (entry.device.disks.some(disk => disk.id === next[entry.device.id] && !disk.isSystem)) continue
     const disk = defaultDisk(entry)
     if (disk) {
       next[entry.device.id] = disk.id
+      changed = true
+    } else if (entry.device.id in next) {
+      delete next[entry.device.id]
       changed = true
     }
   }

@@ -38,7 +38,7 @@ function device(online: boolean): RegisteredDevice {
         model: 'Disk',
         serial: null,
         sizeBytes: 64_000_000_000,
-        isSystem: true
+        isSystem: false
       }],
       lastSeenAt: '2026-08-25T04:59:00Z'
     },
@@ -101,6 +101,9 @@ describe('device operational status', () => {
     expect(isDeviceDeploymentAvailable(device(true), [], now)).toBe(true)
     expect(isDeviceDeploymentAvailable(device(true), [job('running')], now)).toBe(false)
     expect(isDeviceDeploymentAvailable(device(true), [job('paused')], now)).toBe(false)
+    const systemOnly = device(true)
+    systemOnly.device.disks = systemOnly.device.disks.map(disk => ({ ...disk, isSystem: true }))
+    expect(isDeviceDeploymentAvailable(systemOnly, [], now)).toBe(false)
     expect(isDeviceDeploymentAvailable(device(false), [], now)).toBe(false)
   })
 })

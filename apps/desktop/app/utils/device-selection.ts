@@ -1,4 +1,4 @@
-import type { RegisteredDevice } from '~/types/deployment'
+import type { Disk, RegisteredDevice } from '~/types/deployment'
 
 export type DeviceSelectionState = boolean | 'indeterminate'
 export type BatchSendMode = 'selected' | 'all'
@@ -14,8 +14,17 @@ export function deploymentLaunchBlocker(
   return null
 }
 
+/** Never preselects the disk hosting the running system; the host and Agent also refuse it. */
+export function defaultWindowsTargetDisk(disks: readonly Disk[]): Disk | null {
+  return disks.find(disk => !disk.isSystem) ?? null
+}
+
+export function hasDeployableDisk(entry: RegisteredDevice) {
+  return entry.device.disks.some(disk => !disk.isSystem)
+}
+
 export function isDeployableDevice(entry: RegisteredDevice) {
-  return entry.online && entry.device.disks.length > 0
+  return entry.online && hasDeployableDisk(entry)
 }
 
 export function deployableDeviceIds(

@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The disk hosting the running system is now refused at every layer, not only
+  marked in the UI: the Agent rejects it before partitioning, the desktop host
+  rejects it when creating a job, and the control plane will not issue a
+  Windows lease or a Linux installer assignment for it. If the Agent cannot
+  identify the system disk on a disk-backed system (anything other than the
+  WinPE `X:` RAM disk), it marks every disk as a system disk so deployment
+  fails closed. The device page no longer preselects or offers the system
+  disk, and a device with only system disks is not offered as a target.
 - A BIOS PXE ROM that answers the TFTP OACK with an error after a `tsize`
   size probe is no longer reported as a failed boot-file transfer. Any other
   client error now fails the transfer immediately instead of after four

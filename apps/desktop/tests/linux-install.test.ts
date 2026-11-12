@@ -118,6 +118,7 @@ describe('Linux target eligibility', () => {
     const onlyDisk = disk()
     expect(defaultLinuxTargetDisk([onlyDisk])).toBe(onlyDisk)
     expect(defaultLinuxTargetDisk([disk({ serial: null })])).toBeNull()
+    expect(defaultLinuxTargetDisk([disk({ isSystem: true })])).toBeNull()
     expect(defaultLinuxTargetDisk([
       disk(),
       disk({ id: 'disk-2', serial: 'NVME-SERIAL-2' })
