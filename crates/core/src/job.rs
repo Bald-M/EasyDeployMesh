@@ -131,6 +131,40 @@ pub struct PartitionSpec {
     pub drive_letter: Option<char>,
 }
 
+/// Drive letter the WinPE Agent assigns to the EFI (GPT) or System Reserved (MBR) partition.
+pub const SYSTEM_DRIVE_LETTER: char = 'S';
+/// Drive letter the WinPE Agent assigns to the Windows partition while applying the image.
+pub const WINDOWS_DRIVE_LETTER: char = 'W';
+/// Drive letter of the temporary image cache partition created by the WinPE Agent.
+pub const CACHE_DRIVE_LETTER: char = 'R';
+/// Drive letter of the WinPE RAM disk that runs the Agent.
+pub const WINPE_DRIVE_LETTER: char = 'X';
+/// Drive letters used internally during deployment that a data partition must never claim.
+pub const RESERVED_DRIVE_LETTERS: [char; 4] = [
+    SYSTEM_DRIVE_LETTER,
+    WINDOWS_DRIVE_LETTER,
+    CACHE_DRIVE_LETTER,
+    WINPE_DRIVE_LETTER,
+];
+/// Drive letter assigned to a data partition that does not specify one.
+pub const DEFAULT_DATA_DRIVE_LETTER: char = 'D';
+
+impl PartitionSpec {
+    /// The upper-case drive letter a data partition receives, including the implicit default.
+    /// Other roles return `None`; their letters are fixed by the deployment executor.
+    pub fn resolved_data_drive_letter(&self) -> Option<char> {
+        (self.role == PartitionRole::Data).then(|| {
+            self.drive_letter
+                .unwrap_or(DEFAULT_DATA_DRIVE_LETTER)
+                .to_ascii_uppercase()
+        })
+    }
+}
+
+fn is_assignable_data_drive_letter(letter: char) -> bool {
+    ('D'..='Z').contains(&letter) && !RESERVED_DRIVE_LETTERS.contains(&letter)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PartitionPlan {
@@ -239,25 +273,23 @@ impl PartitionPlan {
             {
                 return Err(PartitionPlanError::InvalidLabel(partition.label.clone()));
             }
-            if let Some(letter) = partition.drive_letter {
-                let letter = letter.to_ascii_uppercase();
-                if partition.role != PartitionRole::Data
-                    || !(('D'..='Q').contains(&letter)
-                        || ('S'..='V').contains(&letter)
-                        || ('X'..='Z').contains(&letter))
-                {
-                    return Err(PartitionPlanError::InvalidDriveLetter(letter));
-                }
+            if partition.role != PartitionRole::Data
+                && let Some(letter) = partition.drive_letter
+            {
+                return Err(PartitionPlanError::InvalidDriveLetter(
+                    letter.to_ascii_uppercase(),
+                ));
+            }
+            if let Some(letter) = partition.resolved_data_drive_letter()
+                && !is_assignable_data_drive_letter(letter)
+            {
+                return Err(PartitionPlanError::InvalidDriveLetter(letter));
             }
         }
         let mut drive_letters = self
             .partitions
             .iter()
-            .filter_map(|partition| {
-                partition
-                    .drive_letter
-                    .map(|letter| letter.to_ascii_uppercase())
-            })
+            .filter_map(PartitionSpec::resolved_data_drive_letter)
             .collect::<Vec<_>>();
         drive_letters.sort_unstable();
         if drive_letters
@@ -860,6 +892,89 @@ mod tests {
         });
 
         assert_eq!(plan.validate(), Ok(()));
+    }
+
+    fn plan_with_data_letters(letters: &[Option<char>]) -> PartitionPlan {
+        let mut plan = PartitionPlan::uefi_gpt();
+        plan.partitions.last_mut().unwrap().size_mib = Some(30 * 1024);
+        let count = letters.len();
+        for (index, letter) in letters.iter().enumerate() {
+            plan.partitions.push(PartitionSpec {
+                role: PartitionRole::Data,
+                size_mib: (index + 1 < count).then_some(10 * 1024),
+                file_system: Some(PartitionFileSystem::Ntfs),
+                label: format!("Data{index}"),
+                drive_letter: *letter,
+            });
+        }
+        plan
+    }
+
+    #[test]
+    fn data_partitions_cannot_claim_internal_deployment_drive_letters() {
+        for letter in RESERVED_DRIVE_LETTERS
+            .into_iter()
+            .chain(RESERVED_DRIVE_LETTERS.map(|letter| letter.to_ascii_lowercase()))
+        {
+            assert_eq!(
+                plan_with_data_letters(&[Some(letter)]).validate(),
+                Err(PartitionPlanError::InvalidDriveLetter(
+                    letter.to_ascii_uppercase()
+                )),
+                "{letter} must be rejected"
+            );
+        }
+        for letter in ['A', 'B', 'C', '1', '?'] {
+            assert!(matches!(
+                plan_with_data_letters(&[Some(letter)]).validate(),
+                Err(PartitionPlanError::InvalidDriveLetter(_))
+            ));
+        }
+        for letter in ['D', 'e', 'Q', 'T', 'V', 'Y', 'z'] {
+            assert_eq!(plan_with_data_letters(&[Some(letter)]).validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn implicit_data_drive_letters_take_part_in_duplicate_checks() {
+        assert_eq!(plan_with_data_letters(&[None]).validate(), Ok(()));
+        assert_eq!(
+            plan_with_data_letters(&[None, None]).validate(),
+            Err(PartitionPlanError::DuplicateDriveLetter)
+        );
+        assert_eq!(
+            plan_with_data_letters(&[None, Some('d')]).validate(),
+            Err(PartitionPlanError::DuplicateDriveLetter)
+        );
+        assert_eq!(
+            plan_with_data_letters(&[None, Some('E')]).validate(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn only_data_partitions_resolve_or_accept_drive_letters() {
+        let plan = plan_with_data_letters(&[None, Some('e')]);
+        let resolved = plan
+            .partitions
+            .iter()
+            .map(PartitionSpec::resolved_data_drive_letter)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resolved,
+            [None, None, None, Some(DEFAULT_DATA_DRIVE_LETTER), Some('E')]
+        );
+
+        let mut windows_with_letter = PartitionPlan::uefi_gpt();
+        windows_with_letter
+            .partitions
+            .last_mut()
+            .unwrap()
+            .drive_letter = Some('e');
+        assert_eq!(
+            windows_with_letter.validate(),
+            Err(PartitionPlanError::InvalidDriveLetter('E'))
+        );
     }
 
     #[test]

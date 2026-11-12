@@ -1,6 +1,9 @@
+#[cfg(target_os = "windows")]
+use easydeploymesh_core::WINPE_DRIVE_LETTER;
 use easydeploymesh_core::{
-    AgentJobLease, DeploymentStage, Disk, ImageFormat, JobState, MIB_BYTES, Operation,
-    PARTITION_ALIGNMENT_HEADROOM_MIB, PartitionFileSystem, PartitionRole, PartitionTable,
+    AgentJobLease, CACHE_DRIVE_LETTER, DeploymentStage, Disk, ImageFormat, JobState, MIB_BYTES,
+    Operation, PARTITION_ALIGNMENT_HEADROOM_MIB, PartitionFileSystem, PartitionRole, PartitionSpec,
+    PartitionTable, SYSTEM_DRIVE_LETTER, WINDOWS_DRIVE_LETTER,
 };
 use reqwest::blocking::Client;
 #[cfg(target_os = "windows")]
@@ -71,8 +74,8 @@ pub fn execute(
 
     #[cfg(target_os = "windows")]
     {
-        let work_directory =
-            PathBuf::from(r"X:\EasyDeployMesh\work").join(lease.job_id.to_string());
+        let work_directory = PathBuf::from(format!(r"{WINPE_DRIVE_LETTER}:\EasyDeployMesh\work"))
+            .join(lease.job_id.to_string());
         fs::create_dir_all(&work_directory)?;
         let prepare_script = work_directory.join("partition.txt");
         let cleanup_script = work_directory.join("cleanup.txt");
@@ -129,7 +132,7 @@ pub fn execute(
                     OsString::from("/Apply-Image"),
                     image_argument,
                     OsString::from(format!("/Index:{}", lease.image.index)),
-                    OsString::from(r"/ApplyDir:W:\"),
+                    OsString::from(format!(r"/ApplyDir:{WINDOWS_DRIVE_LETTER}:\")),
                     OsString::from("/CheckIntegrity"),
                 ],
                 &mut control_state,
@@ -145,12 +148,12 @@ pub fn execute(
         run_checked(
             "bcdboot.exe",
             [
-                OsStr::new(r"W:\Windows"),
-                OsStr::new("/s"),
-                OsStr::new("S:"),
-                OsStr::new("/f"),
-                OsStr::new(layout.firmware),
-                OsStr::new("/c"),
+                OsString::from(format!(r"{WINDOWS_DRIVE_LETTER}:\Windows")),
+                OsString::from("/s"),
+                OsString::from(format!("{SYSTEM_DRIVE_LETTER}:")),
+                OsString::from("/f"),
+                OsString::from(layout.firmware),
+                OsString::from("/c"),
             ],
             &mut control_state,
         )?;
@@ -303,16 +306,22 @@ fn prepare_layout(lease: &AgentJobLease, disk: &Disk) -> Result<PreparedLayout, 
             ));
         }
         match partition.role {
-            PartitionRole::Efi => script.push_str("assign letter=S\n"),
+            PartitionRole::Efi => {
+                script.push_str(&format!("assign letter={SYSTEM_DRIVE_LETTER}\n"));
+            }
             PartitionRole::System => {
                 if lease.partition_plan.table == PartitionTable::Mbr {
                     script.push_str("active\n");
                 }
-                script.push_str("assign letter=S\n");
+                script.push_str(&format!("assign letter={SYSTEM_DRIVE_LETTER}\n"));
             }
-            PartitionRole::Windows => script.push_str("assign letter=W\n"),
+            PartitionRole::Windows => {
+                script.push_str(&format!("assign letter={WINDOWS_DRIVE_LETTER}\n"));
+            }
             PartitionRole::Data => {
-                let letter = partition.drive_letter.unwrap_or('D').to_ascii_uppercase();
+                let letter = partition
+                    .resolved_data_drive_letter()
+                    .ok_or("data partition has no drive letter")?;
                 script.push_str(&format!("assign letter={letter}\n"));
             }
             _ => {}
@@ -324,7 +333,7 @@ fn prepare_layout(lease: &AgentJobLease, disk: &Disk) -> Result<PreparedLayout, 
         "primary"
     };
     script.push_str(&format!(
-        "create partition {cache_partition_kind} size={cache_mib}\nformat quick fs=ntfs label=\"EasyDeployMesh Cache\"\nassign letter=R\nexit\n"
+        "create partition {cache_partition_kind} size={cache_mib}\nformat quick fs=ntfs label=\"EasyDeployMesh Cache\"\nassign letter={CACHE_DRIVE_LETTER}\nexit\n"
     ));
     let extend_letter = if remaining_role == PartitionRole::Data {
         lease
@@ -332,13 +341,13 @@ fn prepare_layout(lease: &AgentJobLease, disk: &Disk) -> Result<PreparedLayout, 
             .partitions
             .iter()
             .find(|partition| partition.size_mib.is_none())
-            .and_then(|partition| partition.drive_letter)
-            .unwrap_or('D')
+            .and_then(PartitionSpec::resolved_data_drive_letter)
+            .ok_or("remaining-space data partition has no drive letter")?
     } else {
-        'W'
+        WINDOWS_DRIVE_LETTER
     };
     let cleanup_script = format!(
-        "select disk {disk_number}\nselect volume R\ndelete volume\nselect volume {extend_letter}\nextend\nexit\n"
+        "select disk {disk_number}\nselect volume {CACHE_DRIVE_LETTER}\ndelete volume\nselect volume {extend_letter}\nextend\nexit\n"
     );
     let extension = match lease.image.format {
         ImageFormat::Wim => "wim",
@@ -349,7 +358,9 @@ fn prepare_layout(lease: &AgentJobLease, disk: &Disk) -> Result<PreparedLayout, 
     Ok(PreparedLayout {
         prepare_script: script,
         cleanup_script,
-        image_path: PathBuf::from(format!(r"R:\EasyDeployMesh\image.{extension}")),
+        image_path: PathBuf::from(format!(
+            r"{CACHE_DRIVE_LETTER}:\EasyDeployMesh\image.{extension}"
+        )),
         firmware: match lease.partition_plan.table {
             PartitionTable::Gpt => "UEFI",
             PartitionTable::Mbr => "BIOS",
@@ -833,6 +844,61 @@ mod tests {
         assert!(prepared.cleanup_script.contains("select volume R"));
         assert!(prepared.cleanup_script.contains("select volume D\nextend"));
         assert!(prepared.image_path.to_string_lossy().starts_with(r"R:\"));
+    }
+
+    #[test]
+    fn invalid_drive_letters_fail_before_a_diskpart_script_is_available() {
+        let data = |size_mib, drive_letter| easydeploymesh_core::PartitionSpec {
+            role: PartitionRole::Data,
+            size_mib,
+            file_system: Some(PartitionFileSystem::Ntfs),
+            label: "Data".to_owned(),
+            drive_letter,
+        };
+        let mut target_disk = disk();
+        target_disk.size_bytes = 100 * 1024 * 1024 * 1024;
+        for data_partitions in [
+            vec![data(None, Some('S'))],
+            vec![data(None, Some('x'))],
+            vec![data(Some(10 * 1024), None), data(None, None)],
+            vec![data(Some(10 * 1024), None), data(None, Some('D'))],
+        ] {
+            let mut plan = PartitionPlan::uefi_gpt();
+            plan.partitions.last_mut().unwrap().size_mib = Some(30 * 1024);
+            plan.partitions.extend(data_partitions);
+            let error = prepare_layout(&lease(plan), &target_disk)
+                .expect_err("an invalid plan must not produce a DiskPart script")
+                .to_string();
+            assert!(error.contains("drive letter"), "{error}");
+        }
+    }
+
+    #[test]
+    fn implicit_data_drive_letter_matches_the_shared_default() {
+        let mut plan = PartitionPlan::uefi_gpt();
+        plan.partitions.last_mut().unwrap().size_mib = Some(30 * 1024);
+        plan.partitions.push(easydeploymesh_core::PartitionSpec {
+            role: PartitionRole::Data,
+            size_mib: None,
+            file_system: Some(PartitionFileSystem::Ntfs),
+            label: "Data".to_owned(),
+            drive_letter: None,
+        });
+        let mut target_disk = disk();
+        target_disk.size_bytes = 100 * 1024 * 1024 * 1024;
+        let prepared =
+            prepare_layout(&lease(plan), &target_disk).expect("layout should be generated");
+        let default = easydeploymesh_core::DEFAULT_DATA_DRIVE_LETTER;
+        assert!(
+            prepared
+                .prepare_script
+                .contains(&format!("assign letter={default}\n"))
+        );
+        assert!(
+            prepared
+                .cleanup_script
+                .contains(&format!("select volume {default}\nextend"))
+        );
     }
 
     #[test]

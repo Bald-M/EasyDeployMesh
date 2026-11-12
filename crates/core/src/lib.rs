@@ -5,12 +5,14 @@ mod models;
 
 pub use job::{
     AgentDeploymentImage, AgentGhoDeployment, AgentJobCompletion, AgentJobLease, AgentJobProgress,
-    CreateDeploymentJob, DeploymentJob, DeploymentOptions, DeploymentStage, DeploymentTarget,
-    IMAGE_CACHE_HEADROOM_MIB, JobState, JobTransitionError, LinuxInstallOptions,
-    LinuxInstallOptionsError, LinuxInstallerGuardError, LinuxInstallerGuardRequest,
-    LinuxInstallerObservedDisk, MIB_BYTES, MINIMUM_DATA_MIB, MINIMUM_WINDOWS_MIB,
-    PARTITION_ALIGNMENT_HEADROOM_MIB, PartitionCapacityError, PartitionFileSystem, PartitionPlan,
-    PartitionPlanError, PartitionRole, PartitionSpec, PartitionTable, WindowsPayloadCapacityError,
+    CACHE_DRIVE_LETTER, CreateDeploymentJob, DEFAULT_DATA_DRIVE_LETTER, DeploymentJob,
+    DeploymentOptions, DeploymentStage, DeploymentTarget, IMAGE_CACHE_HEADROOM_MIB, JobState,
+    JobTransitionError, LinuxInstallOptions, LinuxInstallOptionsError, LinuxInstallerGuardError,
+    LinuxInstallerGuardRequest, LinuxInstallerObservedDisk, MIB_BYTES, MINIMUM_DATA_MIB,
+    MINIMUM_WINDOWS_MIB, PARTITION_ALIGNMENT_HEADROOM_MIB, PartitionCapacityError,
+    PartitionFileSystem, PartitionPlan, PartitionPlanError, PartitionRole, PartitionSpec,
+    PartitionTable, RESERVED_DRIVE_LETTERS, SYSTEM_DRIVE_LETTER, WINDOWS_DRIVE_LETTER,
+    WINPE_DRIVE_LETTER, WindowsPayloadCapacityError,
 };
 pub use models::{
     ActivityEvent, ActivitySeverity, ActivitySource, ActivitySubject, AgentHeartbeat,
