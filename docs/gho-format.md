@@ -110,7 +110,15 @@ supplies the volume geometry before any data arrives.
   run length from the record's mapping pairs.
 * In the verified image, Ghost omitted only `$MFTMirr` (record 1, `$DATA`) and
   `$BadClus:$Bad` (record 8). The restorer accepts no other omitted
-  attributes.
+  attributes, except `$Bitmap`, which it rebuilds either way.
+* Ghost does not emit record 6 (`$Bitmap`) in the stream. The record exists
+  only in on-disk form (with update-sequence fixups) inside the `$MFT` data,
+  and the cluster bitmap's data is never transmitted. Ghost's own restore
+  rebuilds it. In a real Windows 10 image, record 6 was the only in-use
+  record missing from the stream. Restoring without rebuilding it leaves the
+  bitmap clusters as whatever the target held, which Windows mounted as an
+  almost empty volume and then overwrote. The `$MFT` record bitmap
+  (`$MFT:$BITMAP`) is stored correctly.
 
 ## Restore algorithm
 
@@ -121,8 +129,16 @@ supplies the volume geometry before any data arrives.
 3. The stored `$Boot` sector must equal the descriptor copy. Patch BPB hidden
    sectors (`0x1C`) with the target partition's starting LBA.
 4. Regenerate `$MFTMirr` from the first `$MFT` clusters.
-5. Write the backup boot sector at sector `total_sectors`.
-6. Leave free clusters untouched. The restored file system keeps its original
+5. Rebuild `$Bitmap` in its own clusters. Its runs come from record 6 in the
+   `$MFT` data, after undoing the update-sequence fixups, or from the stream
+   if it carries the record; stored bitmap data is never written. A bit is set for every cluster of every allocated run of an in-use record
+   (including `$MFTMirr` and `$Bitmap` itself) and every allocated
+   `$BadClus:$Bad` run. Sparse runs and runs of free records stay clear. As
+   ntfsresize does, bits past the last cluster up to the 8-byte-aligned
+   bitmap length are set. Reject an image without `$Bitmap`, with a torn record 6, with a
+   sparse `$Bitmap` run, or with a `$Bitmap` too small for the volume.
+6. Write the backup boot sector at sector `total_sectors`.
+7. Leave free clusters untouched. The restored file system keeps its original
    size. On a larger partition, the Agent runs `diskpart extend filesystem`.
 
 The dry run also records whether any in-use record has a `$FILE_NAME` of

@@ -20,7 +20,7 @@ use thiserror::Error;
 
 /// Bumped whenever accepted images or restore semantics change, so cached
 /// capability metadata is re-verified.
-pub const PARSER_VERSION: u32 = 4;
+pub const PARSER_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
@@ -384,6 +384,75 @@ mod tests {
         assert_eq!(&volume[backup..backup + 512], expected_boot.as_slice());
     }
 
+    fn bitmap_with(lcns: &[u64]) -> [u8; 8] {
+        let mut expected = [0_u8; 8];
+        for lcn in lcns {
+            expected[(lcn / 8) as usize] |= 1 << (lcn % 8);
+        }
+        expected
+    }
+
+    /// Clusters allocated by the fixture: $Boot 0-1, $MFTMirr 2, $MFT 4-5,
+    /// the user file 10 and 20-22, and $Bitmap itself at 30. The sparse hole
+    /// (11-12) and the free record's run (50) stay free.
+    const FIXTURE_ALLOCATED: [u64; 10] = [0, 1, 2, 4, 5, 10, 20, 21, 22, BITMAP_LCN];
+
+    #[test]
+    fn rebuilds_the_cluster_bitmap_that_ghost_leaves_out_of_the_stream() {
+        let mut parts = parts();
+        parts.bad_clusters = vec![(None, 40), (Some(40), 1), (None, 23)];
+        let (_, volume, _) = restore(image_with(&body(&parts))).unwrap();
+        let bitmap = cluster(&volume, BITMAP_LCN, 1);
+        let mut allocated = FIXTURE_ALLOCATED.to_vec();
+        allocated.push(40);
+        assert_eq!(&bitmap[..8], &bitmap_with(&allocated));
+        assert!(bitmap[8..].iter().all(|byte| *byte == 0));
+
+        // A stream that does carry $Bitmap, zeroed or omitted, gives the same
+        // rebuilt bitmap.
+        for form in [
+            BitmapInStream::Stored(vec![0; CLUSTER as usize]),
+            BitmapInStream::Omitted,
+        ] {
+            let mut parts = self::parts();
+            parts.bitmap = form;
+            let (_, volume, _) = restore(image_with(&body(&parts))).unwrap();
+            assert_eq!(
+                &cluster(&volume, BITMAP_LCN, 1)[..8],
+                &bitmap_with(&FIXTURE_ALLOCATED)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_volume_without_a_usable_cluster_bitmap() {
+        // No record in the $MFT slot of $Bitmap.
+        let mut parts = parts();
+        parts.mft_blob[6 * 1024..7 * 1024].fill(0);
+        assert!(matches!(
+            restore(image_with(&body(&parts))),
+            Err(Error::CorruptStream("$Bitmap is missing"))
+        ));
+        // A torn on-disk record: one sector's update sequence number differs.
+        let mut parts = self::parts();
+        parts.mft_blob[6 * 1024 + 1022] ^= 0xff;
+        assert!(matches!(
+            restore(image_with(&body(&parts))),
+            Err(Error::CorruptStream(
+                "$Bitmap record update sequence is torn"
+            ))
+        ));
+        // $Bitmap too small to hold a bit for every cluster.
+        let mut parts = self::parts();
+        // An empty attribute has no runs, so no room for any bit.
+        let small = record(6, &[attribute(0x80, "", &[], CLUSTER)]);
+        parts.mft_blob[6 * 1024..7 * 1024].copy_from_slice(&on_disk(small));
+        assert!(matches!(
+            restore(image_with(&body(&parts))),
+            Err(Error::CorruptStream("$Bitmap is too small for the volume"))
+        ));
+    }
+
     #[test]
     fn read_back_covers_runs_mirror_and_backup_boot_sector() {
         let parts = parts();
@@ -403,6 +472,7 @@ mod tests {
         for offset in [
             (20 * CLUSTER) as usize,
             (2 * CLUSTER) as usize,
+            (BITMAP_LCN * CLUSTER) as usize,
             0x1c,
             backup + 0x1c,
         ] {

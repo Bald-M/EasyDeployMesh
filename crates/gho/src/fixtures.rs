@@ -8,6 +8,8 @@ use std::io::Write;
 pub const CLUSTER: u64 = 4096;
 pub const TOTAL_SECTORS: u64 = 64 * 8;
 pub const VOLUME_BYTES: u64 = (TOTAL_SECTORS + 1) * 512;
+/// `$Bitmap` data: one cluster, holding 64 clusters' bits in its first 8 bytes.
+pub const BITMAP_LCN: u64 = 30;
 
 pub fn boot() -> Vec<u8> {
     boot_sector(CLUSTER, TOTAL_SECTORS, 4, 2)
@@ -49,16 +51,50 @@ pub struct Parts {
     pub user_data: Vec<Vec<u8>>,
     /// Name of the user file; `winload.exe` marks a BCDBoot-capable system.
     pub file_name: String,
+    /// Mapping pairs of `$BadClus:$Bad`; allocated runs are bad clusters.
+    pub bad_clusters: Vec<(Option<u64>, u64)>,
+    /// How the stream carries `$Bitmap` (record 6).
+    pub bitmap: BitmapInStream,
+}
+
+/// Ghost 11.5 leaves record 6 out of the stream: it exists only inside the
+/// raw `$MFT` data, and its clusters are never transmitted. The other forms
+/// keep the restorer honest if another Ghost build does emit it.
+pub enum BitmapInStream {
+    OnlyInMft,
+    Stored(Vec<u8>),
+    Omitted,
+}
+
+/// Applies NTFS update-sequence fixups, giving a record's on-disk form.
+pub fn on_disk(mut record: Vec<u8>) -> Vec<u8> {
+    let usn = [0x01, 0x00];
+    record[0x30..0x32].copy_from_slice(&usn);
+    for sector in 1..=record.len() / 512 {
+        let end = sector * 512;
+        let saved = [record[end - 2], record[end - 1]];
+        record[0x30 + 2 * sector..0x32 + 2 * sector].copy_from_slice(&saved);
+        record[end - 2..end].copy_from_slice(&usn);
+    }
+    record
+}
+
+pub fn bitmap_record() -> Vec<u8> {
+    file_record(6, &[(Some(BITMAP_LCN), 1)])
 }
 
 pub fn parts() -> Parts {
     let mut boot_data = boot();
     boot_data.extend(fill(7, 2 * CLUSTER - 512));
+    let mut mft_blob = fill(1, 2 * CLUSTER);
+    mft_blob[6 * 1024..7 * 1024].copy_from_slice(&on_disk(bitmap_record()));
     Parts {
-        mft_blob: fill(1, 2 * CLUSTER),
+        mft_blob,
         boot_data,
         user_data: vec![fill(30, CLUSTER), fill(40, 3 * CLUSTER)],
         file_name: "WINLOAD.EXE".to_owned(),
+        bad_clusters: vec![(None, 64)],
+        bitmap: BitmapInStream::OnlyInMft,
     }
 }
 
@@ -88,6 +124,22 @@ pub fn body(parts: &Parts) -> Vec<u8> {
     stream.extend(file_record(1, &[(Some(2), 1)]));
     stream.extend(header(0x40, 0x80, 0));
     stream.extend(crc());
+    // $Bitmap, normally absent from the stream; rebuilt on restore.
+    if !matches!(parts.bitmap, BitmapInStream::OnlyInMft) {
+        stream.extend(header(0x04, 0x80, 6));
+        stream.extend(data(1024));
+        stream.extend(bitmap_record());
+        match &parts.bitmap {
+            BitmapInStream::Stored(bitmap) => {
+                stream.extend(header(0x20, 0x80, 0));
+                stream.extend(header(0x02, 0, 0));
+                stream.extend(data(1));
+                stream.extend(bitmap);
+            }
+            _ => stream.extend(header(0x40, 0x80, 0)),
+        }
+        stream.extend(crc());
+    }
     // An empty slot and a free record.
     stream.extend(header(0x10, 0x80, 2));
     stream.extend(data(1024));
@@ -100,7 +152,7 @@ pub fn body(parts: &Parts) -> Vec<u8> {
     stream.extend(data(1024));
     stream.extend(record(
         8,
-        &[attribute(0x80, "$Bad", &[(None, 64)], CLUSTER)],
+        &[attribute(0x80, "$Bad", &parts.bad_clusters, CLUSTER)],
     ));
     stream.extend(header(0x40, 0x80, 0));
     stream.extend(crc());

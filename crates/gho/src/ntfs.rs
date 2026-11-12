@@ -29,6 +29,7 @@ const COPY_CHUNK: usize = 1024 * 1024;
 
 const MFT_RECORD: u64 = 0;
 const MFT_MIRROR_RECORD: u64 = 1;
+const BITMAP_RECORD: u64 = 6;
 const BAD_CLUSTER_RECORD: u64 = 8;
 const ATTRIBUTE_FILE_NAME: u32 = 0x30;
 const ATTRIBUTE_DATA: u32 = 0x80;
@@ -498,7 +499,13 @@ struct Engine<'t, T> {
     mft_prefix: Vec<u8>,
     mft_runs: Option<Vec<Run>>,
     mirror_runs: Option<Vec<Run>>,
+    /// `$Bitmap` runs, when the stream carries record 6. Ghost normally
+    /// leaves that record out, so `finish` reads it from the `$MFT` data. The
+    /// bitmap is rebuilt from the allocated runs either way.
+    bitmap_runs: Option<Vec<Run>>,
     seen_bad_clusters: bool,
+    /// Allocated `$BadClus:$Bad` runs as (first cluster, end).
+    bad_clusters: Vec<(u64, u64)>,
     windows_boot_loader: bool,
 }
 
@@ -526,7 +533,9 @@ pub(crate) fn run<R: Read, S: Write, T: Target>(
         mft_prefix: Vec::new(),
         mft_runs: None,
         mirror_runs: None,
+        bitmap_runs: None,
         seen_bad_clusters: false,
+        bad_clusters: Vec::new(),
         windows_boot_loader: false,
     };
     let mut pending = read_token(stream)?;
@@ -702,14 +711,72 @@ impl<T: Target> Engine<'_, T> {
                 }
                 Ok(())
             }
+            BITMAP_RECORD if attribute.is_unnamed_data() => self.take_bitmap_runs(attribute),
             BAD_CLUSTER_RECORD if attribute.is_named("$Bad") => {
                 self.seen_bad_clusters = true;
+                for run in &attribute.runs {
+                    if let Some(lcn) = run.lcn {
+                        let end = lcn
+                            .checked_add(run.clusters)
+                            .filter(|end| *end <= self.geometry.total_clusters())
+                            .ok_or(Error::CorruptStream(
+                                "a bad cluster lies beyond the end of the volume",
+                            ))?;
+                        self.bad_clusters.push((lcn, end));
+                    }
+                }
                 Ok(())
             }
             _ => Err(Error::UnsupportedVolume(
                 "the image omits attribute data that cannot be regenerated",
             )),
         }
+    }
+
+    /// Reserves the `$Bitmap` clusters for the rebuilt bitmap, which `finish`
+    /// writes once every allocated run is known.
+    fn take_bitmap_runs(&mut self, attribute: &NonResident) -> Result<(), Error> {
+        if attribute.start_vcn != 0 {
+            return Err(Error::UnsupportedVolume(
+                "$Bitmap spans several MFT records",
+            ));
+        }
+        if self.bitmap_runs.is_some() {
+            return Err(Error::CorruptStream("$Bitmap appears twice"));
+        }
+        for run in &attribute.runs {
+            let lcn = run
+                .lcn
+                .ok_or(Error::CorruptStream("$Bitmap has a sparse run"))?;
+            self.reserve(lcn, run.clusters)?;
+        }
+        self.bitmap_runs = Some(attribute.runs.clone());
+        Ok(())
+    }
+
+    /// Reads `$Bitmap` (record 6) from the restored `$MFT` data, where Ghost
+    /// keeps it in on-disk form instead of emitting it in the stream, and
+    /// reserves its clusters.
+    fn bitmap_runs_from_mft(&mut self) -> Result<Vec<Run>, Error> {
+        let record_size = usize::try_from(self.record_size.ok_or(Error::Truncated)?)
+            .map_err(|_| Error::InvalidRecord)?;
+        let start = record_size * BITMAP_RECORD as usize;
+        let on_disk = self
+            .mft_prefix
+            .get(start..start + record_size)
+            .filter(|record| record.starts_with(b"FILE"))
+            .ok_or(Error::CorruptStream("$Bitmap is missing"))?;
+        let record = undo_fixups(on_disk)?;
+        let parsed = parse_record(&record, BITMAP_RECORD)?;
+        let data = parsed
+            .non_resident
+            .into_iter()
+            .find(NonResident::is_unnamed_data)
+            .ok_or(Error::CorruptStream("$Bitmap is missing"))?;
+        self.take_bitmap_runs(&data)?;
+        self.bitmap_runs
+            .take()
+            .ok_or(Error::CorruptStream("$Bitmap is missing"))
     }
 
     /// Copies an attribute's runs to their LCNs and returns the token after
@@ -723,6 +790,12 @@ impl<T: Target> Engine<'_, T> {
         let cluster_size = self.geometry.cluster_size;
         let capture_mft =
             index == MFT_RECORD && attribute.is_unnamed_data() && attribute.start_vcn == 0;
+        // The stored bitmap is consumed but not written; `finish` writes the
+        // rebuilt one into the clusters reserved here.
+        let rebuild_bitmap = index == BITMAP_RECORD && attribute.is_unnamed_data();
+        if rebuild_bitmap {
+            self.take_bitmap_runs(attribute)?;
+        }
         let mut expected_run = 0_u64;
         let mut token = read_token(stream)?;
         while let Some(Token::Header {
@@ -754,7 +827,9 @@ impl<T: Target> Engine<'_, T> {
                     "run data length differs from the mapping pairs",
                 ));
             }
-            self.reserve(lcn, run.clusters)?;
+            if !rebuild_bitmap {
+                self.reserve(lcn, run.clusters)?;
+            }
             let mut remaining = run.clusters * cluster_size;
             let mut offset = lcn * cluster_size;
             let mut buffer =
@@ -766,6 +841,11 @@ impl<T: Target> Engine<'_, T> {
                 if capture_mft && self.mft_prefix.len() < MIRROR_CAPTURE_LIMIT {
                     let wanted = (MIRROR_CAPTURE_LIMIT - self.mft_prefix.len()).min(chunk);
                     self.mft_prefix.extend_from_slice(&buffer[..wanted]);
+                }
+                if rebuild_bitmap {
+                    offset += chunk as u64;
+                    remaining -= chunk as u64;
+                    continue;
                 }
                 if offset == 0 {
                     self.patch_boot_sector(&mut buffer[..chunk])?;
@@ -814,6 +894,48 @@ impl<T: Target> Engine<'_, T> {
         Ok(())
     }
 
+    /// Writes the cluster bitmap: a bit for every cluster that a restored run,
+    /// `$MFTMirr` or a bad cluster occupies. As ntfsresize does, bits past
+    /// the last cluster up to the 8-byte-aligned bitmap length are set, so
+    /// they are never allocated.
+    fn write_bitmap(&mut self, runs: &[Run]) -> Result<(), Error> {
+        let total = self.geometry.total_clusters();
+        let used_bytes = total.div_ceil(8).next_multiple_of(8);
+        let cluster_size = self.geometry.cluster_size;
+        let capacity = runs
+            .iter()
+            .try_fold(0_u64, |sum, run| sum.checked_add(run.clusters))
+            .and_then(|clusters| clusters.checked_mul(cluster_size))
+            .ok_or(Error::CorruptStream("$Bitmap is too large"))?;
+        if capacity < used_bytes {
+            return Err(Error::CorruptStream("$Bitmap is too small for the volume"));
+        }
+        let mut allocated = self
+            .written
+            .iter()
+            .map(|(start, end)| (*start, *end))
+            .chain(self.bad_clusters.iter().copied())
+            .collect::<Vec<_>>();
+        allocated.push((total, used_bytes * 8));
+        allocated.sort_unstable();
+        let mut byte_offset = 0_u64;
+        for run in runs {
+            let lcn = run.lcn.expect("bitmap runs were checked for sparse runs");
+            let mut offset = lcn * cluster_size;
+            let mut remaining = run.clusters * cluster_size;
+            while remaining > 0 {
+                let chunk = remaining.min(COPY_CHUNK as u64);
+                let mut buffer = vec![0_u8; usize::try_from(chunk).expect("bounded by COPY_CHUNK")];
+                fill_bitmap(&mut buffer, byte_offset, &allocated);
+                self.target.write_at(offset, &buffer)?;
+                byte_offset += chunk;
+                offset += chunk;
+                remaining -= chunk;
+            }
+        }
+        Ok(())
+    }
+
     fn finish(mut self) -> Result<Outcome, Error> {
         let geometry = self.geometry;
         if !self.boot_written {
@@ -833,6 +955,10 @@ impl<T: Target> Engine<'_, T> {
         if !self.seen_bad_clusters {
             return Err(Error::CorruptStream("$BadClus is missing"));
         }
+        let bitmap_runs = match self.bitmap_runs.take() {
+            Some(runs) => runs,
+            None => self.bitmap_runs_from_mft()?,
+        };
         let mut mirror_offset = 0_usize;
         for run in &mirror_runs {
             let lcn = run
@@ -851,6 +977,7 @@ impl<T: Target> Engine<'_, T> {
             self.target.write_at(lcn * geometry.cluster_size, &source)?;
             mirror_offset += bytes;
         }
+        self.write_bitmap(&bitmap_runs)?;
         let mut backup = self.descriptor_boot.clone();
         if let Some(hidden) = self.options.hidden_sectors {
             backup[0x1c..0x20].copy_from_slice(&hidden.to_le_bytes());
@@ -861,6 +988,58 @@ impl<T: Target> Engine<'_, T> {
             geometry,
             windows_boot_loader: self.windows_boot_loader,
         })
+    }
+}
+
+/// Returns an on-disk MFT record with its update-sequence fixups removed.
+/// `parse_record` checks the update-sequence array's geometry.
+fn undo_fixups(on_disk: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut record = on_disk.to_vec();
+    let usa_offset = usize::from(u16_at(&record, 4)?);
+    let usa_count = usize::from(u16_at(&record, 6)?);
+    let sectors = record.len() / SECTOR_SIZE as usize;
+    if usa_count != sectors + 1 || usa_offset < 0x28 || usa_offset + usa_count * 2 > record.len() {
+        return Err(Error::CorruptStream(
+            "MFT record update sequence is invalid",
+        ));
+    }
+    let usn = [record[usa_offset], record[usa_offset + 1]];
+    for sector in 1..usa_count {
+        let end = sector * SECTOR_SIZE as usize;
+        if record[end - 2..end] != usn {
+            return Err(Error::CorruptStream(
+                "$Bitmap record update sequence is torn",
+            ));
+        }
+        let saved = usa_offset + 2 * sector;
+        record.copy_within(saved..saved + 2, end - 2);
+    }
+    Ok(record)
+}
+
+/// Sets the bits of `buffer`, which holds bitmap bytes from `first_byte`, for
+/// every cluster in the sorted half-open `allocated` ranges.
+fn fill_bitmap(buffer: &mut [u8], first_byte: u64, allocated: &[(u64, u64)]) {
+    let first = first_byte * 8;
+    let end = first + buffer.len() as u64 * 8;
+    let start_at = allocated.partition_point(|(_, range_end)| *range_end <= first);
+    for &(range_start, range_end) in &allocated[start_at..] {
+        if range_start >= end {
+            break;
+        }
+        let mut bit = range_start.max(first) - first;
+        let stop = range_end.min(end) - first;
+        while bit < stop && !bit.is_multiple_of(8) {
+            buffer[(bit / 8) as usize] |= 1 << (bit % 8);
+            bit += 1;
+        }
+        let whole = (stop - bit) / 8;
+        buffer[(bit / 8) as usize..(bit / 8 + whole) as usize].fill(0xff);
+        bit += whole * 8;
+        while bit < stop {
+            buffer[(bit / 8) as usize] |= 1 << (bit % 8);
+            bit += 1;
+        }
     }
 }
 
@@ -1046,6 +1225,25 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn fills_bitmap_bits_across_byte_and_chunk_boundaries() {
+        // Clusters 3..13 and 20..21, then the tail past a 30-cluster volume
+        // up to the 8-byte-aligned length (bits 30..64).
+        let allocated = [(3, 13), (20, 21), (30, 64)];
+        let mut whole = [0_u8; 8];
+        fill_bitmap(&mut whole, 0, &allocated);
+        assert_eq!(whole, [0xf8, 0x1f, 0x10, 0xc0, 0xff, 0xff, 0xff, 0xff]);
+        // The same bits, filled one byte-chunk at a time.
+        let mut pieces = [0_u8; 8];
+        for (index, byte) in pieces.iter_mut().enumerate() {
+            fill_bitmap(std::slice::from_mut(byte), index as u64, &allocated);
+        }
+        assert_eq!(pieces, whole);
+        let mut none = [0_u8; 2];
+        fill_bitmap(&mut none, 0, &[]);
+        assert_eq!(none, [0, 0]);
     }
 
     #[test]
