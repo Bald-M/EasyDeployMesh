@@ -7,7 +7,7 @@
 use crate::deployment::LocalProgress;
 use crate::progress_view::{
     BannerTone, JobInfo, Language, PowerAction, ProgressModel, Rect, Screen, ScreenLayout, Tone,
-    ValueStyle, layout_screen,
+    ValueStyle, layout_panel, panel_size,
 };
 use easydeploymesh_core::DeploymentStage;
 use std::{
@@ -34,17 +34,20 @@ use windows::{
             DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, EnumFontFamiliesExW, FF_SWISS,
             FW_NORMAL, FW_SEMIBOLD, FillRect, GB2312_CHARSET, GetDC, GetStockObject, HDC, HFONT,
             HGDIOBJ, InvalidateRect, LOGFONTW, NULL_BRUSH, NULL_PEN, OUT_DEFAULT_PRECIS,
-            PAINTSTRUCT, PS_SOLID, Polyline, ReleaseDC, RoundRect, SRCCOPY, SelectClipRgn,
-            SelectObject, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT,
+            PAINTSTRUCT, PS_SOLID, Polyline, ReleaseDC, RoundRect, SRCCOPY, ScreenToClient,
+            SelectClipRgn, SelectObject, SetBkMode, SetTextColor, SetWindowRgn, TEXTMETRICW,
+            TRANSPARENT,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
             CreateWindowExW, DI_NORMAL, DefWindowProcW, DispatchMessageW, DrawIconEx,
-            GetClientRect, GetMessageW, GetSystemMetrics, HICON, IDC_ARROW, IMAGE_ICON,
-            LR_DEFAULTCOLOR, LoadCursorW, LoadIconW, LoadImageW, MSG, RegisterClassW, SM_CXSCREEN,
-            SM_CYSCREEN, SW_HIDE, SW_SHOW, SetForegroundWindow, SetTimer, ShowWindow,
-            TranslateMessage, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONUP, WM_PAINT,
-            WM_TIMER, WNDCLASSW, WS_EX_TOPMOST, WS_POPUP,
+            GetClientRect, GetMessageW, GetSystemMetrics, GetWindowRect, HICON, HTCAPTION,
+            HTCLIENT, IDC_ARROW, IMAGE_ICON, IsWindowVisible, LR_DEFAULTCOLOR, LoadCursorW,
+            LoadIconW, LoadImageW, MSG, PostMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN,
+            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetTimer,
+            SetWindowPos, ShowWindow, TranslateMessage, WM_APP, WM_CLOSE, WM_ERASEBKGND,
+            WM_KEYDOWN, WM_LBUTTONUP, WM_NCHITTEST, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_TOPMOST,
+            WS_POPUP,
         },
     },
     core::{PCWSTR, w},
@@ -54,6 +57,9 @@ use windows::{
 const BRAND_MARK_RESOURCE_ID: u16 = 2;
 const REFRESH_TIMER_ID: usize = 1;
 const VK_ESCAPE: u16 = 0x1b;
+/// Posted by other threads to resize and repaint the window.
+const WM_REFRESH: u32 = WM_APP + 1;
+const PANEL_RADIUS: i32 = 24;
 const REFRESH_INTERVAL_MS: u32 = 1_000;
 const MINIMUM_REPAINT_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -77,6 +83,8 @@ static FONTS: OnceLock<FontChoice> = OnceLock::new();
 static POWER_REQUEST: LazyLock<(Mutex<Option<PowerAction>>, Condvar)> =
     LazyLock::new(|| (Mutex::new(None), Condvar::new()));
 static POWER_ACTION_RUNNING: AtomicBool = AtomicBool::new(false);
+/// Set when the operator hides a failure screen with Esc; cleared by the next job.
+static HIDDEN_BY_OPERATOR: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 struct FontChoice {
@@ -118,14 +126,7 @@ impl ProgressWindow {
         }
         *lock(&POWER_REQUEST.0) = None;
         // A failure screen may have been hidden with Esc; bring the window back.
-        let raw = WINDOW.load(Ordering::Acquire);
-        if raw != 0 {
-            unsafe {
-                let hwnd = HWND(raw as *mut _);
-                let _ = ShowWindow(hwnd, SW_SHOW);
-                let _ = SetForegroundWindow(hwnd);
-            }
-        }
+        HIDDEN_BY_OPERATOR.store(false, Ordering::Release);
         repaint(true);
     }
 
@@ -233,8 +234,64 @@ fn repaint(force: bool) {
     }
     let raw = WINDOW.load(Ordering::Acquire);
     if raw != 0 {
+        // Resizing must happen on the window thread, so ask it to refresh.
         unsafe {
-            let _ = InvalidateRect(Some(HWND(raw as *mut _)), None, false);
+            let _ = PostMessageW(Some(HWND(raw as *mut _)), WM_REFRESH, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// Size of the panel for the current state, or `None` before the first job.
+fn desired_size() -> Option<(i32, i32)> {
+    let screen = lock(&MODEL).as_ref()?.screen(Instant::now());
+    Some(panel_size(&screen, unsafe {
+        GetSystemMetrics(SM_CXSCREEN)
+    }))
+}
+
+/// Keeps the window exactly as large as the panel. The window stays centered
+/// on the screen until the operator drags it; after that a size change keeps
+/// its center where it is. The rest of the WinPE desktop stays visible.
+unsafe fn sync_geometry(hwnd: HWND) {
+    let Some((width, height)) = desired_size() else {
+        return;
+    };
+    let (screen_width, screen_height) =
+        unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    let mut current = RECT::default();
+    let _ = unsafe { GetWindowRect(hwnd, &mut current) };
+    let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+    if current.right - current.left != width || current.bottom - current.top != height {
+        let (center_x, center_y) = if visible {
+            (
+                (current.left + current.right) / 2,
+                (current.top + current.bottom) / 2,
+            )
+        } else {
+            (screen_width / 2, screen_height / 2)
+        };
+        let left = (center_x - width / 2).clamp(0, (screen_width - width).max(0));
+        let top = (center_y - height / 2).clamp(0, (screen_height - height).max(0));
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                left,
+                top,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            // The system owns the region after this call.
+            let region =
+                CreateRoundRectRgn(0, 0, width + 1, height + 1, PANEL_RADIUS, PANEL_RADIUS);
+            SetWindowRgn(hwnd, Some(region), true);
+        }
+    }
+    if !visible && !HIDDEN_BY_OPERATOR.load(Ordering::Acquire) {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
         }
     }
 }
@@ -342,8 +399,8 @@ fn run_window() {
             WS_POPUP,
             0,
             0,
-            GetSystemMetrics(SM_CXSCREEN),
-            GetSystemMetrics(SM_CYSCREEN),
+            1,
+            1,
             None,
             None,
             Some(instance),
@@ -354,8 +411,8 @@ fn run_window() {
         };
         WINDOW.store(hwnd.0 as usize, Ordering::Release);
         SetTimer(Some(hwnd), REFRESH_TIMER_ID, REFRESH_INTERVAL_MS, None);
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
+        // Shown by `sync_geometry` once a job has been started.
+        sync_geometry(hwnd);
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&message);
@@ -365,10 +422,22 @@ fn run_window() {
     }
 }
 
+/// Content and layout for a window whose client area is `width` x `height`.
 fn current_screen(width: i32, height: i32) -> Option<(Screen, ScreenLayout)> {
     let screen = lock(&MODEL).as_ref()?.screen(Instant::now());
-    let layout = layout_screen(&screen, width, height);
+    let layout = layout_panel(&screen, Rect::new(0, 0, width, height));
     Some((screen, layout))
+}
+
+fn button_at(hwnd: HWND, x: i32, y: i32) -> Option<PowerAction> {
+    let mut client = RECT::default();
+    let _ = unsafe { GetClientRect(hwnd, &mut client) };
+    let (_, layout) = current_screen(client.right, client.bottom)?;
+    layout
+        .buttons
+        .iter()
+        .find(|(_, rect)| rect.contains(x, y))
+        .map(|(action, _)| *action)
 }
 
 unsafe extern "system" fn window_proc(
@@ -381,15 +450,30 @@ unsafe extern "system" fn window_proc(
         // The window has no close affordance; the Agent owns its lifetime.
         WM_CLOSE => LRESULT(0),
         WM_ERASEBKGND => LRESULT(1),
-        WM_TIMER => {
+        WM_TIMER | WM_REFRESH => {
             unsafe {
+                sync_geometry(hwnd);
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
         }
+        WM_NCHITTEST => {
+            // Drag the panel anywhere except on its buttons.
+            let mut point = POINT {
+                x: i32::from((lparam.0 & 0xffff) as u16 as i16),
+                y: i32::from(((lparam.0 >> 16) & 0xffff) as u16 as i16),
+            };
+            let _ = unsafe { ScreenToClient(hwnd, &mut point) };
+            if button_at(hwnd, point.x, point.y).is_some() {
+                LRESULT(HTCLIENT as isize)
+            } else {
+                LRESULT(HTCAPTION as isize)
+            }
+        }
         WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE) => {
             // Let on-site staff reach the WinPE shell and the log after a failure.
             if lock(&MODEL).as_ref().is_some_and(ProgressModel::is_failed) {
+                HIDDEN_BY_OPERATOR.store(true, Ordering::Release);
                 unsafe {
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 }
@@ -399,13 +483,8 @@ unsafe extern "system" fn window_proc(
         WM_LBUTTONUP => {
             let x = i32::from((lparam.0 & 0xffff) as u16 as i16);
             let y = i32::from(((lparam.0 >> 16) & 0xffff) as u16 as i16);
-            let mut client = RECT::default();
-            let _ = unsafe { GetClientRect(hwnd, &mut client) };
-            if let Some((_, layout)) = current_screen(client.right, client.bottom)
-                && let Some((action, _)) =
-                    layout.buttons.iter().find(|(_, rect)| rect.contains(x, y))
-            {
-                request_power_action(*action);
+            if let Some(action) = button_at(hwnd, x, y) {
+                request_power_action(action);
             }
             LRESULT(0)
         }
@@ -423,7 +502,6 @@ const fn rgb(red: u8, green: u8, blue: u8) -> COLORREF {
 
 // Tailwind slate / cyan / emerald / rose / amber, matching the desktop app.
 const SLATE_50: COLORREF = rgb(0xf8, 0xfa, 0xfc);
-const SLATE_100: COLORREF = rgb(0xf1, 0xf5, 0xf9);
 const SLATE_200: COLORREF = rgb(0xe2, 0xe8, 0xf0);
 const SLATE_300: COLORREF = rgb(0xcb, 0xd5, 0xe1);
 const SLATE_500: COLORREF = rgb(0x64, 0x74, 0x8b);
@@ -526,7 +604,7 @@ unsafe fn paint(hwnd: HWND) {
         let dc = CreateCompatibleDC(Some(window_dc));
         let bitmap = CreateCompatibleBitmap(window_dc, width, height);
         let previous_bitmap = SelectObject(dc, bitmap.into());
-        fill(dc, Rect::new(0, 0, width, height), SLATE_100);
+        fill(dc, Rect::new(0, 0, width, height), WHITE);
         if let Some((screen, layout)) = current_screen(width, height) {
             thread_local! {
                 static FONTS_CACHE: std::cell::OnceCell<Fonts> = const { std::cell::OnceCell::new() };
@@ -545,7 +623,6 @@ unsafe fn paint(hwnd: HWND) {
 }
 
 unsafe fn draw_screen(dc: HDC, screen: &Screen, layout: &ScreenLayout, fonts: &Fonts) {
-    const PANEL_RADIUS: i32 = 24;
     let panel = layout.panel;
     unsafe {
         SetBkMode(dc, TRANSPARENT);
