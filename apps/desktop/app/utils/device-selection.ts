@@ -19,8 +19,12 @@ export function defaultWindowsTargetDisk(disks: readonly Disk[]): Disk | null {
   return disks.find(disk => !disk.isSystem) ?? null
 }
 
+export function hasDeployableDisk(entry: RegisteredDevice) {
+  return entry.device.disks.some(disk => !disk.isSystem)
+}
+
 export function isDeployableDevice(entry: RegisteredDevice) {
-  return entry.online && entry.device.disks.length > 0
+  return entry.online && hasDeployableDisk(entry)
 }
 
 export function deployableDeviceIds(

@@ -35,5 +35,5 @@ export function isDeviceDeploymentAvailable(
   now = new Date()
 ) {
   return deviceOperationalStatus(entry, jobs, now) === 'online'
-    && entry.device.disks.length > 0
+    && entry.device.disks.some(disk => !disk.isSystem)
 }

@@ -222,6 +222,7 @@ impl InstallerDeployment {
             return Ok(BootOutcome::Denied);
         };
         if options.validate().is_err()
+            || job.targets[0].targets_system_disk(&device.disks)
             || job.targets[0]
                 .target_disk_serial
                 .as_deref()

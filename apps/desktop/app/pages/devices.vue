@@ -856,10 +856,13 @@ watch(sendTargets, (targets) => {
   const next = { ...selectedDiskIds.value }
   let changed = false
   for (const entry of targets) {
-    if (entry.device.disks.some(disk => disk.id === next[entry.device.id])) continue
+    if (entry.device.disks.some(disk => disk.id === next[entry.device.id] && !disk.isSystem)) continue
     const disk = defaultDisk(entry)
     if (disk) {
       next[entry.device.id] = disk.id
+      changed = true
+    } else if (entry.device.id in next) {
+      delete next[entry.device.id]
       changed = true
     }
   }

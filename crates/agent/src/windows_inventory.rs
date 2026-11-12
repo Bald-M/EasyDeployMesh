@@ -532,18 +532,18 @@ impl SystemDiskSet {
     }
 }
 
-/// Fails closed: a failed probe is only harmless when WinPE runs from the X: RAM disk,
-/// which is never a physical disk in the inventory.
+/// Fails closed: a failed or empty probe is only harmless when WinPE runs from the X: RAM
+/// disk, which is never a physical disk in the inventory.
 fn classify_system_disks(
     system_drive: Option<&str>,
     probe: Result<BTreeSet<u32>, String>,
 ) -> SystemDiskSet {
     match probe {
-        Ok(numbers) => SystemDiskSet::Known(numbers),
-        Err(_) if system_drive.is_some_and(is_ram_disk_system_drive) => {
+        Ok(numbers) if !numbers.is_empty() => SystemDiskSet::Known(numbers),
+        _ if system_drive.is_some_and(is_ram_disk_system_drive) => {
             SystemDiskSet::Known(BTreeSet::new())
         }
-        Err(_) => SystemDiskSet::Unknown,
+        _ => SystemDiskSet::Unknown,
     }
 }
 
@@ -798,6 +798,18 @@ mod tests {
             assert!(detected.contains(0));
             assert!(detected.contains(7));
         }
+    }
+
+    #[test]
+    fn empty_system_disk_probe_on_a_disk_backed_system_marks_every_disk() {
+        assert_eq!(
+            classify_system_disks(Some("C:"), Ok(BTreeSet::new())),
+            SystemDiskSet::Unknown
+        );
+        assert_eq!(
+            classify_system_disks(Some("X:"), Ok(BTreeSet::new())),
+            SystemDiskSet::Known(BTreeSet::new())
+        );
     }
 
     #[test]
