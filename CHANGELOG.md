@@ -49,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cache, `X` WinPE), and counts the implicit `D` of a data partition without a
   letter in the duplicate check. The Agent shares these rules with Core, so
   such plans are rejected before the DiskPart `clean` script is built.
+- Job claim now re-runs partition plan validation, so a deployment queued
+  before a stricter plan rule is not leased again and never reaches the Agent.
 
 ### Security
 

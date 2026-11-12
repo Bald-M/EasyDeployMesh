@@ -401,6 +401,8 @@ async fn claim_job(
                     .iter()
                     .any(|disk| job.targets[0].can_deploy_to(disk))
                 && matches!(job.operation, Operation::DeployWim | Operation::DeployGho)
+                // Jobs persisted before a stricter plan rule must not reach the Agent.
+                && job.options.partition_plan.validate().is_ok()
         })
         .collect::<Vec<_>>();
     let images = Arc::clone(&state.images);
@@ -1208,7 +1210,7 @@ mod tests {
         AgentJobCompletion, AgentJobLease, AgentJobProgress, Architecture, BootMode,
         CreateDeploymentJob, DeploymentOptions, DeploymentStage, DeploymentTarget, Disk, JobState,
         LinuxInstallOptions, LinuxInstallerGuardRequest, LinuxInstallerObservedDisk, Operation,
-        PartitionPlan,
+        PartitionPlan, PartitionPlanError,
     };
     use hadris_iso::{
         joliet::JolietLevel,
@@ -1845,6 +1847,146 @@ mod tests {
             .unwrap();
         assert_eq!(downloaded.as_ref(), normalized);
         control_plane.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stored_job_with_an_invalid_partition_plan_is_never_leased() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let jobs_dir = temp.path().join("jobs");
+        let registry = Arc::new(DeviceRegistry::open(temp.path()).expect("registry should open"));
+        let images =
+            Arc::new(ImageLibrary::open(temp.path().join("images")).expect("images should open"));
+        let activities = || {
+            Arc::new(
+                ActivityRepository::open(temp.path().join("activities.json"))
+                    .expect("activities should open"),
+            )
+        };
+        let enrolling_plane = ControlPlane::new(
+            Arc::clone(&registry),
+            Arc::new(JobRepository::open(&jobs_dir).expect("jobs should open")),
+            Arc::clone(&images),
+            activities(),
+        );
+        let status = enrolling_plane
+            .start("127.0.0.1", 0)
+            .await
+            .expect("control service should start");
+        let client = reqwest::Client::new();
+        let registration = client
+            .post(format!(
+                "{}/api/v1/agents/register",
+                status.endpoint.expect("endpoint should be available")
+            ))
+            .bearer_auth(
+                status
+                    .enrollment_token
+                    .expect("enrollment token should be available"),
+            )
+            .json(&inventory())
+            .send()
+            .await
+            .expect("registration should complete")
+            .error_for_status()
+            .expect("registration should be accepted")
+            .json::<AgentRegistration>()
+            .await
+            .expect("registration response should decode");
+        enrolling_plane
+            .stop()
+            .await
+            .expect("control service should stop");
+
+        let image_path = temp.path().join("windows.wim");
+        std::fs::write(&image_path, wim_fixture(b"easydeploymesh-test-image"))
+            .expect("image should write");
+        let image = images.import(&image_path).expect("image should import");
+        {
+            let jobs = JobRepository::open(&jobs_dir).expect("jobs should open");
+            let job = jobs
+                .create(CreateDeploymentJob {
+                    name: "Legacy plan".to_owned(),
+                    operation: Operation::DeployWim,
+                    image_id: image.id,
+                    targets: vec![DeploymentTarget {
+                        device_id: registration.device_id,
+                        target_disk_id: disk().id,
+                        target_disk_model: disk().model,
+                        target_disk_serial: disk().serial,
+                        target_disk_size_bytes: disk().size_bytes,
+                    }],
+                    options: DeploymentOptions::default(),
+                })
+                .expect("job should create");
+            jobs.transition(job.id, JobState::Waiting)
+                .expect("job should queue");
+        }
+        // Simulate a job persisted before the stricter drive-letter rules: its data
+        // partition claims S, the letter the Agent assigns to the EFI partition.
+        let manifest_path = jobs_dir.join("jobs.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("job manifest should read"),
+        )
+        .expect("job manifest should decode");
+        let partitions = manifest["jobs"][0]["options"]["partitionPlan"]["partitions"]
+            .as_array_mut()
+            .expect("stored plan should have partitions");
+        partitions
+            .last_mut()
+            .expect("stored plan should have a Windows partition")["sizeMib"] =
+            serde_json::json!(30 * 1024);
+        partitions.push(serde_json::json!({
+            "role": "data",
+            "sizeMib": null,
+            "fileSystem": "ntfs",
+            "label": "Data",
+            "driveLetter": "S"
+        }));
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("job manifest should encode"),
+        )
+        .expect("job manifest should write");
+
+        let jobs = Arc::new(JobRepository::open(&jobs_dir).expect("jobs should reopen"));
+        assert_eq!(
+            jobs.list().expect("jobs should list")[0]
+                .options
+                .partition_plan
+                .validate(),
+            Err(PartitionPlanError::InvalidDriveLetter('S'))
+        );
+        let control_plane = ControlPlane::new(
+            Arc::clone(&registry),
+            Arc::clone(&jobs),
+            Arc::clone(&images),
+            activities(),
+        );
+        let endpoint = control_plane
+            .start("127.0.0.1", 0)
+            .await
+            .expect("control service should restart")
+            .endpoint
+            .expect("endpoint should be available");
+        let claim = client
+            .post(format!(
+                "{endpoint}/api/v1/agents/{}/jobs/claim",
+                registration.device_id
+            ))
+            .bearer_auth(&registration.device_token)
+            .send()
+            .await
+            .expect("claim should complete")
+            .error_for_status()
+            .expect("claim should be accepted")
+            .json::<Option<AgentJobLease>>()
+            .await
+            .expect("claim response should decode");
+
+        assert!(claim.is_none());
+        let stored = &jobs.list().expect("jobs should list")[0];
+        assert_eq!(stored.state, JobState::Waiting);
+        assert!(stored.lease_id.is_none());
     }
 
     #[tokio::test]

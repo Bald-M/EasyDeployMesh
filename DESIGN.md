@@ -189,7 +189,9 @@ staged directory into `library/objects/<uuid>`.
    store, changed sizes, changed hashes, ambiguous spans, and unsafe names fail
    closed.
 5. Job creation repeats deployment preflight while holding the mutation lock.
-6. Job claim repeats image validation again before issuing a lease.
+6. Job claim repeats image validation again before issuing a lease. It also
+   re-runs partition plan validation, so a job stored before a stricter rule
+   is not leased again and never reaches the Agent.
 7. The Agent hashes the downloaded bytes before applying them.
 
 For native GHO, import and preflight also decode the supported partition stream
@@ -222,7 +224,7 @@ sequenceDiagram
     Host->>Jobs: enqueue single-target job
     Agent->>CP: authenticated heartbeat
     Agent->>CP: claim job
-    CP->>CP: revalidate image and disk fingerprint
+    CP->>CP: revalidate image, partition plan and disk fingerprint
     CP->>Jobs: issue expiring lease
     CP-->>Agent: lease + image + partition plan
     Agent->>Agent: re-read inventory and match disk
