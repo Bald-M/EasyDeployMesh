@@ -1,3 +1,4 @@
+use easydeploymesh_bcd::LoaderIntegrityPolicy;
 #[cfg(target_os = "windows")]
 use easydeploymesh_core::WINPE_DRIVE_LETTER;
 use easydeploymesh_core::{
@@ -168,13 +169,30 @@ pub fn execute(
             45,
             "Applying the Windows image",
         )?;
+        let mut image_boot_policy = LoaderIntegrityPolicy::default();
         if lease.operation == Operation::DeployGho {
             let gho = lease
                 .gho
                 .as_ref()
                 .ok_or("GHO deployment metadata is missing")?;
             await_running(&mut control_state)?;
-            restore_gho_partition(&layout.image_path, gho, &mut control_state, &mut local)?;
+            let grow_file_system =
+                restore_gho_partition(&layout.image_path, gho, &mut control_state, &mut local)?;
+            // The restored volume may carry its own boot store from the
+            // machine it was captured on; bcdboot below builds a new one.
+            image_boot_policy = read_image_boot_policy(Path::new(r"W:\Boot\BCD"));
+            if grow_file_system {
+                // The restored NTFS keeps its original size; let Windows grow
+                // it to fill the target partition.
+                let extend_script = work_directory.join("extend-filesystem.txt");
+                fs::write(&extend_script, "select volume W\nextend filesystem\nexit\n")?;
+                await_running(&mut control_state)?;
+                run_checked(
+                    "diskpart.exe",
+                    [OsStr::new("/s"), extend_script.as_os_str()],
+                    &mut control_state,
+                )?;
+            }
         } else {
             let mut image_argument = OsString::from("/ImageFile:");
             image_argument.push(layout.image_path.as_os_str());
@@ -211,6 +229,18 @@ pub fn execute(
             ],
             &mut control_state,
         )?;
+        let policy_commands = boot_policy_commands(layout.firmware, image_boot_policy);
+        if !policy_commands.is_empty() {
+            progress(
+                DeploymentStage::ConfiguringBoot,
+                90,
+                "Keeping the image's boot policy: boot integrity checks disabled",
+            )?;
+            for arguments in policy_commands {
+                await_running(&mut control_state)?;
+                run_checked("bcdedit.exe", arguments, &mut control_state)?;
+            }
+        }
 
         progress(
             DeploymentStage::Finalizing,
@@ -230,6 +260,44 @@ pub fn execute(
         )?;
         Ok(())
     }
+}
+
+/// Reads the boot-integrity policy of a restored image's own boot store. A
+/// missing or unreadable store means there is nothing to carry over.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn read_image_boot_policy(path: &std::path::Path) -> LoaderIntegrityPolicy {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| easydeploymesh_bcd::windows_loader_integrity_policy(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// `bcdedit` arguments that re-apply the image's boot-integrity policy to the
+/// store bcdboot created on the system partition. Some repackaged Windows 7
+/// images ship a boot loader that the image's own Boot Manager only starts
+/// with integrity checks disabled, and record that in their original store.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn boot_policy_commands(firmware: &str, policy: LoaderIntegrityPolicy) -> Vec<Vec<String>> {
+    if !policy.disable_integrity_checks {
+        return Vec::new();
+    }
+    let store = if firmware == "UEFI" {
+        r"S:\EFI\Microsoft\Boot\BCD"
+    } else {
+        r"S:\Boot\BCD"
+    };
+    [
+        ["loadoptions", "DISABLE_INTEGRITY_CHECKS"],
+        ["nointegritychecks", "Yes"],
+    ]
+    .into_iter()
+    .map(|[name, value]| {
+        ["/store", store, "/set", "{default}", name, value]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    })
+    .collect()
 }
 
 fn matching_disk<'a>(lease: &AgentJobLease, disks: &'a [Disk]) -> Result<&'a Disk, Box<dyn Error>> {
@@ -266,10 +334,13 @@ fn prepare_layout(lease: &AgentJobLease, disk: &Disk) -> Result<PreparedLayout, 
         .partition_plan
         .validate_capacity(disk.size_bytes, lease.image.size_bytes)?;
     if let Some(gho) = &lease.gho {
+        if gho.volume_size_bytes == 0 {
+            return Err("GHO lease does not state the restored volume size".into());
+        }
         lease.partition_plan.validate_windows_payload_capacity(
             disk.size_bytes,
             lease.image.size_bytes,
-            gho.expanded_size_bytes,
+            gho.volume_size_bytes,
         )?;
     }
 
@@ -589,53 +660,88 @@ fn verify_image(
     Ok(())
 }
 
+/// Hashes the logical GHO stream while honouring pause and cancel requests.
 #[cfg(target_os = "windows")]
-struct DigestWriter<'a, W, C> {
-    inner: W,
+struct DigestSink<'a, C> {
     digest: Sha256,
-    written: u64,
+    consumed: u64,
+    unchecked: u64,
     control_state: &'a mut C,
     reporter: TransferReporter<'a>,
 }
 
+/// Logical stream bytes processed between pause/cancel checks.
 #[cfg(target_os = "windows")]
-impl<W: Write, C> Write for DigestWriter<'_, W, C>
+const CONTROL_CHECK_INTERVAL_BYTES: u64 = 4 * 1024 * 1024;
+
+#[cfg(target_os = "windows")]
+impl<C> Write for DigestSink<'_, C>
 where
     C: FnMut() -> Result<JobState, Box<dyn Error>>,
 {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        await_running(self.control_state).map_err(|error| io::Error::other(error.to_string()))?;
-        let count = self.inner.write(bytes)?;
-        self.digest.update(&bytes[..count]);
-        self.written = self.written.saturating_add(count as u64);
-        self.reporter.report(self.written, false);
-        Ok(count)
+        // Writes range from single tag bytes to 1 MiB of run data, so check
+        // pause/cancel by volume processed rather than by write size.
+        self.unchecked = self.unchecked.saturating_add(bytes.len() as u64);
+        if self.unchecked >= CONTROL_CHECK_INTERVAL_BYTES {
+            self.unchecked = 0;
+            await_running(self.control_state)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        }
+        self.digest.update(bytes);
+        self.consumed = self.consumed.saturating_add(bytes.len() as u64);
+        if self.unchecked == 0 {
+            self.reporter.report(self.consumed, false);
+        }
+        Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+        Ok(())
     }
 }
 
+/// Restores the NTFS volume onto `W:`. Returns whether the target partition is
+/// larger than the restored file system, which then needs extending.
 #[cfg(target_os = "windows")]
 fn restore_gho_partition(
     image_path: &Path,
     metadata: &easydeploymesh_core::AgentGhoDeployment,
     control_state: &mut impl FnMut() -> Result<JobState, Box<dyn Error>>,
     local: &mut dyn FnMut(LocalProgress),
-) -> Result<(), Box<dyn Error>> {
+) -> Result<bool, Box<dyn Error>> {
     use std::fs::OpenOptions;
 
     if metadata.parser_version != easydeploymesh_gho::PARSER_VERSION {
         return Err("GHO parser version does not match the control service".into());
     }
+    if metadata.volume_size_bytes == 0 {
+        return Err("GHO lease does not state the restored volume size".into());
+    }
     let mut image = File::open(image_path)?;
-    let volume = OpenOptions::new().read(true).write(true).open(r"\\.\W:")?;
+    let mut volume = OpenOptions::new().read(true).write(true).open(r"\\.\W:")?;
     let volume_lock = LockedVolume::acquire(&volume)?;
-    let mut output = DigestWriter {
-        inner: volume,
+    let extent = volume_lock.extent()?;
+    if extent.bytes_per_sector != 512 {
+        return Err(format!(
+            "target disk uses {}-byte logical sectors; GHO restore requires 512-byte sectors",
+            extent.bytes_per_sector
+        )
+        .into());
+    }
+    if extent.length_bytes < metadata.volume_size_bytes {
+        return Err(format!(
+            "target Windows partition holds {} bytes but the GHO volume needs {}",
+            extent.length_bytes, metadata.volume_size_bytes
+        )
+        .into());
+    }
+    let hidden_sectors = u32::try_from(extent.starting_offset_bytes / 512)
+        .map_err(|_| "target partition starts beyond the NTFS hidden-sector range")?;
+    let mut sink = DigestSink {
         digest: Sha256::new(),
-        written: 0,
+        consumed: 0,
+        unchecked: 0,
         control_state,
         reporter: TransferReporter::new(
             local,
@@ -643,28 +749,64 @@ fn restore_gho_partition(
             metadata.expanded_size_bytes,
         ),
     };
-    let (_, decoded) = easydeploymesh_gho::decode_partition(
+    let restored = easydeploymesh_gho::restore_partition(
         &mut image,
         metadata.source_partition,
-        &mut output,
-        metadata.expanded_size_bytes,
+        &mut volume,
+        &mut sink,
+        easydeploymesh_gho::RestoreOptions {
+            target_size_bytes: extent.length_bytes,
+            hidden_sectors: Some(hidden_sectors),
+            expanded_limit: metadata.expanded_size_bytes,
+        },
     )?;
-    output.flush()?;
-    output.inner.sync_all()?;
-    output.reporter.report(output.written, true);
-    let actual_sha256 = format!("{:x}", output.digest.finalize());
-    if decoded != metadata.expanded_size_bytes || output.written != metadata.expanded_size_bytes {
+    let verified = restored.partition;
+    volume.sync_all()?;
+    sink.reporter.report(sink.consumed, true);
+    let actual_sha256 = format!("{:x}", sink.digest.finalize());
+    if verified.expanded_size_bytes != metadata.expanded_size_bytes
+        || sink.consumed != metadata.expanded_size_bytes
+    {
         return Err(format!(
-            "GHO expanded size mismatch: expected {}, decoded {decoded}, written {}",
-            metadata.expanded_size_bytes, output.written
+            "GHO expanded size mismatch: expected {}, decoded {}",
+            metadata.expanded_size_bytes, verified.expanded_size_bytes
         )
         .into());
     }
     if !actual_sha256.eq_ignore_ascii_case(&metadata.expanded_sha256) {
         return Err("GHO expanded SHA-256 mismatch".into());
     }
+    if verified.volume_size_bytes() != metadata.volume_size_bytes {
+        return Err("GHO restored volume size differs from the approved image".into());
+    }
+    // Read every written region back through the still-locked volume before
+    // anything else touches it.
+    let mut last_check = 0_u64;
+    restored
+        .written
+        .verify(&mut volume, &mut |done| {
+            if done - last_check >= CONTROL_CHECK_INTERVAL_BYTES {
+                last_check = done;
+                await_running(sink.control_state)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+            }
+            Ok(())
+        })
+        .map_err(|error| match error {
+            easydeploymesh_gho::Error::ReadBackMismatch => {
+                format!("GHO read-back verification failed: {error}")
+            }
+            other => other.to_string(),
+        })?;
     drop(volume_lock);
-    Ok(())
+    Ok(extent.length_bytes > verified.volume_size_bytes() + verified.geometry.cluster_size)
+}
+
+#[cfg(target_os = "windows")]
+struct VolumeExtent {
+    length_bytes: u64,
+    starting_offset_bytes: u64,
+    bytes_per_sector: u32,
 }
 
 #[cfg(target_os = "windows")]
@@ -701,8 +843,86 @@ impl LockedVolume {
                 );
                 return Err(error.into());
             }
+            // The backup boot sector may sit past the dismounted file
+            // system's last sector; lift the volume boundary check.
+            if let Err(error) = DeviceIoControl(
+                handle,
+                windows::Win32::System::Ioctl::FSCTL_ALLOW_EXTENDED_DASD_IO,
+                None,
+                0,
+                None,
+                0,
+                None,
+                None,
+            ) {
+                let _ = DeviceIoControl(
+                    handle,
+                    windows::Win32::System::Ioctl::FSCTL_UNLOCK_VOLUME,
+                    None,
+                    0,
+                    None,
+                    0,
+                    None,
+                    None,
+                );
+                return Err(error.into());
+            }
         }
         Ok(Self { handle })
+    }
+
+    fn extent(&self) -> Result<VolumeExtent, Box<dyn Error>> {
+        use windows::Win32::System::{
+            IO::DeviceIoControl,
+            Ioctl::{
+                DISK_GEOMETRY, GET_LENGTH_INFORMATION, IOCTL_DISK_GET_DRIVE_GEOMETRY,
+                IOCTL_DISK_GET_LENGTH_INFO, IOCTL_DISK_GET_PARTITION_INFO_EX,
+                PARTITION_INFORMATION_EX,
+            },
+        };
+
+        let mut length = GET_LENGTH_INFORMATION::default();
+        let mut partition = PARTITION_INFORMATION_EX::default();
+        let mut geometry = DISK_GEOMETRY::default();
+        let mut returned = 0_u32;
+        unsafe {
+            DeviceIoControl(
+                self.handle,
+                IOCTL_DISK_GET_DRIVE_GEOMETRY,
+                None,
+                0,
+                Some((&mut geometry as *mut DISK_GEOMETRY).cast()),
+                size_of::<DISK_GEOMETRY>() as u32,
+                Some(&mut returned),
+                None,
+            )?;
+            DeviceIoControl(
+                self.handle,
+                IOCTL_DISK_GET_LENGTH_INFO,
+                None,
+                0,
+                Some((&mut length as *mut GET_LENGTH_INFORMATION).cast()),
+                size_of::<GET_LENGTH_INFORMATION>() as u32,
+                Some(&mut returned),
+                None,
+            )?;
+            DeviceIoControl(
+                self.handle,
+                IOCTL_DISK_GET_PARTITION_INFO_EX,
+                None,
+                0,
+                Some((&mut partition as *mut PARTITION_INFORMATION_EX).cast()),
+                size_of::<PARTITION_INFORMATION_EX>() as u32,
+                Some(&mut returned),
+                None,
+            )?;
+        }
+        Ok(VolumeExtent {
+            length_bytes: u64::try_from(length.Length).map_err(|_| "volume length is negative")?,
+            starting_offset_bytes: u64::try_from(partition.StartingOffset)
+                .map_err(|_| "partition offset is negative")?,
+            bytes_per_sector: geometry.BytesPerSector,
+        })
     }
 }
 
@@ -890,6 +1110,58 @@ mod tests {
     };
     use uuid::Uuid;
 
+    #[test]
+    fn image_boot_policy_is_reapplied_to_the_new_store_only_when_present() {
+        let disabled = LoaderIntegrityPolicy {
+            disable_integrity_checks: true,
+        };
+        assert!(boot_policy_commands("BIOS", LoaderIntegrityPolicy::default()).is_empty());
+        assert_eq!(
+            boot_policy_commands("BIOS", disabled),
+            vec![
+                vec![
+                    "/store",
+                    r"S:\Boot\BCD",
+                    "/set",
+                    "{default}",
+                    "loadoptions",
+                    "DISABLE_INTEGRITY_CHECKS"
+                ],
+                vec![
+                    "/store",
+                    r"S:\Boot\BCD",
+                    "/set",
+                    "{default}",
+                    "nointegritychecks",
+                    "Yes"
+                ],
+            ]
+        );
+        assert!(
+            boot_policy_commands("UEFI", disabled)
+                .iter()
+                .all(|arguments| arguments[1] == r"S:\EFI\Microsoft\Boot\BCD")
+        );
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_image_boot_store_carries_no_policy() {
+        let directory = std::env::temp_dir().join(format!("edm-bcd-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let missing = directory.join("missing");
+        assert_eq!(
+            read_image_boot_policy(&missing),
+            LoaderIntegrityPolicy::default()
+        );
+        let garbage = directory.join("BCD");
+        std::fs::write(&garbage, b"not a registry hive").unwrap();
+        assert_eq!(
+            read_image_boot_policy(&garbage),
+            LoaderIntegrityPolicy::default()
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     fn lease(plan: PartitionPlan) -> AgentJobLease {
         AgentJobLease {
             job_id: Uuid::new_v4(),
@@ -949,8 +1221,9 @@ mod tests {
         deployment.image.format = ImageFormat::Gho;
         deployment.gho = Some(AgentGhoDeployment {
             source_partition: 1,
-            expanded_size_bytes: 56 * 1024 * 1024 * 1024,
+            expanded_size_bytes: 4 * 1024 * 1024 * 1024,
             expanded_sha256: "11".repeat(32),
+            volume_size_bytes: 56 * 1024 * 1024 * 1024,
             parser_version: easydeploymesh_gho::PARSER_VERSION,
         });
 
@@ -958,6 +1231,25 @@ mod tests {
             .expect_err("raw GHO payload must fit before partitioning")
             .to_string();
         assert!(error.contains("raw Windows partition payload"));
+    }
+
+    #[test]
+    fn gho_lease_without_a_volume_size_is_rejected() {
+        let mut deployment = lease(PartitionPlan::uefi_gpt());
+        deployment.operation = Operation::DeployGho;
+        deployment.image.format = ImageFormat::Gho;
+        deployment.gho = Some(AgentGhoDeployment {
+            source_partition: 1,
+            expanded_size_bytes: 1024,
+            expanded_sha256: "11".repeat(32),
+            volume_size_bytes: 0,
+            parser_version: easydeploymesh_gho::PARSER_VERSION,
+        });
+
+        let error = prepare_layout(&deployment, &disk())
+            .expect_err("a GHO lease must carry the volume size")
+            .to_string();
+        assert!(error.contains("restored volume size"));
     }
 
     #[test]

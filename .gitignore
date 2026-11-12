@@ -14,3 +14,4 @@ release/
 .env.*
 !.env.example
 *.exe
+decompiled/

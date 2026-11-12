@@ -1,3 +1,5 @@
+#[path = "deployment_validation.rs"]
+mod deployment_validation;
 #[path = "installer_deployment.rs"]
 mod installer_deployment;
 
@@ -14,6 +16,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use deployment_validation::{DeploymentValidationCache, Validated};
 use easydeploymesh_core::{
     ActivitySeverity, ActivitySource, ActivitySubject, AgentDeploymentImage, AgentGhoDeployment,
     AgentHeartbeat, AgentHeartbeatAck, AgentInventory, AgentJobCompletion, AgentJobLease,
@@ -26,7 +29,7 @@ use installer_deployment::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     str::FromStr,
@@ -73,6 +76,7 @@ struct ApiState {
     activities: Arc<ActivityRepository>,
     installer: Arc<InstallerDeployment>,
     installer_base_url: String,
+    validations: Arc<DeploymentValidationCache>,
 }
 
 struct RunningServer {
@@ -86,6 +90,9 @@ pub struct ControlPlane {
     jobs: Arc<JobRepository>,
     images: Arc<ImageLibrary>,
     activities: Arc<ActivityRepository>,
+    /// Kept across control-service restarts so a running lease can still
+    /// download its revalidated image.
+    validations: Arc<DeploymentValidationCache>,
     running: Mutex<Option<RunningServer>>,
 }
 
@@ -101,6 +108,7 @@ impl ControlPlane {
             jobs,
             images,
             activities,
+            validations: Arc::new(DeploymentValidationCache::default()),
             running: Mutex::new(None),
         }
     }
@@ -155,6 +163,7 @@ impl ControlPlane {
                 Arc::clone(&self.images),
             )),
             installer_base_url: format!("http://{local_address}"),
+            validations: Arc::clone(&self.validations),
         };
         let router = Router::new()
             .route("/health", get(health))
@@ -405,34 +414,47 @@ async fn claim_job(
                 && job.options.partition_plan.validate().is_ok()
         })
         .collect::<Vec<_>>();
-    let images = Arc::clone(&state.images);
-    let eligible_job_ids = tokio::task::spawn_blocking(move || {
-        let mut validation_results = HashMap::new();
-        candidates
-            .into_iter()
-            .filter_map(|job| {
-                let validation_key = (job.image_id, job.options.image_index, job.operation);
-                let eligible =
-                    *validation_results.entry(validation_key).or_insert_with(|| {
-                        match job.operation {
-                            Operation::DeployWim => images
-                                .revalidate_for_deployment(job.image_id, job.options.image_index)
-                                .is_ok(),
-                            Operation::DeployGho => images
-                                .prepare_gho_partition_deployment(
-                                    job.image_id,
-                                    job.options.image_index,
-                                )
-                                .is_ok(),
-                            Operation::CaptureGho | Operation::InstallLinux => false,
-                        }
-                    });
-                eligible.then_some(job.id)
-            })
-            .collect::<HashSet<_>>()
-    })
-    .await
-    .map_err(|error| ApiError::Conflict(format!("image validation task failed: {error}")))?;
+    // Image revalidation can take minutes for a large GHO, so it runs in the
+    // background and the job is leased on a later claim once it has passed.
+    // One deadline covers every candidate so the claim stays well inside the
+    // Agent's timeout.
+    let deadline = tokio::time::Instant::now() + deployment_validation::CLAIM_WAIT;
+    let mut validated_jobs = HashMap::new();
+    for job in candidates {
+        match state
+            .validations
+            .status_for_claim(&state.images, &job, deadline)
+            .await
+        {
+            deployment_validation::Status::Passed(validated) => {
+                validated_jobs.insert(job.id, validated);
+            }
+            deployment_validation::Status::Running { started: true }
+                if state.validations.announce_once(&job) =>
+            {
+                record_job_activity(
+                    &state,
+                    &job,
+                    "job_image_validating",
+                    ActivitySeverity::Info,
+                    None,
+                );
+            }
+            deployment_validation::Status::Running { .. } => {}
+            deployment_validation::Status::Failed(error) => {
+                let message = error.to_string();
+                if state.validations.report_failure_once(&job, &message) {
+                    record_job_activity(
+                        &state,
+                        &job,
+                        "job_image_validation_failed",
+                        ActivitySeverity::Error,
+                        Some(message),
+                    );
+                }
+            }
+        }
+    }
     let lease_result = state
         .registry
         .with_current(device_id, |current_device| {
@@ -440,7 +462,7 @@ async fn claim_job(
                 device_id,
                 chrono::Duration::minutes(JOB_LEASE_MINUTES),
                 |job| {
-                    eligible_job_ids.contains(&job.id)
+                    validated_jobs.contains_key(&job.id)
                         && matches!(job.operation, Operation::DeployWim | Operation::DeployGho)
                         && job.targets.len() == 1
                         && job.targets[0].device_id == device_id
@@ -476,13 +498,15 @@ async fn claim_job(
         "/api/v1/agents/{device_id}/jobs/{}/image?leaseId={lease_id}",
         job.id
     );
-    let (gho, download_size_bytes, download_sha256) = if job.operation == Operation::DeployGho {
-        let prepared = state
-            .images
-            .prepare_gho_partition_deployment(job.image_id, job.options.image_index)
-            .map_err(ApiError::Images)?;
-        let metadata =
-            AgentGhoDeployment {
+    let validated = validated_jobs
+        .get(&job.id)
+        .cloned()
+        .ok_or(ApiError::Conflict(
+            "leased job has no revalidated image".to_owned(),
+        ))?;
+    let (gho, download_size_bytes, download_sha256) =
+        if let Validated::Gho(prepared) = validated.as_ref() {
+            let metadata = AgentGhoDeployment {
                 source_partition: prepared.capability.source_partition.ok_or_else(|| {
                     ApiError::Conflict("GHO source partition is missing".to_owned())
                 })?,
@@ -490,25 +514,30 @@ async fn claim_job(
                     .capability
                     .expanded_size_bytes
                     .ok_or_else(|| ApiError::Conflict("GHO expanded size is missing".to_owned()))?,
-                expanded_sha256: prepared.capability.expanded_sha256.ok_or_else(|| {
+                expanded_sha256: prepared.capability.expanded_sha256.clone().ok_or_else(|| {
                     ApiError::Conflict("GHO expanded checksum is missing".to_owned())
                 })?,
+                volume_size_bytes: prepared
+                    .capability
+                    .volume_size_bytes
+                    .filter(|size| *size > 0)
+                    .ok_or_else(|| ApiError::Conflict("GHO volume size is missing".to_owned()))?,
                 parser_version: prepared.capability.parser_version,
             };
-        (
-            Some(metadata),
-            prepared.download_size_bytes,
-            prepared.download_sha256,
-        )
-    } else {
-        (
-            None,
-            image.size_bytes,
-            image.sha256.clone().ok_or(ApiError::Conflict(
-                "deployment image has no checksum".to_owned(),
-            ))?,
-        )
-    };
+            (
+                Some(metadata),
+                prepared.download_size_bytes,
+                prepared.download_sha256.clone(),
+            )
+        } else {
+            (
+                None,
+                image.size_bytes,
+                image.sha256.clone().ok_or(ApiError::Conflict(
+                    "deployment image has no checksum".to_owned(),
+                ))?,
+            )
+        };
     Ok(Json(Some(AgentJobLease {
         job_id: job.id,
         lease_id,
@@ -651,15 +680,23 @@ async fn download_job_image(
         .ok_or(ApiError::NotFound)?;
     let (reader, length): (Box<dyn AsyncRead + Unpin + Send>, u64) =
         if job.operation == Operation::DeployGho {
-            let prepared = state
-                .images
-                .prepare_gho_partition_deployment(job.image_id, job.options.image_index)
-                .map_err(ApiError::Images)?;
+            // The lease was issued from this revalidation; refuse the download
+            // if the image files changed since.
+            let validated = state.validations.passed_for_lease(&job).ok_or_else(|| {
+                ApiError::Conflict(
+                    "GHO image revalidation is missing or out of date for this lease".to_owned(),
+                )
+            })?;
+            let Validated::Gho(prepared) = validated.as_ref() else {
+                return Err(ApiError::Conflict(
+                    "leased GHO job has no GHO revalidation".to_owned(),
+                ));
+            };
             let primary = tokio::fs::File::open(&prepared.image.primary.canonical_path)
                 .await
                 .map_err(|_| ApiError::NotFound)?;
             let mut reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(primary);
-            for span in prepared.image.spans {
+            for span in &prepared.image.spans {
                 let mut file = tokio::fs::File::open(&span.canonical_path)
                     .await
                     .map_err(|_| ApiError::NotFound)?;
@@ -1731,28 +1768,8 @@ mod tests {
         control_plane.stop().await.unwrap();
     }
 
-    fn gho_fixture(partitions: &[&[u8]]) -> Vec<u8> {
-        let mut contents = vec![0_u8; 512];
-        contents[0..8].copy_from_slice(&[0xfe, 0xef, 1, 0, 1, 2, 3, 4]);
-        for partition in partitions {
-            contents.extend_from_slice(&0x0603_u32.to_le_bytes());
-            contents.extend_from_slice(&0x012f_18d8_u32.to_le_bytes());
-            contents.extend_from_slice(&20_u16.to_le_bytes());
-            contents.extend_from_slice(&[0; 20]);
-            let mut header = vec![0_u8; 512];
-            header[0..2].copy_from_slice(&0xeffe_u16.to_le_bytes());
-            contents.extend(header);
-            contents.extend_from_slice(&(partition.len() as u16 + 2).to_le_bytes());
-            contents.extend_from_slice(partition);
-        }
-        contents.extend_from_slice(&0x0023_u32.to_le_bytes());
-        contents.extend_from_slice(&0x012f_18d8_u32.to_le_bytes());
-        contents.extend_from_slice(&0_u16.to_le_bytes());
-        contents
-    }
-
     #[tokio::test]
-    async fn gho_lease_and_download_bind_the_selected_partition_and_normalized_spans() {
+    async fn gho_lease_and_download_bind_the_volume_and_normalized_spans() {
         use sha2::{Digest, Sha256};
 
         let temp = tempfile::tempdir().expect("temporary directory should be available");
@@ -1783,12 +1800,12 @@ mod tests {
             .await
             .unwrap();
 
-        let normalized = gho_fixture(&[b"\xebR\x90NTFS    reserved", b"\xebR\x90NTFS    windows"]);
+        let normalized = easydeploymesh_gho::fixtures::image();
         let split_at = 700;
         let primary = temp.path().join("disk.gho");
         std::fs::write(&primary, &normalized[..split_at]).unwrap();
         let mut span = vec![0_u8; 512];
-        span[0..8].copy_from_slice(&[0xfe, 0xef, 9, 0, 1, 2, 3, 4]);
+        span[0..8].copy_from_slice(&[0xfe, 0xef, 9, normalized[3], 1, 2, 3, 4]);
         span.extend_from_slice(&normalized[split_at..]);
         std::fs::write(temp.path().join("disk001.ghs"), span).unwrap();
         let image = images.import(&primary).expect("spanned GHO should import");
@@ -1805,7 +1822,7 @@ mod tests {
                     target_disk_size_bytes: disk().size_bytes,
                 }],
                 options: DeploymentOptions {
-                    image_index: 2,
+                    image_index: 1,
                     partition_plan: PartitionPlan::uefi_gpt(),
                     linux_install: None,
                 },
@@ -1827,7 +1844,13 @@ mod tests {
             .await
             .unwrap()
             .expect("GHO job should lease");
-        assert_eq!(lease.gho.as_ref().unwrap().source_partition, 2);
+        let gho = lease.gho.as_ref().unwrap();
+        assert_eq!(gho.source_partition, 1);
+        assert_eq!(
+            gho.volume_size_bytes,
+            easydeploymesh_gho::fixtures::VOLUME_BYTES
+        );
+        assert_eq!(gho.parser_version, easydeploymesh_gho::PARSER_VERSION);
         assert_eq!(lease.image.size_bytes, normalized.len() as u64);
         assert_eq!(
             lease.image.sha256,

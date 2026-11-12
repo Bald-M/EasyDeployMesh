@@ -35,6 +35,7 @@ windows = { version = "0.62.2", features = ["Win32_Storage_FileSystem"] }
 nix = { version = "0.30.1", features = ["socket", "uio"] }
 
 [dev-dependencies]
+easydeploymesh-gho = { path = "../gho", features = ["fixtures"] }
 hadris-udf = { version = "2.1.0", features = ["write"] }
 reqwest.workspace = true
 tempfile = "3.23.0"

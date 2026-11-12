@@ -95,10 +95,12 @@ All user-visible strings go in both `i18n/locales/zh-CN.json` and `en-US.json`.
 
 ## Repo-specific notes
 
-- GHO status is inconsistent across docs: `README.md` says GHO/GHS import and
-  restore are unsupported, while `DESIGN.md`, `AGENTS.md`, and the code
-  (`crates/gho`, `ImageLibrary`, Agent restore path) still contain a native GHO
-  pipeline. Confirm the intended behavior with the user before touching GHO.
+- GHO restore is a preview limited to zlib-compressed Ghost 11.x
+  single-partition NTFS images; `docs/gho-format.md` is the format reference.
+  Validate parser changes against a real image
+  (`EASYDEPLOYMESH_GHO_PATH=... cargo test -p easydeploymesh-gho -- --ignored`).
+  The local `decompiled/` directory holds third-party decompiled code, is
+  git-ignored, and must never be committed or copied into source.
 - `scripts/` diagnostic marker strings and exit codes are a machine-readable
   interface; change them only together with their tests and docs.
 - Version bumps must stay in sync across `Cargo.toml`, both `package.json`

@@ -1,15 +1,26 @@
-//! Bounds-checked, read-only Norton Ghost 11.x/12.x partition-image decoder.
+//! Bounds-checked Norton Ghost 11.x partition-image reader and NTFS restorer.
+//!
+//! A Ghost NTFS image is not a raw volume dump. It is a stream of MFT records
+//! and the cluster runs of each record's non-resident attributes. Restoring
+//! places every stored run at its original LCN on the target volume,
+//! regenerates `$MFTMirr` and the backup boot sector, and leaves growing the
+//! file system to the operating system. See `docs/gho-format.md`.
 
-use flate2::read::ZlibDecoder;
+mod container;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures;
+mod ntfs;
+mod readback;
+
+pub use ntfs::{NtfsGeometry, RestoreOptions};
+pub use readback::WrittenRegions;
+
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use thiserror::Error;
 
-pub const PARSER_VERSION: u32 = 3;
-const HEADER_SIZE: u64 = 512;
-const RECORD_HEADER_SIZE: usize = 10;
-const RECORD_MAGIC: u32 = 0x012f_18d8;
-const BLOCK_SIZE: usize = 32 * 1024;
-const MAX_STORED_LEN: usize = 33_002;
+/// Bumped whenever accepted images or restore semantics change, so cached
+/// capability metadata is re-verified.
+pub const PARSER_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
@@ -18,7 +29,20 @@ pub enum Compression {
     High(u8),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileSystem {
+    Ntfs,
+}
+
+impl FileSystem {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ntfs => "ntfs",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageInfo {
     pub compression: Compression,
     pub partition_count: u32,
@@ -27,10 +51,23 @@ pub struct ImageInfo {
     pub spanned: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifiedPartition {
     pub info: ImageInfo,
+    pub file_system: FileSystem,
+    pub geometry: NtfsGeometry,
+    /// Bytes in the logical (expanded) partition stream.
     pub expanded_size_bytes: u64,
+    /// Whether an in-use MFT record is named `winload.exe`, i.e. the volume
+    /// holds Windows that BCDBoot can configure (Vista and later).
+    pub windows_boot_loader: bool,
+}
+
+impl VerifiedPartition {
+    /// Minimum target partition size.
+    pub fn volume_size_bytes(&self) -> u64 {
+        self.geometry.volume_size_bytes()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -51,17 +88,22 @@ pub enum Error {
     EncryptedUnsupported,
     #[error("GHO partition selection is invalid for an image containing {0} partitions")]
     PartitionCount(u32),
-    #[error("GHO compressed block is invalid")]
+    #[error("GHO compressed packet is invalid")]
     CorruptBlock,
+    #[error("GHO partition stream is invalid: {0}")]
+    CorruptStream(&'static str),
+    #[error("GHO partition does not contain an NTFS file system")]
+    UnsupportedFileSystem,
+    #[error("GHO NTFS volume is unsupported: {0}")]
+    UnsupportedVolume(&'static str),
+    #[error("target partition holds {available} bytes but the GHO volume needs {required}")]
+    TargetTooSmall { required: u64, available: u64 },
     #[error("GHO expanded data exceeds the configured limit")]
     ExpandedLimit,
+    #[error("restored volume does not read back the bytes that were written")]
+    ReadBackMismatch,
     #[error(transparent)]
     Io(#[from] io::Error),
-}
-
-#[derive(Debug, Clone)]
-struct Partition {
-    spans: Vec<(u64, u64)>,
 }
 
 /// Presents a primary GHO and its ordered GHS files as one seekable stream.
@@ -73,6 +115,9 @@ pub struct SpanReader<R> {
     position: u64,
     total: u64,
 }
+
+const FILE_MAGIC: u16 = 0xeffe;
+const HEADER_SIZE: u64 = container::HEADER_SIZE;
 
 impl<R: Read + Seek> SpanReader<R> {
     pub fn new(mut readers: Vec<R>) -> Result<Self, Error> {
@@ -87,7 +132,7 @@ impl<R: Read + Seek> SpanReader<R> {
         readers[0]
             .read_exact(&mut primary_header)
             .map_err(map_eof)?;
-        if u16::from_le_bytes([primary_header[0], primary_header[1]]) != 0xeffe
+        if u16::from_le_bytes([primary_header[0], primary_header[1]]) != FILE_MAGIC
             || primary_header[2] != 1
         {
             return Err(Error::InvalidMagic);
@@ -104,7 +149,7 @@ impl<R: Read + Seek> SpanReader<R> {
                 reader.seek(SeekFrom::Start(0))?;
                 let mut header = [0_u8; HEADER_SIZE as usize];
                 reader.read_exact(&mut header).map_err(map_eof)?;
-                if u16::from_le_bytes([header[0], header[1]]) != 0xeffe
+                if u16::from_le_bytes([header[0], header[1]]) != FILE_MAGIC
                     || header[2] != 9
                     || header[3] != compression
                     || &header[4..8] != primary_id
@@ -181,352 +226,93 @@ impl<R: Read + Seek> Seek for SpanReader<R> {
     }
 }
 
+/// Reads the container structure without decoding partition data.
 pub fn inspect<R: Read + Seek>(reader: &mut R) -> Result<ImageInfo, Error> {
-    let (_, info) = parse(reader)?;
-    Ok(info)
+    Ok(container::locate(reader)?.info)
 }
 
+/// Decodes and validates the whole partition stream without writing.
 pub fn verify<R: Read + Seek>(
     reader: &mut R,
     expanded_limit: u64,
 ) -> Result<VerifiedPartition, Error> {
-    let mut sink = io::sink();
-    let (info, expanded_size_bytes) = decode_partition(reader, 1, &mut sink, expanded_limit)?;
+    analyze_partition(reader, 1, &mut io::sink(), expanded_limit)
+}
+
+/// Validates the partition stream as a dry-run restore and copies every
+/// logical stream byte into `sink` (for example a digest).
+pub fn analyze_partition<R: Read + Seek, S: Write>(
+    reader: &mut R,
+    source_partition: u32,
+    sink: &mut S,
+    expanded_limit: u64,
+) -> Result<VerifiedPartition, Error> {
+    process(
+        reader,
+        source_partition,
+        sink,
+        &mut ntfs::DryRun,
+        RestoreOptions {
+            target_size_bytes: u64::MAX,
+            hidden_sectors: None,
+            expanded_limit,
+        },
+    )
+}
+
+/// Result of a restore: the validated partition and a record of every region
+/// written, for read-back verification once the writes are durable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredPartition {
+    pub partition: VerifiedPartition,
+    pub written: WrittenRegions,
+}
+
+/// Restores the partition onto `target`, which must address the target
+/// volume from its first byte. Every logical stream byte is also copied into
+/// `sink`. On error the target may be partially written.
+pub fn restore_partition<R: Read + Seek, W: Write + Seek, S: Write>(
+    reader: &mut R,
+    source_partition: u32,
+    target: &mut W,
+    sink: &mut S,
+    options: RestoreOptions,
+) -> Result<RestoredPartition, Error> {
+    let mut target = readback::Recording::new(ntfs::SeekTarget { inner: target });
+    let partition = process(reader, source_partition, sink, &mut target, options)?;
+    let (target, written) = target.finish();
+    target.inner.flush()?;
+    Ok(RestoredPartition { partition, written })
+}
+
+fn process<R: Read + Seek, S: Write, T: ntfs::Target>(
+    reader: &mut R,
+    source_partition: u32,
+    sink: &mut S,
+    target: &mut T,
+    options: RestoreOptions,
+) -> Result<VerifiedPartition, Error> {
+    let layout = container::locate(reader)?;
+    if source_partition != 1 {
+        return Err(Error::PartitionCount(layout.info.partition_count));
+    }
+    let mut stream = ntfs::Tee {
+        inner: container::LogicalStream::new(reader, &layout),
+        sink,
+        consumed: 0,
+        limit: options.expanded_limit,
+    };
+    let outcome = ntfs::run(&mut stream, target, options)?;
     Ok(VerifiedPartition {
-        info,
-        expanded_size_bytes,
+        info: layout.info,
+        file_system: FileSystem::Ntfs,
+        geometry: outcome.geometry,
+        expanded_size_bytes: stream.consumed,
+        windows_boot_loader: outcome.windows_boot_loader,
     })
 }
 
-pub fn decode_partition<R: Read + Seek, W: Write>(
-    reader: &mut R,
-    source_partition: u32,
-    output: &mut W,
-    expanded_limit: u64,
-) -> Result<(ImageInfo, u64), Error> {
-    let (partitions, info) = parse(reader)?;
-    if source_partition == 0 || source_partition > info.partition_count {
-        return Err(Error::PartitionCount(info.partition_count));
-    }
-    let partition = partitions
-        .get((source_partition - 1) as usize)
-        .ok_or(Error::PartitionCount(info.partition_count))?;
-    let mut total = 0_u64;
-    let mut compressed = vec![0_u8; MAX_STORED_LEN];
-    let mut expanded = vec![0_u8; BLOCK_SIZE + 1024];
-    for &(start, end) in &partition.spans {
-        let mut offset = start;
-        while offset.checked_add(2).is_some_and(|next| next <= end) {
-            reader.seek(SeekFrom::Start(offset))?;
-            let mut length = [0_u8; 2];
-            reader.read_exact(&mut length).map_err(map_eof)?;
-            let stored = usize::from(u16::from_le_bytes(length));
-            if stored == 0 {
-                break;
-            }
-            if !(3..=MAX_STORED_LEN).contains(&stored) {
-                return Err(Error::CorruptBlock);
-            }
-            let data_len = stored - 2;
-            let next = offset
-                .checked_add(stored as u64)
-                .ok_or(Error::CorruptBlock)?;
-            if next > end {
-                return Err(Error::Truncated);
-            }
-            reader
-                .read_exact(&mut compressed[..data_len])
-                .map_err(map_eof)?;
-            let count = match info.compression {
-                Compression::None => {
-                    if data_len > expanded.len() {
-                        return Err(Error::CorruptBlock);
-                    }
-                    expanded[..data_len].copy_from_slice(&compressed[..data_len]);
-                    data_len
-                }
-                Compression::Fast => fast_lz(&compressed[..data_len], &mut expanded)?,
-                Compression::High(_) => zlib(&compressed[..data_len], &mut expanded)?,
-            };
-            total = total
-                .checked_add(count as u64)
-                .ok_or(Error::ExpandedLimit)?;
-            if total > expanded_limit {
-                return Err(Error::ExpandedLimit);
-            }
-            output.write_all(&expanded[..count])?;
-            offset = next;
-        }
-    }
-    Ok((info, total))
-}
-
-fn parse<R: Read + Seek>(reader: &mut R) -> Result<(Vec<Partition>, ImageInfo), Error> {
-    let file_len = reader.seek(SeekFrom::End(0))?;
-    if file_len < HEADER_SIZE {
-        return Err(Error::Truncated);
-    }
-    reader.seek(SeekFrom::Start(0))?;
-    let mut header = [0_u8; HEADER_SIZE as usize];
-    reader.read_exact(&mut header).map_err(map_eof)?;
-    if u16::from_le_bytes([header[0], header[1]]) != 0xeffe {
-        return Err(Error::InvalidMagic);
-    }
-    if header[2] != 1 {
-        return Err(Error::SpannedUnsupported);
-    }
-    if header[12] & 0x02 != 0 {
-        return Err(Error::EncryptedUnsupported);
-    }
-    let compression = match header[3] {
-        0 => Compression::None,
-        2 => Compression::Fast,
-        value @ 3..=9 => Compression::High(value),
-        // Some Ghost 11/12 producers encode Z9 as tag 10. Decompression is
-        // still zlib; normalize the displayed level without rejecting it.
-        10 => Compression::High(9),
-        value => return Err(Error::UnsupportedCompression(value)),
-    };
-    let mut partitions: Vec<Partition> = Vec::new();
-    let mut offset = HEADER_SIZE;
-    while offset < file_len {
-        let record = find_record(reader, offset, file_len)?;
-        let Some((record_offset, kind, body_len)) = record else {
-            break;
-        };
-        let body_end = record_offset
-            .checked_add(RECORD_HEADER_SIZE as u64)
-            .and_then(|v| v.checked_add(body_len as u64))
-            .ok_or(Error::InvalidRecord)?;
-        if body_end > file_len {
-            return Err(Error::Truncated);
-        }
-        match kind {
-            0x0603 => {
-                let data_start = body_end
-                    .checked_add(HEADER_SIZE)
-                    .ok_or(Error::InvalidRecord)?;
-                if data_start > file_len {
-                    return Err(Error::Truncated);
-                }
-                reader.seek(SeekFrom::Start(body_end))?;
-                let mut magic = [0_u8; 2];
-                reader.read_exact(&mut magic).map_err(map_eof)?;
-                if u16::from_le_bytes(magic) != 0xeffe {
-                    return Err(Error::InvalidMagic);
-                }
-                let data_end = find_record(reader, data_start, file_len)?.map_or(file_len, |v| v.0);
-                partitions.push(Partition {
-                    spans: vec![(data_start, data_end)],
-                });
-                offset = data_end;
-            }
-            0x0703 => {
-                let mut data_start = body_end;
-                if data_start + HEADER_SIZE <= file_len {
-                    reader.seek(SeekFrom::Start(data_start))?;
-                    let mut magic = [0_u8; 2];
-                    reader.read_exact(&mut magic).map_err(map_eof)?;
-                    if u16::from_le_bytes(magic) == 0xeffe {
-                        data_start += HEADER_SIZE;
-                    }
-                }
-                let data_end = find_record(reader, data_start, file_len)?.map_or(file_len, |v| v.0);
-                partitions
-                    .last_mut()
-                    .ok_or(Error::InvalidRecord)?
-                    .spans
-                    .push((data_start, data_end));
-                offset = data_end;
-            }
-            0x0023 => break,
-            _ => offset = body_end,
-        }
-    }
-    let count = u32::try_from(partitions.len()).map_err(|_| Error::InvalidRecord)?;
-    if count == 0 {
-        return Err(Error::PartitionCount(count));
-    }
-    Ok((
-        partitions,
-        ImageInfo {
-            compression,
-            partition_count: count,
-            // Inspection describes the container. Callers must explicitly choose
-            // a one-based partition when more than one stream is present.
-            source_partition: 1,
-            encrypted: false,
-            spanned: false,
-        },
-    ))
-}
-
-fn find_record<R: Read + Seek>(
-    reader: &mut R,
-    start: u64,
-    end: u64,
-) -> Result<Option<(u64, u16, u16)>, Error> {
-    let mut offset = start;
-    let mut buffer = vec![0_u8; 64 * 1024 + RECORD_HEADER_SIZE];
-    while offset < end {
-        reader.seek(SeekFrom::Start(offset))?;
-        let remaining =
-            usize::try_from((end - offset).min(buffer.len() as u64)).unwrap_or(buffer.len());
-        let read = reader.read(&mut buffer[..remaining])?;
-        if read < RECORD_HEADER_SIZE {
-            return Ok(None);
-        }
-        for i in 0..=read - RECORD_HEADER_SIZE {
-            if u32::from_le_bytes(buffer[i + 4..i + 8].try_into().unwrap()) == RECORD_MAGIC {
-                let kind = u16::from_le_bytes(buffer[i..i + 2].try_into().unwrap());
-                if matches!(kind, 0x0006 | 0x0603 | 0x0703 | 0x0023) {
-                    let len = u16::from_le_bytes(buffer[i + 8..i + 10].try_into().unwrap());
-                    return Ok(Some((offset + i as u64, kind, len)));
-                }
-            }
-        }
-        offset = offset
-            .checked_add((read - (RECORD_HEADER_SIZE - 1)) as u64)
-            .ok_or(Error::InvalidRecord)?;
-    }
-    Ok(None)
-}
-
-fn fast_lz(data: &[u8], out: &mut [u8]) -> Result<usize, Error> {
-    if data.len() < 4 {
-        return Err(Error::CorruptBlock);
-    }
-    if data[0] == 1 {
-        let raw = &data[4..];
-        if raw.len() > out.len() {
-            return Err(Error::CorruptBlock);
-        }
-        out[..raw.len()].copy_from_slice(raw);
-        return Ok(raw.len());
-    }
-    let mut table = [-1_i32; 4096];
-    let sentinel = b"123456789012345678";
-    let (mut src, mut dst, mut control) = (4_usize, 0_usize, 1_u32);
-    let (mut literal_run, mut previous_run) = (0_u16, 0_u16);
-    while src < data.len() {
-        if control == 1 {
-            if src + 1 >= data.len() {
-                break;
-            }
-            control = u32::from(data[src]) | (u32::from(data[src + 1]) << 8) | 0x10000;
-            src += 2;
-        }
-        let tokens = if data.len().saturating_sub(32) < src {
-            1
-        } else {
-            16
-        };
-        for _ in 0..tokens {
-            if src >= data.len() {
-                break;
-            }
-            if control & 1 != 0 {
-                if src + 1 >= data.len() {
-                    return Err(Error::Truncated);
-                }
-                let index = usize::from(data[src + 1]) | (usize::from(data[src] & 0xf0) << 4);
-                let extra = usize::from(data[src] & 0x0f);
-                let match_pos = table[index];
-                let match_start = dst;
-                for j in 0..3 + extra {
-                    if dst >= out.len() {
-                        return Err(Error::CorruptBlock);
-                    }
-                    out[dst] = if match_pos < 0 {
-                        sentinel.get(j).copied().unwrap_or(0)
-                    } else {
-                        let at = usize::try_from(match_pos)
-                            .unwrap()
-                            .checked_add(j)
-                            .ok_or(Error::CorruptBlock)?;
-                        if at >= dst {
-                            return Err(Error::CorruptBlock);
-                        }
-                        out[at]
-                    };
-                    dst += 1;
-                }
-                src += 2;
-                if literal_run > 0 {
-                    let pos = match_start
-                        .checked_sub(usize::from(literal_run))
-                        .ok_or(Error::CorruptBlock)?;
-                    if pos + 2 < dst {
-                        table[hash(out[pos], out[pos + 1], out[pos + 2])] = pos as i32;
-                    }
-                    if previous_run == 2 && pos + 3 < dst {
-                        table[hash(out[pos + 1], out[pos + 2], out[pos + 3])] = (pos + 1) as i32;
-                    }
-                    literal_run = 0;
-                    previous_run = 0;
-                }
-                table[index] = match_start as i32;
-            } else {
-                if dst >= out.len() {
-                    return Err(Error::CorruptBlock);
-                }
-                out[dst] = data[src];
-                dst += 1;
-                src += 1;
-                literal_run += 1;
-                previous_run = literal_run;
-                if literal_run == 3 {
-                    let pos = dst - 3;
-                    table[hash(out[pos], out[pos + 1], out[pos + 2])] = pos as i32;
-                    literal_run = 2;
-                    previous_run = 2;
-                }
-            }
-            control >>= 1;
-            if control == 1 {
-                break;
-            }
-        }
-    }
-    Ok(dst)
-}
-
-fn hash(a: u8, b: u8, c: u8) -> usize {
-    let value = i32::from(c) ^ (16 * (i32::from(b) ^ (16 * i32::from(a))));
-    (((-24993_i32).wrapping_mul(value) as u32 >> 4) & 0xfff) as usize
-}
-
-fn zlib(data: &[u8], out: &mut [u8]) -> Result<usize, Error> {
-    if data.len() < 4 {
-        return Err(Error::CorruptBlock);
-    }
-    if data[0] == 1 {
-        let raw = &data[4..];
-        if raw.len() > out.len() {
-            return Err(Error::CorruptBlock);
-        }
-        out[..raw.len()].copy_from_slice(raw);
-        return Ok(raw.len());
-    }
-    let mut decoder = ZlibDecoder::new(&data[4..]);
-    let mut count = 0;
-    while count < out.len() {
-        let n = decoder
-            .read(&mut out[count..])
-            .map_err(|_| Error::CorruptBlock)?;
-        if n == 0 {
-            break;
-        }
-        count += n;
-    }
-    let mut extra = [0_u8; 1];
-    if decoder.read(&mut extra).map_err(|_| Error::CorruptBlock)? != 0 {
-        return Err(Error::CorruptBlock);
-    }
-    Ok(count)
-}
-
-fn map_eof(error: io::Error) -> Error {
+pub(crate) fn map_eof(error: io::Error) -> Error {
     if error.kind() == io::ErrorKind::UnexpectedEof {
         Error::Truncated
     } else {
@@ -537,42 +323,434 @@ fn map_eof(error: io::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::*;
+    use crate::ntfs::test_support::*;
     use std::io::Cursor;
 
-    fn image(compression: u8, block: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![0_u8; 512];
-        bytes[0..4].copy_from_slice(&[0xfe, 0xef, 1, compression]);
-        bytes.extend_from_slice(&0x0603_u32.to_le_bytes());
-        bytes.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
-        bytes.extend_from_slice(&20_u16.to_le_bytes());
-        bytes.extend_from_slice(&[0; 20]);
-        let mut ph = vec![0_u8; 512];
-        ph[0..2].copy_from_slice(&0xeffe_u16.to_le_bytes());
-        bytes.extend(ph);
-        bytes.extend_from_slice(&u16::try_from(block.len() + 2).unwrap().to_le_bytes());
-        bytes.extend_from_slice(block);
-        bytes.extend_from_slice(&0x23_u32.to_le_bytes());
-        bytes.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
-        bytes.extend_from_slice(&0_u16.to_le_bytes());
-        bytes
+    fn options(target_size_bytes: u64) -> RestoreOptions {
+        RestoreOptions {
+            target_size_bytes,
+            hidden_sectors: Some(2048),
+            expanded_limit: u64::MAX,
+        }
     }
 
-    fn multi_partition_image(first: &[u8], second: &[u8]) -> Vec<u8> {
-        let mut bytes = image(0, first);
-        bytes.truncate(bytes.len() - RECORD_HEADER_SIZE);
-        bytes.extend_from_slice(&0x0603_u32.to_le_bytes());
-        bytes.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
-        bytes.extend_from_slice(&20_u16.to_le_bytes());
-        bytes.extend_from_slice(&[0; 20]);
-        let mut header = vec![0_u8; HEADER_SIZE as usize];
-        header[0..2].copy_from_slice(&0xeffe_u16.to_le_bytes());
-        bytes.extend(header);
-        bytes.extend_from_slice(&u16::try_from(second.len() + 2).unwrap().to_le_bytes());
-        bytes.extend_from_slice(second);
-        bytes.extend_from_slice(&0x23_u32.to_le_bytes());
-        bytes.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
-        bytes.extend_from_slice(&0_u16.to_le_bytes());
-        bytes
+    fn restore(bytes: Vec<u8>) -> Result<(VerifiedPartition, Vec<u8>, Vec<u8>), Error> {
+        let mut target = Cursor::new(vec![0xcc_u8; VOLUME_BYTES as usize]);
+        let mut logical = Vec::new();
+        let restored = restore_partition(
+            &mut Cursor::new(bytes),
+            1,
+            &mut target,
+            &mut logical,
+            options(VOLUME_BYTES),
+        )?;
+        let mut volume = Cursor::new(target.into_inner());
+        restored
+            .written
+            .verify(&mut volume, &mut |_| Ok(()))
+            .expect("a restored volume must read back what was written");
+        Ok((restored.partition, volume.into_inner(), logical))
+    }
+
+    fn cluster(volume: &[u8], lcn: u64, count: u64) -> &[u8] {
+        &volume[(lcn * CLUSTER) as usize..((lcn + count) * CLUSTER) as usize]
+    }
+
+    #[test]
+    fn restores_runs_at_their_lcns_and_regenerates_metadata() {
+        let parts = parts();
+        let (verified, volume, logical) = restore(image_with(&body(&parts))).unwrap();
+        assert_eq!(verified.file_system, FileSystem::Ntfs);
+        assert_eq!(verified.geometry.cluster_size, CLUSTER);
+        assert_eq!(verified.volume_size_bytes(), VOLUME_BYTES);
+        assert_eq!(verified.info.compression, Compression::High(9));
+        assert_eq!(verified.expanded_size_bytes, logical.len() as u64);
+
+        assert_eq!(cluster(&volume, 4, 2), parts.mft_blob.as_slice());
+        assert_eq!(cluster(&volume, 10, 1), parts.user_data[0].as_slice());
+        assert_eq!(cluster(&volume, 20, 3), parts.user_data[1].as_slice());
+        // Sparse clusters and the free record's run are untouched.
+        assert!(cluster(&volume, 11, 2).iter().all(|byte| *byte == 0xcc));
+        assert!(cluster(&volume, 50, 1).iter().all(|byte| *byte == 0xcc));
+        // $MFTMirr mirrors the first $MFT cluster.
+        assert_eq!(cluster(&volume, 2, 1), &parts.mft_blob[..CLUSTER as usize]);
+        // Boot sector and its backup carry the target's hidden sectors.
+        let mut expected_boot = boot();
+        expected_boot[0x1c..0x20].copy_from_slice(&2048_u32.to_le_bytes());
+        assert_eq!(&volume[..512], expected_boot.as_slice());
+        assert_eq!(&volume[512..2 * CLUSTER as usize], &parts.boot_data[512..]);
+        let backup = (TOTAL_SECTORS * 512) as usize;
+        assert_eq!(&volume[backup..backup + 512], expected_boot.as_slice());
+    }
+
+    fn bitmap_with(lcns: &[u64]) -> [u8; 8] {
+        let mut expected = [0_u8; 8];
+        for lcn in lcns {
+            expected[(lcn / 8) as usize] |= 1 << (lcn % 8);
+        }
+        expected
+    }
+
+    /// Clusters allocated by the fixture: $Boot 0-1, $MFTMirr 2, $MFT 4-5,
+    /// the user file 10 and 20-22, and $Bitmap itself at 30. The sparse hole
+    /// (11-12) and the free record's run (50) stay free.
+    const FIXTURE_ALLOCATED: [u64; 10] = [0, 1, 2, 4, 5, 10, 20, 21, 22, BITMAP_LCN];
+
+    #[test]
+    fn rebuilds_the_cluster_bitmap_that_ghost_leaves_out_of_the_stream() {
+        let mut parts = parts();
+        parts.bad_clusters = vec![(None, 40), (Some(40), 1), (None, 23)];
+        let (_, volume, _) = restore(image_with(&body(&parts))).unwrap();
+        let bitmap = cluster(&volume, BITMAP_LCN, 1);
+        let mut allocated = FIXTURE_ALLOCATED.to_vec();
+        allocated.push(40);
+        assert_eq!(&bitmap[..8], &bitmap_with(&allocated));
+        assert!(bitmap[8..].iter().all(|byte| *byte == 0));
+
+        // A stream that does carry $Bitmap, zeroed or omitted, gives the same
+        // rebuilt bitmap.
+        for form in [
+            BitmapInStream::Stored(vec![0; CLUSTER as usize]),
+            BitmapInStream::Omitted,
+        ] {
+            let mut parts = self::parts();
+            parts.bitmap = form;
+            let (_, volume, _) = restore(image_with(&body(&parts))).unwrap();
+            assert_eq!(
+                &cluster(&volume, BITMAP_LCN, 1)[..8],
+                &bitmap_with(&FIXTURE_ALLOCATED)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_volume_without_a_usable_cluster_bitmap() {
+        // No record in the $MFT slot of $Bitmap.
+        let mut parts = parts();
+        parts.mft_blob[6 * 1024..7 * 1024].fill(0);
+        assert!(matches!(
+            restore(image_with(&body(&parts))),
+            Err(Error::CorruptStream("$Bitmap is missing"))
+        ));
+        // A torn on-disk record: one sector's update sequence number differs.
+        let mut parts = self::parts();
+        parts.mft_blob[6 * 1024 + 1022] ^= 0xff;
+        assert!(matches!(
+            restore(image_with(&body(&parts))),
+            Err(Error::CorruptStream(
+                "$Bitmap record update sequence is torn"
+            ))
+        ));
+        // $Bitmap too small to hold a bit for every cluster.
+        let mut parts = self::parts();
+        // An empty attribute has no runs, so no room for any bit.
+        let small = record(6, &[attribute(0x80, "", &[], CLUSTER)]);
+        parts.mft_blob[6 * 1024..7 * 1024].copy_from_slice(&on_disk(small));
+        assert!(matches!(
+            restore(image_with(&body(&parts))),
+            Err(Error::CorruptStream("$Bitmap is too small for the volume"))
+        ));
+    }
+
+    #[test]
+    fn read_back_covers_runs_mirror_and_backup_boot_sector() {
+        let parts = parts();
+        let mut target = Cursor::new(vec![0xcc_u8; VOLUME_BYTES as usize]);
+        let restored = restore_partition(
+            &mut Cursor::new(image_with(&body(&parts))),
+            1,
+            &mut target,
+            &mut io::sink(),
+            options(VOLUME_BYTES),
+        )
+        .unwrap();
+        let intact = target.into_inner();
+        let backup = (TOTAL_SECTORS * 512) as usize;
+        // A user-data run, the regenerated $MFTMirr, the patched boot sector
+        // and its backup are all covered by the read-back.
+        for offset in [
+            (20 * CLUSTER) as usize,
+            (2 * CLUSTER) as usize,
+            (BITMAP_LCN * CLUSTER) as usize,
+            0x1c,
+            backup + 0x1c,
+        ] {
+            let mut volume = intact.clone();
+            volume[offset] ^= 0xff;
+            let error = restored
+                .written
+                .verify(&mut Cursor::new(volume), &mut |_| Ok(()))
+                .unwrap_err();
+            assert!(matches!(error, Error::ReadBackMismatch), "{offset}");
+        }
+        // Sparse and unallocated clusters were never written.
+        let mut volume = intact.clone();
+        volume[(11 * CLUSTER) as usize] ^= 0xff;
+        restored
+            .written
+            .verify(&mut Cursor::new(volume), &mut |_| Ok(()))
+            .unwrap();
+    }
+
+    #[test]
+    fn dry_run_matches_restore_and_logical_stream() {
+        let bytes = image();
+        let (restored, _, logical) = restore(bytes.clone()).unwrap();
+        let mut sink = Vec::new();
+        let analyzed = analyze_partition(&mut Cursor::new(&bytes), 1, &mut sink, u64::MAX).unwrap();
+        assert_eq!(analyzed, restored);
+        assert_eq!(sink, logical);
+        assert_eq!(
+            verify(&mut Cursor::new(&bytes), u64::MAX).unwrap(),
+            restored
+        );
+        let descriptor = descriptor_segment(&boot());
+        assert_eq!(&logical[..descriptor.len()], descriptor.as_slice());
+    }
+
+    #[test]
+    fn reports_whether_the_volume_holds_a_windows_boot_loader() {
+        assert!(
+            verify(&mut Cursor::new(image()), u64::MAX)
+                .unwrap()
+                .windows_boot_loader
+        );
+        let legacy = verify(&mut Cursor::new(image_without_boot_loader()), u64::MAX).unwrap();
+        assert!(!legacy.windows_boot_loader);
+    }
+
+    #[test]
+    fn inspects_container_metadata() {
+        let info = inspect(&mut Cursor::new(image())).unwrap();
+        assert_eq!(info.partition_count, 1);
+        assert_eq!(info.compression, Compression::High(9));
+    }
+
+    #[test]
+    fn rejects_a_target_smaller_than_the_volume() {
+        let mut target = Cursor::new(vec![0_u8; VOLUME_BYTES as usize]);
+        let error = restore_partition(
+            &mut Cursor::new(image()),
+            1,
+            &mut target,
+            &mut io::sink(),
+            options(VOLUME_BYTES - 1),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::TargetTooSmall { .. }));
+        assert!(
+            target.into_inner().iter().all(|byte| *byte == 0),
+            "nothing may be written"
+        );
+    }
+
+    #[test]
+    fn rejects_other_partitions_and_unverified_compression() {
+        assert!(matches!(
+            verify_partition(image(), 2),
+            Err(Error::PartitionCount(1))
+        ));
+        for (tag, expected) in [(0, 0), (2, 2), (1, 1), (11, 11)] {
+            let bytes = image_from(&descriptor_segment(&boot()), &body(&parts()), tag);
+            assert!(
+                matches!(inspect(&mut Cursor::new(bytes)), Err(Error::UnsupportedCompression(value)) if value == expected),
+                "tag {tag}"
+            );
+        }
+    }
+
+    fn verify_partition(bytes: Vec<u8>, partition: u32) -> Result<VerifiedPartition, Error> {
+        analyze_partition(
+            &mut Cursor::new(bytes),
+            partition,
+            &mut io::sink(),
+            u64::MAX,
+        )
+    }
+
+    #[test]
+    fn rejects_encrypted_and_continuation_files() {
+        let mut encrypted = image();
+        encrypted[12] = 0x02;
+        assert!(matches!(
+            inspect(&mut Cursor::new(encrypted)),
+            Err(Error::EncryptedUnsupported)
+        ));
+        let mut span = image();
+        span[2] = 9;
+        assert!(matches!(
+            inspect(&mut Cursor::new(span)),
+            Err(Error::SpannedUnsupported)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_non_ntfs_descriptor() {
+        let mut fat = boot();
+        fat[3..11].copy_from_slice(b"MSDOS5.0");
+        let bytes = image_from(&descriptor_segment(&fat), &body(&parts()), 10);
+        assert!(matches!(
+            verify_partition(bytes, 1),
+            Err(Error::UnsupportedFileSystem)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_boot_sector_that_differs_from_the_descriptor() {
+        let mut parts = parts();
+        parts.boot_data[0x30] ^= 1;
+        assert!(matches!(
+            verify_partition(image_with(&body(&parts)), 1),
+            Err(Error::CorruptStream(_))
+        ));
+    }
+
+    fn replace(stream: &mut Vec<u8>, from: &[u8], to: &[u8]) {
+        let at = stream
+            .windows(from.len())
+            .position(|window| window == from)
+            .expect("pattern present");
+        stream.splice(at..at + from.len(), to.iter().copied());
+    }
+
+    fn assert_corrupt(stream: Vec<u8>) {
+        let result = verify_partition(image_with(&stream), 1);
+        assert!(
+            matches!(result, Err(Error::CorruptStream(_) | Error::Truncated)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_structural_stream_corruption() {
+        let parts = parts();
+        let original = body(&parts);
+
+        // Data length disagrees with the mapping pairs.
+        let mut stream = original.clone();
+        let run = [header(0x02, 0, 0), data(1)].concat();
+        let wrong = [header(0x02, 0, 0), data(2)].concat();
+        let at = stream
+            .windows(run.len())
+            .rposition(|window| window == run.as_slice())
+            .unwrap();
+        stream.splice(at..at + run.len(), wrong);
+        assert_corrupt(stream);
+
+        // Runs out of order.
+        let mut stream = original.clone();
+        replace(&mut stream, &header(0x02, 0, 1), &header(0x02, 0, 5));
+        assert_corrupt(stream);
+
+        // A sparse run carrying data.
+        let mut stream = original.clone();
+        let sparse = [header(0x02, 0, 1), header(0x02, 0, 2)].concat();
+        let with_data = [
+            header(0x02, 0, 1),
+            data(2),
+            vec![0; 2 * CLUSTER as usize],
+            header(0x02, 0, 2),
+        ]
+        .concat();
+        replace(&mut stream, &sparse, &with_data);
+        assert_corrupt(stream);
+
+        // Unknown packet tag.
+        let mut stream = original.clone();
+        stream.push(0x61);
+        assert_corrupt(stream);
+
+        // Stream that does not start with $MFT.
+        let mut stream = original.clone();
+        stream[1] = 0x10;
+        assert_corrupt(stream);
+
+        // Missing CRC terminator: record ends with another record header.
+        let mut stream = original.clone();
+        stream.truncate(stream.len() - 10);
+        assert_corrupt(stream);
+    }
+
+    #[test]
+    fn rejects_runs_that_overlap_or_leave_the_volume() {
+        let parts = parts();
+        let original = body(&parts);
+        let user = user_record("WINLOAD.EXE", &[(Some(10), 1), (None, 2), (Some(20), 3)]);
+
+        let overlapping = user_record("WINLOAD.EXE", &[(Some(4), 1), (None, 2), (Some(20), 3)]);
+        let mut stream = original.clone();
+        replace(&mut stream, &user, &overlapping);
+        assert_corrupt(stream);
+
+        let outside = user_record("WINLOAD.EXE", &[(Some(10), 1), (None, 2), (Some(62), 3)]);
+        let mut stream = original.clone();
+        replace(&mut stream, &user, &outside);
+        assert_corrupt(stream);
+    }
+
+    #[test]
+    fn rejects_omitted_data_that_cannot_be_regenerated() {
+        let parts = parts();
+        let mut stream = body(&parts);
+        let section = [header(0x20, 0x80, 0), header(0x02, 0, 0), data(1)].concat();
+        let at = stream
+            .windows(section.len())
+            .rposition(|window| window == section.as_slice())
+            .unwrap();
+        // Replace the user file's whole data section with an omission marker.
+        let end = stream.len() - 10;
+        stream.splice(at..end, header(0x40, 0x80, 0));
+        assert!(matches!(
+            verify_partition(image_with(&stream), 1),
+            Err(Error::UnsupportedVolume(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_corrupt_packets_and_end_records() {
+        let bytes = image();
+        let descriptor_end = 512 + 0x400 + descriptor_segment(&boot()).len();
+
+        let mut flipped = bytes.clone();
+        flipped[descriptor_end + 8] ^= 0xff;
+        assert!(verify_partition(flipped, 1).is_err());
+
+        let mut bad_length = bytes.clone();
+        bad_length[descriptor_end..descriptor_end + 2].copy_from_slice(&2_u16.to_le_bytes());
+        assert!(matches!(
+            verify_partition(bad_length, 1),
+            Err(Error::CorruptBlock)
+        ));
+
+        let mut bad_end = bytes.clone();
+        let len = bad_end.len();
+        bad_end[len - 16] ^= 1;
+        assert!(matches!(
+            inspect(&mut Cursor::new(bad_end)),
+            Err(Error::InvalidRecord)
+        ));
+    }
+
+    #[test]
+    fn enforces_the_expanded_limit() {
+        let bytes = image();
+        let full = verify(&mut Cursor::new(&bytes), u64::MAX)
+            .unwrap()
+            .expanded_size_bytes;
+        assert!(matches!(
+            verify(&mut Cursor::new(&bytes), full - 1),
+            Err(Error::ExpandedLimit)
+        ));
+        assert!(verify(&mut Cursor::new(&bytes), full).is_ok());
+    }
+
+    #[test]
+    fn rejects_every_truncation_without_panicking() {
+        let bytes = image();
+        for length in (0..bytes.len()).step_by(97) {
+            assert!(verify(&mut Cursor::new(&bytes[..length]), u64::MAX).is_err());
+        }
     }
 
     fn span(primary: &[u8], payload: &[u8], image_id: [u8; 4]) -> (Vec<u8>, Vec<u8>) {
@@ -586,48 +764,20 @@ mod tests {
     }
 
     #[test]
-    fn decodes_uncompressed_partition() {
-        let bytes = image(0, b"hello");
-        let verified = verify(&mut Cursor::new(bytes), 100).unwrap();
-        assert_eq!(verified.expanded_size_bytes, 5);
-    }
-
-    #[test]
-    fn decodes_an_explicit_partition_from_a_multi_partition_image() {
-        let bytes = multi_partition_image(b"first", b"second");
-        let info = inspect(&mut Cursor::new(&bytes)).unwrap();
-        assert_eq!(info.partition_count, 2);
-
-        let mut out = Vec::new();
-        decode_partition(&mut Cursor::new(bytes), 2, &mut out, 100).unwrap();
-        assert_eq!(out, b"second");
-    }
-
-    #[test]
-    fn rejects_an_out_of_range_partition_selection() {
-        let bytes = multi_partition_image(b"first", b"second");
-        assert!(matches!(
-            decode_partition(&mut Cursor::new(bytes), 3, &mut Vec::new(), 100),
-            Err(Error::PartitionCount(2))
-        ));
-    }
-
-    #[test]
-    fn span_reader_skips_validated_continuation_headers() {
-        let primary = image(0, b"first");
-        let (primary, continuation) = span(&primary, b"second", [1, 2, 3, 4]);
-        let expected = [primary.as_slice(), b"second"].concat();
+    fn restores_from_a_split_span_set() {
+        let whole = image();
+        let split = whole.len() / 2;
+        let (primary, continuation) = span(&whole[..split], &whole[split..], [1, 2, 3, 4]);
         let mut reader = SpanReader::new(vec![Cursor::new(primary), Cursor::new(continuation)])
             .expect("matching spans should form a virtual stream");
-        let mut actual = Vec::new();
-        reader.read_to_end(&mut actual).unwrap();
-        assert_eq!(actual, expected);
-        assert_eq!(reader.len(), expected.len() as u64);
+        assert_eq!(reader.len(), whole.len() as u64);
+        let joined = verify(&mut reader, u64::MAX).unwrap();
+        assert_eq!(joined, verify(&mut Cursor::new(&whole), u64::MAX).unwrap());
     }
 
     #[test]
     fn span_reader_rejects_a_mismatched_image_id() {
-        let primary = image(0, b"first");
+        let primary = image();
         let (primary, mut continuation) = span(&primary, b"second", [1, 2, 3, 4]);
         continuation[4] = 9;
         assert!(matches!(
@@ -635,56 +785,54 @@ mod tests {
             Err(Error::SpanMismatch)
         ));
     }
+
+    /// Run with `EASYDEPLOYMESH_GHO_PATH=/path/to/image.gho cargo test -p
+    /// easydeploymesh-gho -- --ignored` to validate a real Ghost image.
     #[test]
-    fn rejects_encryption_spans_and_unknown_compression() {
-        for (file_type, flags, compression) in [(9, 0, 0), (1, 2, 0), (1, 0, 1)] {
-            let mut bytes = image(compression, b"x");
-            bytes[2] = file_type;
-            bytes[12] = flags;
-            assert!(inspect(&mut Cursor::new(bytes)).is_err());
-        }
-    }
-    #[test]
-    fn rejects_every_truncation_without_panicking() {
-        let bytes = image(0, b"abcdef");
-        for length in 0..bytes.len() {
-            let _ = inspect(&mut Cursor::new(&bytes[..length]));
-        }
-    }
-    #[test]
-    fn enforces_expanded_limit() {
-        let bytes = image(0, b"abcdef");
-        assert!(matches!(
-            verify(&mut Cursor::new(bytes), 5),
-            Err(Error::ExpandedLimit)
-        ));
-    }
-    #[test]
-    fn decodes_fast_uncompressed_block() {
-        let bytes = image(2, b"\x01\0\0\0hello");
-        let mut out = Vec::new();
-        decode_partition(&mut Cursor::new(bytes), 1, &mut out, 100).unwrap();
-        assert_eq!(out, b"hello");
-    }
-    #[test]
-    fn decodes_zlib_block() {
-        use flate2::{Compression as Level, write::ZlibEncoder};
-        let mut encoder = ZlibEncoder::new(Vec::new(), Level::new(6));
-        encoder.write_all(b"hello zlib").unwrap();
-        let mut block = vec![0, 0, 0, 0];
-        block.extend(encoder.finish().unwrap());
-        let mut out = Vec::new();
-        decode_partition(&mut Cursor::new(image(3, &block)), 1, &mut out, 100).unwrap();
-        assert_eq!(out, b"hello zlib");
+    #[ignore = "requires EASYDEPLOYMESH_GHO_PATH to point to a real Ghost GHO image"]
+    fn verifies_a_real_ghost_image() {
+        let path =
+            std::env::var_os("EASYDEPLOYMESH_GHO_PATH").expect("set EASYDEPLOYMESH_GHO_PATH");
+        let mut file = std::fs::File::open(path).unwrap();
+        let verified = verify(&mut file, u64::MAX).unwrap();
+        assert_eq!(verified.file_system, FileSystem::Ntfs);
+        assert!(verified.volume_size_bytes() > 0);
     }
 
+    /// Restores a real image into a file in the temp directory (sparse on
+    /// APFS) and reads every written region back.
     #[test]
-    fn maps_ghost_header_compression_tag_to_z_level() {
-        let z3 = inspect(&mut Cursor::new(image(3, b"unused"))).unwrap();
-        assert_eq!(z3.compression, Compression::High(3));
-        let z9 = inspect(&mut Cursor::new(image(9, b"unused"))).unwrap();
-        assert_eq!(z9.compression, Compression::High(9));
-        let legacy_z9 = inspect(&mut Cursor::new(image(10, b"unused"))).unwrap();
-        assert_eq!(legacy_z9.compression, Compression::High(9));
+    #[ignore = "requires EASYDEPLOYMESH_GHO_PATH and free space for the restored data"]
+    fn restores_and_reads_back_a_real_ghost_image() {
+        let path =
+            std::env::var_os("EASYDEPLOYMESH_GHO_PATH").expect("set EASYDEPLOYMESH_GHO_PATH");
+        let volume_path = std::env::temp_dir().join(format!(
+            "easydeploymesh-gho-readback-{}.img",
+            std::process::id()
+        ));
+        let mut volume = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&volume_path)
+            .unwrap();
+        let result = (|| {
+            let restored = restore_partition(
+                &mut std::fs::File::open(&path)?,
+                1,
+                &mut volume,
+                &mut io::sink(),
+                RestoreOptions {
+                    target_size_bytes: u64::MAX,
+                    hidden_sectors: Some(2048),
+                    expanded_limit: u64::MAX,
+                },
+            )?;
+            volume.sync_all()?;
+            restored.written.verify(&mut volume, &mut |_| Ok(()))?;
+            Ok::<_, Error>(restored.written.bytes())
+        })();
+        std::fs::remove_file(&volume_path).unwrap();
+        assert!(result.unwrap() > 0);
     }
 }

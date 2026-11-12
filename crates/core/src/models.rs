@@ -348,6 +348,10 @@ pub struct GhoPartitionCapability {
     pub file_system: String,
     pub expanded_size_bytes: u64,
     pub expanded_sha256: String,
+    /// Bytes the restored NTFS volume occupies, including its backup boot
+    /// sector. The target partition must be at least this large.
+    #[serde(default)]
+    pub volume_size_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +361,8 @@ pub struct GhoImageCapability {
     pub compression: Option<String>,
     pub expanded_size_bytes: Option<u64>,
     pub expanded_sha256: Option<String>,
+    #[serde(default)]
+    pub volume_size_bytes: Option<u64>,
     pub partition_count: Option<u32>,
     pub source_partition: Option<u32>,
     #[serde(default)]

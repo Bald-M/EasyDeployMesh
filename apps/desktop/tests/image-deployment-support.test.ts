@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import type { GhoImageCapability } from '../app/types/deployment'
 import {
   classifyImageDeploymentSupport,
   deploymentOperationForImageFormat
@@ -34,8 +35,28 @@ describe('image deployment support classification', () => {
     }
   )
 
-  it('keeps a verified GHO image manual-only', () => {
-    expect(classifyImageDeploymentSupport('gho', true)).toBe('manual')
+  it('classifies only a verified deployable GHO image as automatic', () => {
+    const capability: GhoImageCapability = {
+      deployable: true,
+      compression: 'high',
+      expandedSizeBytes: 16_013_124_300,
+      expandedSha256: 'a'.repeat(64),
+      volumeSizeBytes: 53_689_188_352,
+      partitionCount: 1,
+      sourcePartition: 1,
+      partitions: [],
+      parserVersion: 4,
+      blockedReason: null
+    }
+    expect(classifyImageDeploymentSupport('gho', true, null, capability)).toBe('automatic')
+    expect(classifyImageDeploymentSupport('gho', false, null, capability))
+      .toBe('verification-required')
+    expect(classifyImageDeploymentSupport('gho', true, null, {
+      ...capability,
+      deployable: false,
+      blockedReason: 'windows_boot_loader_missing'
+    })).toBe('catalog-only')
+    expect(classifyImageDeploymentSupport('gho', true)).toBe('catalog-only')
   })
 
   it.each(['swm'] as const)(
