@@ -20,8 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The WinPE deployment progress window is now a full-screen panel with three
-  states. While deploying it shows the step, percent, bytes, speed, elapsed
+- The WinPE deployment progress window is now a centered panel with three
+  states. It is only as large as the panel, so the WinPE desktop and shell stay
+  visible around it, and it can be dragged aside. While deploying it shows the step, percent, bytes, speed, elapsed
   and remaining time, image, and target. On success it shows a summary and
   restarts after a 10-second countdown, with Shut down / Restart now buttons.
   On failure it shows the failed step, reason, error code, and log path, and

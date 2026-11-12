@@ -952,29 +952,52 @@ const FOOTER_HEIGHT: i32 = 72;
 const BUTTON_HEIGHT: i32 = 44;
 const BRAND_MARK_SIZE: i32 = 32;
 
-pub fn layout_screen(screen: &Screen, client_width: i32, client_height: i32) -> ScreenLayout {
-    let width = (client_width - 2 * OUTER_MARGIN).clamp(1, PANEL_MAX_WIDTH);
-    let row_lines = |row: &Row| i32::from(row.lines.clamp(1, 2));
+fn row_lines(row: &Row) -> i32 {
+    i32::from(row.lines.clamp(1, 2))
+}
+
+fn rows_height(screen: &Screen) -> i32 {
     let line_count = screen
         .columns
         .iter()
         .map(|column| column.iter().map(row_lines).sum::<i32>())
         .max()
         .unwrap_or(0);
-    let rows_height = if line_count == 0 {
+    if line_count == 0 {
         0
     } else {
         ROWS_PADDING * 2 + ROW_HEIGHT * line_count
-    };
+    }
+}
+
+/// Size of the progress panel for `screen` on a display `display_width` wide.
+/// The window is exactly this size, so the WinPE desktop stays visible around it.
+pub fn panel_size(screen: &Screen, display_width: i32) -> (i32, i32) {
+    let width = (display_width - 2 * OUTER_MARGIN).clamp(1, PANEL_MAX_WIDTH);
+    let rows_height = rows_height(screen);
     let height = HEADER_HEIGHT
         + 1
         + STATUS_HEIGHT
         + if rows_height > 0 { 1 + rows_height } else { 0 }
         + screen.banner.as_ref().map_or(0, |_| 1 + BANNER_HEIGHT)
         + screen.footer.as_ref().map_or(0, |_| 1 + FOOTER_HEIGHT);
-    let left = (client_width - width) / 2;
-    let top = ((client_height - height) / 2).max(0);
-    let panel = Rect::new(left, top, left + width, top + height);
+    (width, height)
+}
+
+/// Layout of the panel centered on a display of the given size.
+#[cfg(test)]
+pub fn layout_screen(screen: &Screen, display_width: i32, display_height: i32) -> ScreenLayout {
+    let (width, height) = panel_size(screen, display_width);
+    let left = (display_width - width) / 2;
+    let top = ((display_height - height) / 2).max(0);
+    layout_panel(screen, Rect::new(left, top, left + width, top + height))
+}
+
+/// Lays out the panel content inside `panel`, a rectangle of [`panel_size`].
+pub fn layout_panel(screen: &Screen, panel: Rect) -> ScreenLayout {
+    let width = panel.width();
+    let top = panel.top;
+    let rows_height = rows_height(screen);
     let inner_left = panel.left + PADDING;
     let inner_right = panel.right - PADDING;
     let separator = |y: i32| Rect::new(panel.left, y, panel.right, y + 1);
@@ -1525,6 +1548,47 @@ mod tests {
         let reason = failed.rows[0][0].1;
         assert_eq!(reason.bottom - reason.top, 2 * ROW_HEIGHT);
         assert_eq!(failed.rows[0][1].1.top, reason.bottom);
+    }
+
+    #[test]
+    fn the_window_is_only_as_large_as_the_panel_so_winpe_stays_visible() {
+        let now = Instant::now();
+        let mut model = ProgressModel::new(Language::Chinese, job(false), false, now);
+        model.local(&layout_event(), now);
+        let mut failed = model.clone();
+        failed.stage(DeploymentStage::Partitioning, 10);
+        failed.fail(&"x".repeat(500), now);
+        failed.failure_reported();
+        let mut succeeded = model.clone();
+        succeeded.succeed(now, Duration::from_secs(10));
+
+        for state in [&model, &failed, &succeeded] {
+            let screen = state.screen(now);
+            for (display_width, display_height) in [(1024, 768), (1280, 800), (1920, 1080)] {
+                let (width, height) = panel_size(&screen, display_width);
+                assert!(width <= display_width - 2 * OUTER_MARGIN);
+                assert!(height <= display_height - 2 * OUTER_MARGIN);
+                // Everything is laid out inside a window of exactly that size.
+                let layout = layout_panel(&screen, Rect::new(0, 0, width, height));
+                assert_eq!(layout.panel, Rect::new(0, 0, width, height));
+                let inside = |rect: &Rect| {
+                    rect.left >= 0 && rect.top >= 0 && rect.right <= width && rect.bottom <= height
+                };
+                assert!(
+                    layout
+                        .rows
+                        .iter()
+                        .flatten()
+                        .all(|(label, value)| inside(label) && inside(value))
+                );
+                assert!(layout.buttons.iter().all(|(_, button)| inside(button)));
+                assert!(layout.banner.iter().all(inside));
+                assert!(inside(&layout.bar));
+            }
+        }
+        // On the smallest supported display a third of the desktop stays visible.
+        let (width, height) = panel_size(&model.screen(now), 1024);
+        assert!(width * height < 1024 * 768 * 2 / 3);
     }
 
     #[test]
