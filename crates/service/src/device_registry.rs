@@ -1,3 +1,4 @@
+use crate::atomic_file::write_file_atomic;
 use easydeploymesh_core::{
     AgentHeartbeatAck, AgentInventory, AgentRegistration, Device, RegisteredDevice,
 };
@@ -299,9 +300,11 @@ impl DeviceRegistry {
             devices: devices.to_vec(),
         };
         let bytes = serde_json::to_vec_pretty(&manifest)?;
-        fs::write(&self.manifest_path, bytes).map_err(|source| DeviceRegistryError::Write {
-            path: self.manifest_path.display().to_string(),
-            source,
+        write_file_atomic(&self.manifest_path, &bytes).map_err(|source| {
+            DeviceRegistryError::Write {
+                path: self.manifest_path.display().to_string(),
+                source,
+            }
         })
     }
 }
@@ -488,6 +491,40 @@ mod tests {
         assert_eq!(
             reloaded.list().expect("devices should list")[0].device.id,
             device.device.id
+        );
+    }
+
+    #[test]
+    fn truncated_manifest_fails_closed_without_being_overwritten() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let registry = DeviceRegistry::open(temp.path()).expect("registry should open");
+        registry
+            .register(
+                inventory("AA:BB:CC:DD:EE:FF"),
+                "192.168.10.20".parse().expect("IP should parse"),
+            )
+            .expect("device should register");
+        let manifest_path = temp.path().join("devices.json");
+        let complete = fs::read(&manifest_path).expect("manifest should read");
+        assert_eq!(
+            fs::read_dir(temp.path())
+                .expect("directory should list")
+                .count(),
+            1,
+            "persisting must not leave temporary files behind"
+        );
+
+        let truncated = &complete[..complete.len() / 2];
+        fs::write(&manifest_path, truncated).expect("truncated manifest should write");
+
+        let error = DeviceRegistry::open(temp.path())
+            .err()
+            .expect("a truncated manifest must not open as an empty registry");
+        assert!(matches!(error, DeviceRegistryError::InvalidManifest(_)));
+        assert_eq!(
+            fs::read(&manifest_path).expect("manifest should still read"),
+            truncated,
+            "a failed open must leave the damaged manifest for recovery"
         );
     }
 

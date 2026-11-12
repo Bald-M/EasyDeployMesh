@@ -1,6 +1,7 @@
 #[path = "linux_iso.rs"]
 mod linux_iso;
 
+use crate::atomic_file::write_file_atomic;
 use easydeploymesh_core::{
     Architecture, GhoImageCapability, GhoPartitionCapability, ImageArtifact, ImageFormat,
     InstallerBootAsset, InstallerCapability, InstallerDistribution, InstallerProfile,
@@ -797,7 +798,7 @@ fn persist_manifest(
         images: images.to_vec(),
     };
     let bytes = serde_json::to_vec_pretty(&manifest)?;
-    fs::write(manifest_path, bytes).map_err(|source| ImageLibraryError::Write {
+    write_file_atomic(manifest_path, &bytes).map_err(|source| ImageLibraryError::Write {
         path: manifest_path.display().to_string(),
         source,
     })

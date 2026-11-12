@@ -1,3 +1,4 @@
+use crate::atomic_file::write_file_atomic;
 use easydeploymesh_core::{
     AgentJobProgress, CreateDeploymentJob, DeploymentJob, DeploymentStage, JobState, Operation,
 };
@@ -701,7 +702,7 @@ impl JobRepository {
             jobs: jobs.to_vec(),
         };
         let bytes = serde_json::to_vec_pretty(&manifest)?;
-        fs::write(&self.manifest_path, bytes).map_err(|source| JobRepositoryError::Write {
+        write_file_atomic(&self.manifest_path, &bytes).map_err(|source| JobRepositoryError::Write {
             path: self.manifest_path.display().to_string(),
             source,
         })
@@ -823,6 +824,35 @@ mod tests {
         assert_eq!(
             reloaded.list().expect("jobs should list")[0].state,
             JobState::Waiting
+        );
+    }
+
+    #[test]
+    fn truncated_manifest_fails_closed_without_being_overwritten() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let repository = JobRepository::open(temp.path()).expect("repository should open");
+        repository.create(request()).expect("job should be created");
+        let manifest_path = temp.path().join("jobs.json");
+        let complete = fs::read(&manifest_path).expect("manifest should read");
+        assert_eq!(
+            fs::read_dir(temp.path())
+                .expect("directory should list")
+                .count(),
+            1,
+            "persisting must not leave temporary files behind"
+        );
+
+        let truncated = &complete[..complete.len() / 2];
+        fs::write(&manifest_path, truncated).expect("truncated manifest should write");
+
+        let error = JobRepository::open(temp.path())
+            .err()
+            .expect("a truncated manifest must not open as an empty repository");
+        assert!(matches!(error, JobRepositoryError::InvalidManifest(_)));
+        assert_eq!(
+            fs::read(&manifest_path).expect("manifest should still read"),
+            truncated,
+            "a failed open must leave the damaged manifest for recovery"
         );
     }
 

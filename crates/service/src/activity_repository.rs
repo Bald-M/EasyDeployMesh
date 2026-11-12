@@ -1,3 +1,4 @@
+use crate::atomic_file::write_file_atomic;
 use chrono::{DateTime, Duration, Utc};
 use easydeploymesh_core::{ActivityEvent, ActivitySeverity, ActivitySource, ActivitySubject};
 use serde_json::{Map, Value};
@@ -132,12 +133,7 @@ impl ActivityRepository {
 
     fn persist(&self, events: &[ActivityEvent]) -> Result<(), ActivityRepositoryError> {
         let bytes = serde_json::to_vec_pretty(events)?;
-        let temporary = self.path.with_extension("json.tmp");
-        fs::write(&temporary, bytes).map_err(|source| ActivityRepositoryError::Write {
-            path: temporary.display().to_string(),
-            source,
-        })?;
-        fs::rename(&temporary, &self.path).map_err(|source| ActivityRepositoryError::Write {
+        write_file_atomic(&self.path, &bytes).map_err(|source| ActivityRepositoryError::Write {
             path: self.path.display().to_string(),
             source,
         })

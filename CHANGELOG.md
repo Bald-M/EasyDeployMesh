@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Device, job, image, activity, PXE configuration, DHCP lease, and WinPE
+  bootstrap JSON files are now replaced atomically (synced temporary file,
+  rename, directory sync), so a crash or power loss mid-write can no longer
+  leave a truncated manifest that stops the app from starting. A damaged
+  `devices.json` or `jobs.json` still fails closed and is left untouched.
 - The disk hosting the running system is now refused at every layer, not only
   marked in the UI: the Agent rejects it before partitioning, the desktop host
   rejects it when creating a job, and the control plane will not issue a

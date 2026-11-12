@@ -110,7 +110,8 @@ async fn sync_agent_bootstrap(status: &ControlPlaneStatus, state: &AppState) -> 
         "enrollmentToken": enrollment_token,
     }))
     .map_err(|error| error.to_string())?;
-    fs::write(&bootstrap_path, &bootstrap).map_err(|error| error.to_string())?;
+    easydeploymesh_service::write_file_atomic(&bootstrap_path, &bootstrap)
+        .map_err(|error| error.to_string())?;
     if state.pxe_boot_root.join("boot/boot.wim").is_file() {
         let boot_wim = state.pxe_boot_root.join("boot/boot.wim");
         let runtime_wim = boot_wim.clone();
@@ -252,9 +253,7 @@ fn save_pxe_config(config: PxeConfig, state: State<'_, AppState>) -> Result<PxeC
 
 fn persist_pxe_config(config: &PxeConfig, path: &std::path::Path) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(&config).map_err(|error| error.to_string())?;
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
-    fs::rename(&temporary, path).map_err(|error| error.to_string())
+    easydeploymesh_service::write_file_atomic(path, &bytes).map_err(|error| error.to_string())
 }
 
 fn require_winpe_import_host() -> Result<(), String> {
