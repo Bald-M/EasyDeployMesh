@@ -14,7 +14,7 @@ import {
   type DeviceSelectionState
 } from '~/utils/device-selection'
 import { partitionPlanFor, type PartitionPreset } from '~/utils/partition-plans'
-import { partitionCapacity, partitionUserBudgets } from '~/utils/partition-capacity'
+import { partitionCapacity, partitionUserBudgets, requiredWindowsPartitionGib, windowsPartitionFitsPayload } from '~/utils/partition-capacity'
 import { templateDiskGroups } from '~/utils/template-disk-groups'
 import {
   deviceOperationalStatus,
@@ -154,7 +154,8 @@ const selectedImageIndexIsValid = computed(() => {
 const ghoPartitionItems = computed(() => selectedGhoPartitions.value.map(partition => ({
   label: t('devices.ghoPartitionOption', {
     index: partition.sourcePartition,
-    size: formatBytes(partition.expandedSizeBytes, locale.value)
+    size: requiredWindowsPartitionGib(partition.expandedSizeBytes),
+    bytes: new Intl.NumberFormat(locale.value).format(partition.expandedSizeBytes)
   }),
   value: partition.sourcePartition
 })))
@@ -272,6 +273,24 @@ const partitionPresetItems = computed(() => [
   { label: t('devices.partitionLegacy'), value: 'legacy_bios_mbr' },
   ...customTemplates.value.map(template => ({ label: `${t('devices.customTemplatePrefix')} · ${template.name}`, value: `custom:${template.id}` }))
 ])
+const selectedGhoPayloadBytes = computed(() => selectedGhoPartitions.value
+  .find(partition => partition.sourcePartition === selectedImageIndex.value)?.expandedSizeBytes ?? null)
+const targetsWithoutGhoPayloadCapacity = computed(() => {
+  const image = selectedImage.value
+  const payloadBytes = selectedGhoPayloadBytes.value
+  if (!image || payloadBytes === null) return []
+  return sendTargets.value.filter((entry) => {
+    const disk = selectedDisk(entry)
+    const plan = selectedPartitionPlan(entry.device.bootMode)
+    return disk && plan && !windowsPartitionFitsPayload(plan, disk.sizeBytes, image.sizeBytes, payloadBytes)
+  })
+})
+const ghoPayloadCapacityErrorDescription = computed(() => t('devices.ghoPayloadCapacityInsufficientHint', {
+  names: new Intl.ListFormat(locale.value, { style: 'short', type: 'conjunction' })
+    .format(targetsWithoutGhoPayloadCapacity.value.map(displayName)),
+  size: requiredWindowsPartitionGib(selectedGhoPayloadBytes.value ?? 0),
+  bytes: new Intl.NumberFormat(locale.value).format(selectedGhoPayloadBytes.value ?? 0)
+}))
 const sendTargetDisksAreValid = computed(() => sendTargets.value.every(entry =>
   selectedDisk(entry) !== null
 ))
@@ -376,6 +395,7 @@ const canSend = computed(() => Boolean(
   && selectedPlansAreKnown.value
   && sendTargetDisksAreValid.value
   && targetsWithoutPartitionCapacity.value.length === 0
+  && targetsWithoutGhoPayloadCapacity.value.length === 0
   && (!selectedImageIsLinux.value || Boolean(selectedInstallerCapability.value))
   && linuxInstallFormErrors.value.length === 0
   && linuxTargetFailures.value.length === 0
@@ -883,6 +903,12 @@ watch(deploymentConfirmationKey, (current, previous) => {
 
 watch(() => [selectedImage.value?.sizeBytes, JSON.stringify(selectedDiskIds.value)], () => {
   if (templateDialogOpen.value) clampDraftPartitionSizes()
+})
+
+watch([selectedGhoPayloadBytes, partitionPreset], ([payloadBytes]) => {
+  if (payloadBytes === null || partitionPreset.value !== 'windows_and_data') return
+  const requiredGib = requiredWindowsPartitionGib(payloadBytes)
+  if (windowsPartitionSizeGib.value < requiredGib) windowsPartitionSizeGib.value = requiredGib
 })
 
 watch(selectedImageId, () => {
@@ -1428,6 +1454,14 @@ onBeforeUnmount(() => stopPolling?.())
             icon="i-lucide-hard-drive"
             :title="$t('devices.partitionCapacityInsufficientTitle')"
             :description="partitionCapacityErrorDescription"
+          />
+          <UAlert
+            v-if="targetsWithoutGhoPayloadCapacity.length"
+            color="error"
+            variant="subtle"
+            icon="i-lucide-hard-drive"
+            :title="$t('devices.ghoPayloadCapacityInsufficientTitle')"
+            :description="ghoPayloadCapacityErrorDescription"
           />
           </template>
           <section
