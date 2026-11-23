@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A client whose latest Windows deployment succeeded no longer PXE-boots back
+  into WinPE: the dynamic iPXE dispatcher exits so the firmware boots the
+  local disk. Queuing a new job for the device brings WinPE back.
+
 - Creating a GHO deployment job no longer hashes and decodes the whole image,
   which took minutes and left the dialog stuck at 0/1. Job creation checks the
   stored verification, span set and total size; the full revalidation still

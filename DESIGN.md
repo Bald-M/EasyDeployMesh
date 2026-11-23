@@ -293,7 +293,10 @@ sequenceDiagram
 ```
 
 The dynamic `boot.ipxe` asks the control plane for a per-device decision. A
-device without a Linux assignment chains to the exact managed WinPE script; a
+device without a Linux assignment chains to the exact managed WinPE script,
+unless its latest Windows deployment job succeeded and nothing newer exists: then
+the script exits iPXE so the firmware boots the next device, normally the
+restored disk (most clients keep the network first in their boot order); a
 device with a Linux assignment that fails identity, compatibility, or integrity
 checks receives a stop decision and must not fall through to another installer.
 Native-ISO WinPE packages cannot host this dispatcher because their fallback
