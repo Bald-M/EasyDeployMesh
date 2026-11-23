@@ -121,6 +121,14 @@ pub fn execute(
 
     #[cfg(target_os = "windows")]
     {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs() as i64);
+        let mut control_state = crate::resilience::lease_bounded(
+            control_state,
+            crate::resilience::lease_window(lease.expires_at.timestamp(), now_unix),
+            std::time::Instant::now,
+        );
         let work_directory = PathBuf::from(format!(r"{WINPE_DRIVE_LETTER}:\EasyDeployMesh\work"))
             .join(lease.job_id.to_string());
         fs::create_dir_all(&work_directory)?;
@@ -507,18 +515,21 @@ fn download_image(
         device_token,
         client,
         destination,
+        lease.image.size_bytes,
         control_state,
         TransferReporter::new(local, TransferPhase::Download, lease.image.size_bytes),
     )
 }
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 fn download_file(
     download_url: &str,
     server: &str,
     device_token: &str,
     client: &Client,
     destination: &Path,
+    total: u64,
     control_state: &mut impl FnMut() -> Result<JobState, Box<dyn Error>>,
     mut reporter: TransferReporter<'_>,
 ) -> Result<(), Box<dyn Error>> {
@@ -526,30 +537,26 @@ fn download_file(
         .parent()
         .ok_or("deployment image destination has no parent")?;
     fs::create_dir_all(parent)?;
-    let url = if download_url.starts_with("http://") || download_url.starts_with("https://") {
-        download_url.to_owned()
-    } else {
-        format!("{}{}", server.trim_end_matches('/'), download_url)
-    };
-    let mut response = client
-        .get(url)
-        .bearer_auth(device_token)
-        .send()?
-        .error_for_status()?;
+    let url = crate::resilience::resolve_download_url(server, download_url)?;
     let mut output = File::create(destination)?;
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    let mut downloaded = 0_u64;
-    loop {
-        await_running(control_state)?;
-        let read = response.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        output.write_all(&buffer[..read])?;
-        downloaded = downloaded.saturating_add(read as u64);
-        reporter.report(downloaded, false);
-    }
-    output.flush()?;
+    let downloaded = crate::resilience::download_resumable(
+        |offset| {
+            let mut request = client.get(&url).bearer_auth(device_token);
+            if offset > 0 {
+                request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+            }
+            let response = request.send()?.error_for_status()?;
+            if offset > 0 && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                return Err("control server did not resume the image download".into());
+            }
+            Ok(Box::new(response) as Box<dyn Read>)
+        },
+        &mut output,
+        total,
+        control_state,
+        &mut thread::sleep,
+        |done| reporter.report(done, false),
+    )?;
     reporter.report(downloaded, true);
     Ok(())
 }
@@ -728,17 +735,7 @@ impl Drop for LockedVolume {
 fn await_running(
     control_state: &mut impl FnMut() -> Result<JobState, Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
-    loop {
-        match control_state()? {
-            JobState::Running => return Ok(()),
-            JobState::Paused => thread::sleep(Duration::from_secs(1)),
-            state => {
-                return Err(
-                    format!("deployment control entered unexpected state: {state:?}").into(),
-                );
-            }
-        }
-    }
+    crate::resilience::await_running_with(control_state, &mut thread::sleep)
 }
 
 #[cfg(target_os = "windows")]
@@ -787,11 +784,20 @@ where
     loop {
         let requested_state = match control_state() {
             Ok(state) => state,
-            Err(_) => {
+            Err(error) if crate::resilience::is_transient(&*error) => {
                 // Keep the last applied process state during a transient control-plane outage.
                 // Resuming a deliberately suspended disk writer without operator intent is unsafe.
                 thread::sleep(Duration::from_secs(1));
                 continue;
+            }
+            Err(error) => {
+                // A rejected lease, or an outage past the lease, must stop the disk writer.
+                if suspended {
+                    let _ = set_process_suspended(process_handle, false);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
             }
         };
         match requested_state {

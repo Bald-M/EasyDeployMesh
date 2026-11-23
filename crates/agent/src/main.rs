@@ -25,6 +25,7 @@ use sysinfo::{Disks, System};
 mod deployment;
 #[cfg(any(target_os = "windows", test))]
 mod progress_view;
+mod resilience;
 #[cfg(any(target_os = "windows", test))]
 mod windows_inventory;
 #[cfg(target_os = "windows")]
@@ -575,11 +576,7 @@ where
     claim()
 }
 
-fn is_transient_request_error(error: &reqwest::Error) -> bool {
-    error
-        .status()
-        .is_none_or(|status| status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429))
-}
+use resilience::is_transient_request_error;
 
 fn connection_settings(cli: &Cli) -> Result<BootstrapConfig, Box<dyn Error>> {
     let automatic_bootstrap = [
@@ -645,22 +642,27 @@ fn execute_lease(
         // modified even if the report itself fails.
         #[cfg(target_os = "windows")]
         progress_window.stage(stage, progress_percent);
-        client
-            .post(format!(
-                "{server}/api/v1/agents/{}/jobs/{}/progress",
-                registration.device_id, lease.job_id
-            ))
-            .timeout(Duration::from_secs(15))
-            .bearer_auth(&registration.device_token)
-            .json(&AgentJobProgress {
-                lease_id: lease.lease_id,
-                stage,
-                progress_percent,
-                message: Some(message.to_owned()),
-            })
-            .send()?
-            .error_for_status()?;
-        Ok(())
+        resilience::report_best_effort(
+            || {
+                client
+                    .post(format!(
+                        "{server}/api/v1/agents/{}/jobs/{}/progress",
+                        registration.device_id, lease.job_id
+                    ))
+                    .timeout(Duration::from_secs(15))
+                    .bearer_auth(&registration.device_token)
+                    .json(&AgentJobProgress {
+                        lease_id: lease.lease_id,
+                        stage,
+                        progress_percent,
+                        message: Some(message.to_owned()),
+                    })
+                    .send()?
+                    .error_for_status()?;
+                Ok(())
+            },
+            &mut thread::sleep,
+        )
     };
     let control_state = || -> Result<JobState, Box<dyn Error>> {
         Ok(client
