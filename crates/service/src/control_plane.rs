@@ -28,7 +28,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
     str::FromStr,
     sync::Arc,
 };
@@ -670,7 +669,14 @@ async fn download_job_image(
             }
             (reader, prepared.download_size_bytes)
         } else {
-            let path = PathBuf::from(&image.source_path);
+            let images = Arc::clone(&state.images);
+            let (image_id, image_index) = (job.image_id, job.options.image_index);
+            let path = tokio::task::spawn_blocking(move || {
+                images.prepare_wim_download(image_id, image_index)
+            })
+            .await
+            .map_err(|error| ApiError::Conflict(format!("image validation task failed: {error}")))?
+            .map_err(ApiError::Images)?;
             let file = tokio::fs::File::open(&path)
                 .await
                 .map_err(|_| ApiError::NotFound)?;
@@ -2610,6 +2616,44 @@ mod tests {
             .await
             .expect("image should download");
         assert_eq!(downloaded.as_ref(), image_contents.as_slice());
+
+        // The download repeats the lease-time checks instead of trusting the manifest path.
+        let managed_image_path = std::path::PathBuf::from(&image.source_path);
+        #[cfg(unix)]
+        {
+            let external_copy = temp.path().join("external.wim");
+            std::fs::copy(&managed_image_path, &external_copy).expect("external copy should write");
+            std::fs::remove_file(&managed_image_path).expect("managed image should be removable");
+            std::os::unix::fs::symlink(&external_copy, &managed_image_path)
+                .expect("symlink out of the object library should be created");
+            let outside_library = client
+                .get(format!("{endpoint}{}", lease.image.download_url))
+                .bearer_auth(&registration.device_token)
+                .send()
+                .await
+                .expect("download outside the object library should complete");
+            assert_eq!(
+                outside_library.status(),
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            );
+            std::fs::remove_file(&managed_image_path).expect("symlink should be removable");
+        }
+        let mut tampered_contents = image_contents.clone();
+        *tampered_contents
+            .last_mut()
+            .expect("image fixture should not be empty") ^= 0xff;
+        std::fs::write(&managed_image_path, tampered_contents)
+            .expect("managed image should be tampered after the lease");
+        let tampered_download = client
+            .get(format!("{endpoint}{}", lease.image.download_url))
+            .bearer_auth(&registration.device_token)
+            .send()
+            .await
+            .expect("tampered download should complete");
+        assert_eq!(
+            tampered_download.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        );
 
         client
             .post(format!(
