@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { createJob, getJobs, removeJob, transitionJob } from '~/services/deployment'
 import type { CreateDeploymentJob, DeploymentJob } from '~/types/deployment'
+import { createLatestRefresh } from '~/utils/refresh-coordination'
 
 export const useJobStore = defineStore('jobs', () => {
   const jobs = ref<DeploymentJob[]>([])
@@ -11,16 +12,19 @@ export const useJobStore = defineStore('jobs', () => {
     jobs.value.filter(job => job.state === 'waiting').length
   )
 
-  async function refresh() {
-    loading.value = true
+  const latest = createLatestRefresh(getJobs, (next) => { jobs.value = next })
+
+  // Background refreshes (polling) never toggle the user-visible `loading`.
+  async function refresh(options: { background?: boolean } = {}) {
+    if (!options.background) loading.value = true
     lastError.value = null
 
     try {
-      jobs.value = await getJobs()
+      await latest.run()
     } catch (error) {
       lastError.value = String(error)
     } finally {
-      loading.value = false
+      if (!options.background) loading.value = false
     }
   }
 
@@ -29,6 +33,7 @@ export const useJobStore = defineStore('jobs', () => {
     lastError.value = null
     try {
       const queued = await createJob(request)
+      latest.invalidate()
       jobs.value = [queued, ...jobs.value.filter(job => job.id !== queued.id)]
       return queued
     } catch (error) {
@@ -43,6 +48,7 @@ export const useJobStore = defineStore('jobs', () => {
     lastError.value = null
     try {
       const removed = await removeJob(id)
+      latest.invalidate()
       if (removed) jobs.value = jobs.value.filter(job => job.id !== id)
       return removed
     } catch (error) {
@@ -55,6 +61,7 @@ export const useJobStore = defineStore('jobs', () => {
     lastError.value = null
     try {
       const updated = await transitionJob(id, state)
+      latest.invalidate()
       jobs.value = jobs.value.map(job => job.id === id ? updated : job)
       return updated
     } catch (error) {

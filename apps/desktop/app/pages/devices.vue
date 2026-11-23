@@ -18,9 +18,11 @@ import { partitionCapacity, partitionUserBudgets } from '~/utils/partition-capac
 import { templateDiskGroups } from '~/utils/template-disk-groups'
 import {
   deviceOperationalStatus,
+  deviceOperationalStatuses,
   isDeviceDeploymentAvailable,
   type DeviceOperationalStatus
 } from '~/utils/device-operational-status'
+import { startVisiblePolling } from '~/utils/refresh-coordination'
 import {
   clampFixedPartitionSizes,
   cloneCustomPartitionTemplate,
@@ -58,7 +60,9 @@ const imageStore = useImageStore()
 const jobStore = useJobStore()
 const toast = useToast()
 const { locale, t } = useI18n()
-let refreshTimer: ReturnType<typeof setInterval> | undefined
+let stopPolling: (() => void) | undefined
+// Reactive clock for lease expiry; advanced on every refresh tick.
+const now = ref(new Date())
 const sendDialogOpen = ref(false)
 const sendMode = ref<SendMode>('selected')
 const sendTarget = ref<RegisteredDevice | null>(null)
@@ -81,12 +85,14 @@ const sendProgress = ref({ completed: 0, total: 0 })
 const hardwareTarget = ref<RegisteredDevice | null>(null)
 const hardwareDialogOpen = ref(false)
 
-function operationalStatus(entry: RegisteredDevice) {
-  return deviceOperationalStatus(entry, jobStore.jobs)
+const operationalStatusById = computed(() => deviceOperationalStatuses(deviceStore.devices, jobStore.jobs, now.value))
+
+function operationalStatus(entry: RegisteredDevice): DeviceOperationalStatus {
+  return operationalStatusById.value.get(entry.device.id) ?? deviceOperationalStatus(entry, jobStore.jobs, now.value)
 }
 
 function isEntryDeployable(entry: RegisteredDevice) {
-  return isDeviceDeploymentAvailable(entry, jobStore.jobs)
+  return isDeviceDeploymentAvailable(entry, jobStore.jobs, now.value)
 }
 
 const ordinaryOnlineDevices = computed(() =>
@@ -886,24 +892,21 @@ watch(selectedImageId, () => {
   initializeTargetDisks(sendTargets.value)
 })
 
-async function refreshClients(verifyOnline = false) {
+async function refreshClients(verifyOnline = false, background = false) {
   await Promise.all([
-    verifyOnline ? deviceStore.verifyOnline() : deviceStore.refresh(),
-    jobStore.refresh()
+    verifyOnline ? deviceStore.verifyOnline() : deviceStore.refresh({ background }),
+    jobStore.refresh({ background })
   ])
+  now.value = new Date()
 }
 
 onMounted(() => {
   customTemplates.value = parseCustomPartitionTemplates(localStorage.getItem(customPartitionTemplatesStorageKey))
   void refreshClients()
-  refreshTimer = setInterval(() => void refreshClients(), 5_000)
+  stopPolling = startVisiblePolling(() => refreshClients(false, true), 5_000)
 })
 
-onBeforeUnmount(() => {
-  if (refreshTimer) {
-    clearInterval(refreshTimer)
-  }
-})
+onBeforeUnmount(() => stopPolling?.())
 </script>
 
 <template>
