@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { JobState } from '~/types/deployment'
+import { startVisiblePolling } from '~/utils/refresh-coordination'
 
 definePageMeta({ titleKey: 'nav.jobs' })
 
@@ -7,16 +8,14 @@ const jobStore = useJobStore()
 const toast = useToast()
 const { locale, t } = useI18n()
 const deletingJobId = ref<string | null>(null)
-let refreshTimer: ReturnType<typeof setInterval> | undefined
+let stopPolling: (() => void) | undefined
 
 onMounted(async () => {
   await jobStore.refresh()
-  refreshTimer = setInterval(() => void jobStore.refresh(), 3000)
+  stopPolling = startVisiblePolling(() => jobStore.refresh({ background: true }), 3000)
 })
 
-onUnmounted(() => {
-  if (refreshTimer) clearInterval(refreshTimer)
-})
+onUnmounted(() => stopPolling?.())
 
 type BadgeColor = 'neutral' | 'warning' | 'info' | 'success' | 'error'
 
