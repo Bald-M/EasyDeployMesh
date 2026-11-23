@@ -5,14 +5,24 @@ use easydeploymesh_core::{
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Reverse,
+    collections::HashMap,
     fs, io,
     path::{Path, PathBuf},
-    sync::RwLock,
+    sync::{Mutex, RwLock},
 };
 use thiserror::Error;
 use uuid::Uuid;
 
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
+/// How long a leased Agent job may go without any lease, control, or progress
+/// call before the host treats the Agent session as gone. A running Agent polls
+/// job control about every second during every long disk operation, so this
+/// leaves room for short network outages.
+pub const AGENT_JOB_CONTACT_TIMEOUT: chrono::Duration = chrono::Duration::minutes(10);
+/// A gap this long between two sweeps means the host itself was suspended or
+/// stalled, so missing Agent contact proves nothing about the Agent.
+const HOST_STALL_THRESHOLD: chrono::Duration = chrono::Duration::minutes(2);
+pub const ABANDONED_JOB_MESSAGE: &str = "The Agent stopped responding while the deployment was in progress (the device may have gone offline or restarted). The target disk may be partially written; retry the job to redeploy it from the start.";
 
 #[derive(Debug, Error)]
 pub enum JobRepositoryError {
@@ -87,6 +97,14 @@ struct JobManifest {
 pub struct JobRepository {
     manifest_path: PathBuf,
     jobs: RwLock<Vec<DeploymentJob>>,
+    /// Last Agent contact per leased job. Kept in memory only; after a restart
+    /// the repository open time stands in for it so live Agents get a full
+    /// timeout to reconnect.
+    agent_contacts: Mutex<HashMap<Uuid, chrono::DateTime<chrono::Utc>>>,
+    /// Earliest time missing contact may count against an Agent: the
+    /// repository open time, moved forward when the host resumes from a stall.
+    contact_grace_from: Mutex<chrono::DateTime<chrono::Utc>>,
+    last_sweep_at: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
 }
 
 impl JobRepository {
@@ -112,7 +130,83 @@ impl JobRepository {
         Ok(Self {
             manifest_path,
             jobs: RwLock::new(jobs),
+            agent_contacts: Mutex::new(HashMap::new()),
+            contact_grace_from: Mutex::new(chrono::Utc::now()),
+            last_sweep_at: Mutex::new(None),
         })
+    }
+
+    fn record_agent_contact(&self, job_id: Uuid, at: chrono::DateTime<chrono::Utc>) {
+        if let Ok(mut contacts) = self.agent_contacts.lock() {
+            contacts.insert(job_id, at);
+        }
+    }
+
+    /// Fails Agent jobs whose Agent session has stopped contacting the host.
+    ///
+    /// A running or paused Agent job whose Agent is gone cannot be resumed
+    /// safely: its lease is still held by the lost session, and reclaiming it
+    /// would silently restart partitioning. Failing it makes the interrupted,
+    /// possibly partially written disk explicit; redeploying needs a new job.
+    pub fn fail_abandoned_agent_jobs(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        timeout: chrono::Duration,
+    ) -> Result<Vec<DeploymentJob>, JobRepositoryError> {
+        let mut jobs = self
+            .jobs
+            .write()
+            .map_err(|_| JobRepositoryError::LockPoisoned)?;
+        let mut contacts = self
+            .agent_contacts
+            .lock()
+            .map_err(|_| JobRepositoryError::LockPoisoned)?;
+        let grace_from = {
+            let mut last_sweep_at = self
+                .last_sweep_at
+                .lock()
+                .map_err(|_| JobRepositoryError::LockPoisoned)?;
+            let mut grace_from = self
+                .contact_grace_from
+                .lock()
+                .map_err(|_| JobRepositoryError::LockPoisoned)?;
+            if last_sweep_at.is_some_and(|previous| now - previous > HOST_STALL_THRESHOLD) {
+                *grace_from = (*grace_from).max(now);
+            }
+            *last_sweep_at = Some(now);
+            *grace_from
+        };
+        let mut next_jobs = jobs.clone();
+        let mut failed = Vec::new();
+        for job in next_jobs.iter_mut().filter(|job| {
+            job.operation != Operation::InstallLinux
+                && matches!(job.state, JobState::Running | JobState::Paused)
+        }) {
+            let last_contact = contacts
+                .get(&job.id)
+                .copied()
+                .unwrap_or(grace_from)
+                .max(grace_from);
+            if now - last_contact < timeout {
+                continue;
+            }
+            job.state = job.state.transition(JobState::Failed)?;
+            job.status_message = None;
+            job.error_message = Some(ABANDONED_JOB_MESSAGE.to_owned());
+            job.lease_id = None;
+            job.lease_expires_at = None;
+            job.updated_at = now;
+            failed.push(job.clone());
+        }
+        if failed.is_empty() {
+            return Ok(failed);
+        }
+        self.persist(&next_jobs)?;
+        *jobs = next_jobs;
+        for job in &failed {
+            contacts.remove(&job.id);
+        }
+        Ok(failed)
     }
 
     pub fn list(&self) -> Result<Vec<DeploymentJob>, JobRepositoryError> {
@@ -327,6 +421,7 @@ impl JobRepository {
         let leased = job.clone();
         self.persist(&next_jobs)?;
         *jobs = next_jobs;
+        self.record_agent_contact(leased.id, now);
         Ok(Some(leased))
     }
 
@@ -603,6 +698,7 @@ impl JobRepository {
             return Err(JobRepositoryError::InvalidLease);
         }
         let now = chrono::Utc::now();
+        self.record_agent_contact(job_id, now);
         if job
             .lease_expires_at
             .is_some_and(|expires_at| expires_at >= now + duration / 2)
@@ -655,6 +751,7 @@ impl JobRepository {
         let updated = job.clone();
         self.persist(&next_jobs)?;
         *jobs = next_jobs;
+        self.record_agent_contact(job_id, updated.updated_at);
         Ok(updated)
     }
 
@@ -1385,5 +1482,179 @@ mod tests {
         repository
             .authorized_lease(created.id, device_id, lease_id)
             .expect("resumed lease should remain authorized");
+    }
+
+    fn paused_leased_job(repository: &JobRepository) -> (DeploymentJob, Uuid, Uuid) {
+        let request = request();
+        let device_id = request.targets[0].device_id;
+        let created = repository.create(request).expect("job should create");
+        repository
+            .transition(created.id, JobState::Waiting)
+            .expect("job should queue");
+        let leased = repository
+            .lease_for_device(device_id, chrono::Duration::minutes(120))
+            .expect("lease should work")
+            .expect("job should be available");
+        let lease_id = leased.lease_id.expect("lease id should exist");
+        repository
+            .transition(created.id, JobState::Paused)
+            .expect("running job should pause");
+        (created, device_id, lease_id)
+    }
+
+    #[test]
+    fn paused_job_without_agent_contact_fails_and_cannot_resume() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let repository = JobRepository::open(temp.path()).expect("repository should open");
+        let (created, device_id, lease_id) = paused_leased_job(&repository);
+        let later = chrono::Utc::now() + AGENT_JOB_CONTACT_TIMEOUT + chrono::Duration::seconds(1);
+
+        let failed = repository
+            .fail_abandoned_agent_jobs(later, AGENT_JOB_CONTACT_TIMEOUT)
+            .expect("abandoned jobs should fail");
+
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].state, JobState::Failed);
+        assert_eq!(
+            failed[0].error_message.as_deref(),
+            Some(ABANDONED_JOB_MESSAGE)
+        );
+        assert_eq!(failed[0].lease_id, None);
+        assert!(
+            repository
+                .transition(created.id, JobState::Running)
+                .is_err()
+        );
+        assert!(matches!(
+            repository.renew_control_lease(
+                created.id,
+                device_id,
+                lease_id,
+                chrono::Duration::minutes(120)
+            ),
+            Err(JobRepositoryError::InvalidLease)
+        ));
+        assert!(
+            repository
+                .lease_for_device(device_id, chrono::Duration::minutes(120))
+                .expect("lease lookup should work")
+                .is_none(),
+            "a failed job must never be reclaimed and restarted"
+        );
+        let reloaded = JobRepository::open(temp.path()).expect("repository should reload");
+        assert_eq!(
+            reloaded.list().expect("jobs should list")[0].state,
+            JobState::Failed
+        );
+    }
+
+    #[test]
+    fn agent_control_polling_keeps_a_paused_job_alive() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let repository = JobRepository::open(temp.path()).expect("repository should open");
+        let (created, device_id, lease_id) = paused_leased_job(&repository);
+        repository
+            .renew_control_lease(
+                created.id,
+                device_id,
+                lease_id,
+                chrono::Duration::minutes(120),
+            )
+            .expect("paused lease should renew");
+        let within = chrono::Utc::now() + AGENT_JOB_CONTACT_TIMEOUT - chrono::Duration::seconds(5);
+
+        assert!(
+            repository
+                .fail_abandoned_agent_jobs(within, AGENT_JOB_CONTACT_TIMEOUT)
+                .expect("sweep should work")
+                .is_empty()
+        );
+        repository
+            .transition(created.id, JobState::Running)
+            .expect("a job with a live Agent should still resume");
+    }
+
+    #[test]
+    fn reopened_repository_gives_live_agents_a_full_timeout_to_reconnect() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        {
+            let repository = JobRepository::open(temp.path()).expect("repository should open");
+            paused_leased_job(&repository);
+        }
+        let reopened = JobRepository::open(temp.path()).expect("repository should reopen");
+
+        assert!(
+            reopened
+                .fail_abandoned_agent_jobs(chrono::Utc::now(), AGENT_JOB_CONTACT_TIMEOUT)
+                .expect("sweep should work")
+                .is_empty()
+        );
+        let mut at = chrono::Utc::now();
+        let mut failed = Vec::new();
+        while failed.is_empty() && at < chrono::Utc::now() + AGENT_JOB_CONTACT_TIMEOUT * 2 {
+            at += chrono::Duration::seconds(30);
+            failed = reopened
+                .fail_abandoned_agent_jobs(at, AGENT_JOB_CONTACT_TIMEOUT)
+                .expect("sweep should work");
+        }
+        assert_eq!(
+            failed.len(),
+            1,
+            "a lost Agent must still be detected after a restart"
+        );
+    }
+
+    #[test]
+    fn sweep_ignores_jobs_no_agent_has_claimed() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let repository = JobRepository::open(temp.path()).expect("repository should open");
+        let created = repository.create(request()).expect("job should create");
+        repository
+            .transition(created.id, JobState::Waiting)
+            .expect("job should queue");
+        let later = chrono::Utc::now() + AGENT_JOB_CONTACT_TIMEOUT * 10;
+
+        assert!(
+            repository
+                .fail_abandoned_agent_jobs(later, AGENT_JOB_CONTACT_TIMEOUT)
+                .expect("sweep should work")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn host_stall_restarts_the_contact_timeout_instead_of_failing_live_jobs() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let repository = JobRepository::open(temp.path()).expect("repository should open");
+        paused_leased_job(&repository);
+        let now = chrono::Utc::now();
+        assert!(
+            repository
+                .fail_abandoned_agent_jobs(now, AGENT_JOB_CONTACT_TIMEOUT)
+                .expect("sweep should work")
+                .is_empty()
+        );
+
+        let after_sleep = now + AGENT_JOB_CONTACT_TIMEOUT + chrono::Duration::minutes(1);
+        assert!(
+            repository
+                .fail_abandoned_agent_jobs(after_sleep, AGENT_JOB_CONTACT_TIMEOUT)
+                .expect("sweep should work")
+                .is_empty(),
+            "the first sweep after the host wakes must not fail a job"
+        );
+
+        let mut at = after_sleep;
+        while at < after_sleep + AGENT_JOB_CONTACT_TIMEOUT {
+            at += chrono::Duration::seconds(30);
+            let failed = repository
+                .fail_abandoned_agent_jobs(at, AGENT_JOB_CONTACT_TIMEOUT)
+                .expect("sweep should work");
+            if !failed.is_empty() {
+                assert!(at >= after_sleep + AGENT_JOB_CONTACT_TIMEOUT);
+                return;
+            }
+        }
+        panic!("a job with no Agent contact after the host woke should still fail");
     }
 }

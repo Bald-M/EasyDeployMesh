@@ -304,7 +304,16 @@ draft -> waiting -> running -> succeeded
 
 Windows Agent jobs are leased for two hours. Progress and control polling renew
 the lease. An expired running Windows lease may be claimed again, but only after
-current image and disk eligibility checks pass. Linux installer attempts are
+current image and disk eligibility checks pass. The host also tracks, in
+memory, the last lease, control, or progress call for each running or paused
+Windows Agent job. A job with no such contact for 10 minutes is marked failed
+with an explicit "disk may be partially written" message, so a lost Agent
+session (device powered off or rebooted) never leaves a job stuck in paused and
+never silently restarts partitioning on resume; the user retries it
+explicitly. After the app starts, or after the host itself stalls for over two
+minutes (for example sleep), the 10 minutes count from that point instead, so a
+live Agent gets a full window to reconnect. A background sweep runs every 30
+seconds. Linux installer attempts are
 not automatically reclaimed after destructive authorization. Image download requires both device
 authentication and a valid, unexpired lease for that job.
 

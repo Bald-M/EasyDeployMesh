@@ -5,8 +5,9 @@ use easydeploymesh_core::{
     RegisteredDevice, RuntimeStatus,
 };
 use easydeploymesh_service::{
-    ActivityQuery, ActivityRepository, BootPackage, ControlPlane, DeviceRegistry, ImageLibrary,
-    JobRepository, NetworkInterfaceSummary, PxeService, WimlibCapability,
+    AGENT_JOB_CONTACT_TIMEOUT, ActivityQuery, ActivityRepository, BootPackage, ControlPlane,
+    DeviceRegistry, ImageLibrary, JobRepository, NetworkInterfaceSummary, PxeService,
+    WimlibCapability,
 };
 use serde::Deserialize;
 use std::{
@@ -435,6 +436,7 @@ fn activity_events(
     state: State<'_, AppState>,
 ) -> Result<Vec<ActivityEvent>, String> {
     capture_offline_devices(&state);
+    fail_abandoned_jobs(&state);
     state
         .activities
         .query(&ActivityQuery {
@@ -784,6 +786,7 @@ async fn remove_image(id: String, state: State<'_, AppState>) -> Result<bool, St
 
 #[tauri::command]
 fn list_jobs(state: State<'_, AppState>) -> Result<Vec<DeploymentJob>, String> {
+    fail_abandoned_jobs(&state);
     state.jobs.list().map_err(|error| error.to_string())
 }
 
@@ -851,6 +854,7 @@ async fn transition_job(
     state: State<'_, AppState>,
 ) -> Result<DeploymentJob, String> {
     let id = Uuid::parse_str(&id).map_err(|error| error.to_string())?;
+    fail_abandoned_jobs(&state);
     let updated = state
         .deployment_mutations
         .transition_job(id, next_state)
@@ -940,6 +944,54 @@ fn record_job_activity(
         details,
         raw,
     );
+}
+
+fn fail_abandoned_jobs(state: &AppState) {
+    let Ok(failed) = state
+        .jobs
+        .fail_abandoned_agent_jobs(chrono::Utc::now(), AGENT_JOB_CONTACT_TIMEOUT)
+    else {
+        return;
+    };
+    for job in failed {
+        record_job_activity(
+            state,
+            &job,
+            "job_failed",
+            ActivitySeverity::Error,
+            job.error_message.clone(),
+        );
+    }
+}
+
+/// Fails abandoned Agent jobs even while no page is polling, so the host
+/// notices its own suspension (a long gap between sweeps) and does not
+/// mistake it for lost Agents.
+fn spawn_abandoned_job_sweeper(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if let Some(state) = app.try_state::<AppState>() {
+                fail_abandoned_jobs(&state);
+            }
+        }
+    });
+}
+
+/// Devices already offline when the app starts were reported before it
+/// closed, so they are not reported again on every launch.
+fn initially_offline_devices(devices: &DeviceRegistry) -> HashSet<Uuid> {
+    devices
+        .list()
+        .map(|devices| {
+            devices
+                .into_iter()
+                .filter(|registered| !registered.online)
+                .map(|registered| registered.device.id)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn capture_offline_devices(state: &AppState) {
@@ -1032,6 +1084,8 @@ pub fn run() {
                 Arc::clone(&jobs),
                 pxe_boot_root.clone(),
             ));
+            let offline_devices = initially_offline_devices(&devices);
+            spawn_abandoned_job_sweeper(app.handle().clone());
             app.manage(AppState {
                 activities: Arc::clone(&activities),
                 control_plane: Arc::new(ControlPlane::new(
@@ -1051,7 +1105,7 @@ pub fn run() {
                 pxe_config_path: app_data_dir.join("pxe-config.json"),
                 pxe_boot_root,
                 agent_binary_path,
-                offline_devices: Mutex::new(HashSet::new()),
+                offline_devices: Mutex::new(offline_devices),
             });
             Ok(())
         })

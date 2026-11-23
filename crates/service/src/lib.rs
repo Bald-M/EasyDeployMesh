@@ -23,7 +23,7 @@ pub use image_library::{
     ImageLibrary, ImageLibraryError, PreparedGhoDeployment, PreparedGhoImageFile,
     PreparedGhoImageSet,
 };
-pub use job_repository::{JobRepository, JobRepositoryError};
+pub use job_repository::{AGENT_JOB_CONTACT_TIMEOUT, JobRepository, JobRepositoryError};
 #[cfg(target_os = "macos")]
 pub use macos_privileged::run_privileged_socket_helper_from_args;
 pub use pxe::{BootPackage, PxeService, PxeServiceError, validate_pxe_config};
