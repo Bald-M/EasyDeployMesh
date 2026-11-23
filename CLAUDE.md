@@ -74,7 +74,7 @@ Key flows that span several files:
   (only its SHA-256 is persisted in `devices.json`).
 - **Image import**: `ImageLibrary` stages copies into `library/objects/<uuid>`,
   hashes and validates, then atomically moves; manifests only store managed
-  paths. Validation repeats at job creation and again at job claim; the Agent
+  paths. Validation repeats at job creation (metadata-only for GHO) and fully at job claim; the Agent
   hashes downloaded bytes before applying.
 - **Deployment**: `create_job` (under `DeploymentMutationCoordinator`, which
   serializes image deletion vs. job creation) → `JobRepository` single-target job

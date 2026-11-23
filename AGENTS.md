@@ -60,7 +60,10 @@ The following behavior is intentional and must not be bypassed:
 - A lease is authenticated, device-bound, job-bound, expiring, and required for
   progress, control, completion, and image download.
 - Image format and operation must agree.
-- WIM/ESD and native GHO images are revalidated at job creation and job claim.
+- WIM/ESD images are fully revalidated at job creation and job claim. Native GHO
+  job creation runs only a metadata check (capability, parser version, source
+  partition, span set, sizes); the full hash-and-decode revalidation runs at job
+  claim before any lease is issued.
 - Downloaded bytes are hashed again before application.
 - GHO restore requires the expected parser version, expanded size, and expanded
   SHA-256; the target volume is locked and dismounted.

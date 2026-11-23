@@ -29,6 +29,30 @@ export function deviceOperationalStatus(
   return activeDeployment.state === 'paused' ? 'paused' : 'deploying'
 }
 
+// One pass over the jobs for every device, for lists that render many rows.
+export function deviceOperationalStatuses(
+  entries: readonly RegisteredDevice[],
+  jobs: readonly DeploymentJob[],
+  now = new Date()
+): Map<string, DeviceOperationalStatus> {
+  const activeByDevice = new Map<string, DeploymentJob>()
+  for (const job of jobs) {
+    if (job.state !== 'running' && job.state !== 'paused') continue
+    for (const target of job.targets) {
+      if (!activeByDevice.has(target.deviceId)) activeByDevice.set(target.deviceId, job)
+    }
+  }
+  return new Map(entries.map((entry) => {
+    const active = activeByDevice.get(entry.device.id)
+    const status: DeviceOperationalStatus = !active
+      ? (entry.online ? 'online' : 'offline')
+      : !hasValidLease(active, now)
+          ? 'unknown'
+          : active.state === 'paused' ? 'paused' : 'deploying'
+    return [entry.device.id, status]
+  }))
+}
+
 export function isDeviceDeploymentAvailable(
   entry: RegisteredDevice,
   jobs: readonly DeploymentJob[],
