@@ -704,6 +704,73 @@ impl ImageLibrary {
         self.prepare_gho_partition_deployment(id, source_partition)
     }
 
+    /// Cheap job-creation check for a GHO partition deployment.
+    ///
+    /// Hashing and decoding a large Ghost image takes minutes, so job creation
+    /// relies on the stored verification instead: the image must be verified
+    /// and deployable under the current parser, the selected partition must
+    /// exist, and the managed files must still match the recorded span set and
+    /// total size. The full revalidation runs at claim time before any lease is
+    /// issued. Returns the restored volume size of the selected partition.
+    pub fn check_gho_job_creation(
+        &self,
+        id: Uuid,
+        source_partition: u32,
+    ) -> Result<u64, ImageLibraryError> {
+        let artifact = self
+            .get(id)?
+            .ok_or(ImageLibraryError::ImageNotFound { id })?;
+        if artifact.format != ImageFormat::Gho {
+            return Err(ImageLibraryError::UnsupportedFormat(format!(
+                "GHO deployment requires GHO, found {:?} for image {id}",
+                artifact.format
+            )));
+        }
+        let capability = artifact
+            .gho_capability
+            .as_ref()
+            .filter(|value| {
+                artifact.verified && value.deployable && value.parser_version == PARSER_VERSION
+            })
+            .ok_or(ImageLibraryError::ImageNotVerified { id })?;
+        let volume_size_bytes = capability
+            .partitions
+            .iter()
+            .find(|partition| partition.source_partition == source_partition)
+            .map(|partition| partition.volume_size_bytes)
+            .ok_or(ImageLibraryError::UnsupportedFormat(format!(
+                "GHO source partition {source_partition} is not a verified NTFS partition"
+            )))?;
+        let object_directory = resolve_gho_object_directory(id, &artifact, &self.objects_dir)?;
+        let managed_files = read_directory_files(&object_directory)?;
+        let discovered_spans =
+            discover_ghost_spans(Path::new(&artifact.source_path), &managed_files)?;
+        let recorded_spans = artifact.spans.iter().map(PathBuf::from).collect::<Vec<_>>();
+        if discovered_spans != recorded_spans {
+            return Err(ImageLibraryError::InvalidSpanSet {
+                path: artifact.source_path.clone(),
+                reason: "stored GHO span list no longer matches the managed object directory"
+                    .to_owned(),
+            });
+        }
+        let mut total_size_bytes = 0_u64;
+        for path in artifact_file_paths(&artifact) {
+            let metadata = fs::metadata(&path).map_err(|source| ImageLibraryError::Read {
+                path: path.display().to_string(),
+                source,
+            })?;
+            total_size_bytes = total_size_bytes.saturating_add(metadata.len());
+        }
+        if total_size_bytes != artifact.size_bytes {
+            return Err(ImageLibraryError::ManagedSizeMismatch {
+                id,
+                expected: artifact.size_bytes,
+                actual: total_size_bytes,
+            });
+        }
+        Ok(volume_size_bytes)
+    }
+
     pub fn prepare_gho_partition_deployment(
         &self,
         id: Uuid,
@@ -2219,6 +2286,26 @@ mod tests {
             .expect("spanned GHO should prepare for deployment");
         assert_eq!(prepared.image.spans.len(), 1);
         assert_eq!(prepared.capability.source_partition, Some(1));
+
+        let volume_size = library
+            .check_gho_job_creation(artifact.id, 1)
+            .expect("job creation check should pass for a verified image");
+        assert_eq!(volume_size, prepared.capability.volume_size_bytes.unwrap());
+        assert!(matches!(
+            library.check_gho_job_creation(artifact.id, 2),
+            Err(ImageLibraryError::UnsupportedFormat(_))
+        ));
+
+        let stored_span = PathBuf::from(&artifact.spans[0]);
+        let mut grown = fs::read(&stored_span).unwrap();
+        grown.push(0);
+        fs::write(&stored_span, grown).unwrap();
+        assert!(matches!(
+            library.check_gho_job_creation(artifact.id, 1),
+            Err(ImageLibraryError::ManagedSizeMismatch { .. })
+        ));
+        fs::remove_file(&stored_span).unwrap();
+        assert!(library.check_gho_job_creation(artifact.id, 1).is_err());
     }
 
     #[test]

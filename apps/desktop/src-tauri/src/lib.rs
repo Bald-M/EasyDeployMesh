@@ -589,9 +589,11 @@ impl DeploymentMutationCoordinator {
             Operation::DeployWim => images
                 .revalidate_for_deployment(image_id, image_index)
                 .map(|_| None),
+            // The full GHO revalidation takes minutes; it runs at claim time
+            // before any lease is issued.
             Operation::DeployGho => images
-                .prepare_gho_partition_deployment(image_id, image_index)
-                .map(|prepared| prepared.capability.volume_size_bytes),
+                .check_gho_job_creation(image_id, image_index)
+                .map(Some),
             Operation::CaptureGho => Err(
                 easydeploymesh_service::ImageLibraryError::UnsupportedFormat(
                     "GHO capture is not supported".to_owned(),

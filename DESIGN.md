@@ -191,7 +191,10 @@ staged directory into `library/objects/<uuid>`.
 4. The manifest records only managed paths. Symlinks, paths outside the object
    store, changed sizes, changed hashes, ambiguous spans, and unsafe names fail
    closed.
-5. Job creation repeats deployment preflight while holding the mutation lock.
+5. Job creation repeats deployment preflight while holding the mutation lock. For
+   native GHO this is a cheap check of the stored verification, span set and
+   total size, because a full decode takes minutes; the full revalidation runs
+   at claim time before any lease is issued.
 6. Job claim repeats image validation again before issuing a lease. It also
    re-runs partition plan validation, so a job stored before a stricter rule
    is not leased again and never reaches the Agent. Because a

@@ -49,6 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Creating a GHO deployment job no longer hashes and decodes the whole image,
+  which took minutes and left the dialog stuck at 0/1. Job creation checks the
+  stored verification, span set and total size; the full revalidation still
+  runs at claim time before a lease is issued (#63).
+
 - Device, job, image, activity, PXE configuration, DHCP lease, and WinPE
   bootstrap JSON files are now replaced atomically (synced temporary file,
   rename, directory sync), so a crash or power loss mid-write can no longer
