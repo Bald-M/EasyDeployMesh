@@ -16,7 +16,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
 #[tauri::command]
@@ -262,16 +262,30 @@ fn require_winpe_import_host() -> Result<(), String> {
 }
 
 #[tauri::command]
-fn winpe_import_capability() -> WimlibCapability {
-    easydeploymesh_service::wimlib_capability()
+async fn winpe_import_capability() -> Result<WimlibCapability, String> {
+    tauri::async_runtime::spawn_blocking(easydeploymesh_service::wimlib_capability)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn import_pxe_boot_package(
+async fn import_pxe_boot_package(
     source: String,
     bios_boot_file: String,
     uefi_x64_boot_file: String,
-    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<BootPackage, String> {
+    run_blocking(app, move |state| {
+        import_pxe_boot_package_blocking(source, bios_boot_file, uefi_x64_boot_file, state)
+    })
+    .await
+}
+
+fn import_pxe_boot_package_blocking(
+    source: String,
+    bios_boot_file: String,
+    uefi_x64_boot_file: String,
+    state: &AppState,
 ) -> Result<BootPackage, String> {
     require_winpe_import_host()?;
     if !state.agent_binary_path.is_file() {
@@ -293,7 +307,11 @@ fn import_pxe_boot_package(
 }
 
 #[tauri::command]
-fn import_pxe_media(source: String, state: State<'_, AppState>) -> Result<BootPackage, String> {
+async fn import_pxe_media(source: String, app: AppHandle) -> Result<BootPackage, String> {
+    run_blocking(app, move |state| import_pxe_media_blocking(source, state)).await
+}
+
+fn import_pxe_media_blocking(source: String, state: &AppState) -> Result<BootPackage, String> {
     require_winpe_import_host()?;
     if !state.agent_binary_path.is_file() {
         return Err(format!(
@@ -431,12 +449,19 @@ struct ActivityQueryInput {
 }
 
 #[tauri::command]
-fn activity_events(
+async fn activity_events(
     query: ActivityQueryInput,
-    state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<Vec<ActivityEvent>, String> {
-    capture_offline_devices(&state);
-    fail_abandoned_jobs(&state);
+    run_blocking(app, move |state| activity_events_blocking(query, state)).await
+}
+
+fn activity_events_blocking(
+    query: ActivityQueryInput,
+    state: &AppState,
+) -> Result<Vec<ActivityEvent>, String> {
+    capture_offline_devices(state);
+    fail_abandoned_jobs(state);
     state
         .activities
         .query(&ActivityQuery {
@@ -876,6 +901,17 @@ async fn transition_job(
         updated.error_message.clone(),
     );
     Ok(updated)
+}
+
+/// Runs disk- or process-bound command work off the main thread so the window
+/// stays responsive.
+async fn run_blocking<T: Send + 'static>(
+    app: AppHandle,
+    work: impl FnOnce(&AppState) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(move || work(&app.state::<AppState>()))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 struct AppState {
