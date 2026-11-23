@@ -65,3 +65,34 @@ export function partitionUserBudgets(
     totalGib: Math.floor(totalMib / 1024)
   }
 }
+
+const GIB_BYTES = 1024 * MIB_BYTES
+
+/** Smallest whole-GiB Windows partition that holds a raw payload (rounded up, never down). */
+export function requiredWindowsPartitionGib(payloadSizeBytes: number): number {
+  return Math.max(1, Math.ceil(payloadSizeBytes / GIB_BYTES))
+}
+
+/** Mirrors `PartitionPlan::validate_windows_payload_capacity` in crates/core. */
+export function windowsPartitionAvailableBytes(
+  plan: PartitionPlan,
+  diskSizeBytes: number,
+  imageSizeBytes: number
+): number {
+  const windows = plan.partitions.find(partition => partition.role === 'windows')
+  if (!windows) return 0
+  if (windows.sizeMib !== null) return windows.sizeMib * MIB_BYTES
+  const fixedMib = plan.partitions.reduce((total, partition) => total + (partition.sizeMib ?? 0), 0)
+  const cacheMib = Math.ceil(imageSizeBytes / MIB_BYTES) + IMAGE_CACHE_HEADROOM_MIB
+  const availableMib = Math.floor(diskSizeBytes / MIB_BYTES) - fixedMib - cacheMib - PARTITION_ALIGNMENT_HEADROOM_MIB
+  return Math.max(0, availableMib) * MIB_BYTES
+}
+
+export function windowsPartitionFitsPayload(
+  plan: PartitionPlan,
+  diskSizeBytes: number,
+  imageSizeBytes: number,
+  payloadSizeBytes: number
+): boolean {
+  return windowsPartitionAvailableBytes(plan, diskSizeBytes, imageSizeBytes) >= payloadSizeBytes
+}
