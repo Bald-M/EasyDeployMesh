@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { openExternalUrl } from '~/services/external'
+import { startVisiblePolling } from '~/utils/refresh-coordination'
 
 const route = useRoute()
 const { t } = useI18n()
@@ -8,7 +9,7 @@ const runtimeStore = useRuntimeStore()
 const imageStore = useImageStore()
 const jobStore = useJobStore()
 const deviceStore = useDeviceStore()
-let refreshTimer: ReturnType<typeof setInterval> | undefined
+let stopPolling: (() => void) | undefined
 const repositoryUrl = 'https://github.com/Bald-M/EasyDeployMesh'
 
 const globalRefreshLoading = computed(() =>
@@ -82,17 +83,13 @@ onMounted(() => {
     jobStore.refresh(),
     deviceStore.refresh()
   ])
-  refreshTimer = setInterval(() => {
-    runtimeStore.refresh()
-    deviceStore.refresh()
-  }, 10_000)
+  stopPolling = startVisiblePolling(() => Promise.all([
+    runtimeStore.refresh({ background: true }),
+    deviceStore.refresh({ background: true })
+  ]), 10_000)
 })
 
-onBeforeUnmount(() => {
-  if (refreshTimer) {
-    clearInterval(refreshTimer)
-  }
-})
+onBeforeUnmount(() => stopPolling?.())
 </script>
 
 <template>

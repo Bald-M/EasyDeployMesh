@@ -22,10 +22,18 @@ export const useDeviceStore = defineStore('devices', () => {
     return pxeClients.value.filter(entry => !registered.has(entry.macAddress.toUpperCase()))
   })
 
-  function refresh() {
-    if (refreshInFlight) return refreshInFlight
-    refreshInFlight = (async () => {
+  // Background refreshes (polling) never toggle the user-visible `loading`.
+  function refresh(options: { background?: boolean } = {}) {
+    const visible = !options.background
+    if (refreshInFlight) {
+      if (!visible) return refreshInFlight
+      // A user-visible call joining a background poll still shows the spinner.
       activeRequests.value += 1
+      return refreshInFlight.finally(() => { activeRequests.value -= 1 })
+    }
+    let request: Promise<void> | undefined
+    request = (async () => {
+      if (visible) activeRequests.value += 1
       lastError.value = null
       try {
         const sequence = ++requestSequence
@@ -37,11 +45,12 @@ export const useDeviceStore = defineStore('devices', () => {
       } catch (error) {
         lastError.value = String(error)
       } finally {
-        activeRequests.value -= 1
-        refreshInFlight = null
+        if (visible) activeRequests.value -= 1
+        if (refreshInFlight === request) refreshInFlight = null
       }
     })()
-    return refreshInFlight
+    refreshInFlight = request
+    return request
   }
 
   function verifyOnline() {
@@ -70,6 +79,8 @@ export const useDeviceStore = defineStore('devices', () => {
     lastError.value = null
     try {
       const removed = await removeDevice(id)
+      requestSequence += 1
+      refreshInFlight = null
       if (removed) {
         devices.value = devices.value.filter(entry => entry.device.id !== id)
       }

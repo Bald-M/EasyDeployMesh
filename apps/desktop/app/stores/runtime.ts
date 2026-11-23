@@ -16,6 +16,7 @@ import type {
   PxeServiceStatus,
   RuntimeStatus
 } from '~/types/runtime'
+import { createLatestRefresh } from '~/utils/refresh-coordination'
 
 const initialStatus: RuntimeStatus = {
   serviceState: 'idle',
@@ -54,25 +55,31 @@ export const useRuntimeStore = defineStore('runtime', () => {
     interfaces.value.filter(item => !item.isLoopback)
   )
 
-  async function refresh() {
-    refreshing.value = true
-    errorCode.value = null
-
-    try {
-      const [nextStatus, nextInterfaces, nextControlStatus, nextPxeStatus] = await Promise.all([
-        getRuntimeStatus(),
-        getNetworkInterfaces(),
-        getControlPlaneStatus(),
-        getPxeServiceStatus()
-      ])
+  const latest = createLatestRefresh(
+    () => Promise.all([
+      getRuntimeStatus(),
+      getNetworkInterfaces(),
+      getControlPlaneStatus(),
+      getPxeServiceStatus()
+    ]),
+    ([nextStatus, nextInterfaces, nextControlStatus, nextPxeStatus]) => {
       status.value = nextStatus
       interfaces.value = nextInterfaces
       controlStatus.value = nextControlStatus
       pxeStatus.value = nextPxeStatus
+    }
+  )
+
+  async function refresh(options: { background?: boolean } = {}) {
+    if (!options.background) refreshing.value = true
+    errorCode.value = null
+
+    try {
+      await latest.run()
     } catch {
       errorCode.value = 'errors.runtimeUnavailable'
     } finally {
-      refreshing.value = false
+      if (!options.background) refreshing.value = false
     }
   }
 
@@ -80,7 +87,9 @@ export const useRuntimeStore = defineStore('runtime', () => {
     controlLoading.value = true
     errorCode.value = null
     try {
-      controlStatus.value = await startControlPlane(bindAddress, port)
+      const next = await startControlPlane(bindAddress, port)
+      latest.invalidate()
+      controlStatus.value = next
       await refresh()
     } catch (error) {
       errorCode.value = 'errors.controlStartFailed'
@@ -94,7 +103,9 @@ export const useRuntimeStore = defineStore('runtime', () => {
     controlLoading.value = true
     errorCode.value = null
     try {
-      controlStatus.value = await stopControlPlane()
+      const next = await stopControlPlane()
+      latest.invalidate()
+      controlStatus.value = next
       await refresh()
     } catch (error) {
       errorCode.value = 'errors.controlStopFailed'
@@ -107,7 +118,9 @@ export const useRuntimeStore = defineStore('runtime', () => {
   async function startPxe(config: PxeConfig, controlPort = 7760) {
     pxeLoading.value = true
     try {
-      pxeStatus.value = await startPxeService(config, controlPort)
+      const next = await startPxeService(config, controlPort)
+      latest.invalidate()
+      pxeStatus.value = next
       controlStatus.value = await getControlPlaneStatus()
     }
     finally { pxeLoading.value = false }
@@ -115,7 +128,11 @@ export const useRuntimeStore = defineStore('runtime', () => {
 
   async function stopPxe() {
     pxeLoading.value = true
-    try { pxeStatus.value = await stopPxeService() }
+    try {
+      const next = await stopPxeService()
+      latest.invalidate()
+      pxeStatus.value = next
+    }
     finally { pxeLoading.value = false }
   }
 

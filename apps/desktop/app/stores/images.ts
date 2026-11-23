@@ -6,6 +6,7 @@ import {
   removeImage
 } from '~/services/deployment'
 import type { ImageArtifact } from '~/types/deployment'
+import { createLatestRefresh } from '~/utils/refresh-coordination'
 
 export const useImageStore = defineStore('images', () => {
   const images = ref<ImageArtifact[]>([])
@@ -17,16 +18,18 @@ export const useImageStore = defineStore('images', () => {
     images.value.filter(image => image.verified).length
   )
 
-  async function refresh() {
-    loading.value = true
+  const latest = createLatestRefresh(getImages, (next) => { images.value = next })
+
+  async function refresh(options: { background?: boolean } = {}) {
+    if (!options.background) loading.value = true
     lastError.value = null
 
     try {
-      images.value = await getImages()
+      await latest.run()
     } catch (error) {
       lastError.value = String(error)
     } finally {
-      loading.value = false
+      if (!options.background) loading.value = false
     }
   }
 
@@ -45,7 +48,8 @@ export const useImageStore = defineStore('images', () => {
         await importImage(path)
         imported += 1
       }
-      images.value = await getImages()
+      latest.invalidate()
+      await latest.run()
       return imported
     } catch (error) {
       lastError.value = String(error)
@@ -59,6 +63,7 @@ export const useImageStore = defineStore('images', () => {
     lastError.value = null
     try {
       const removed = await removeImage(id)
+      latest.invalidate()
       if (removed) {
         images.value = images.value.filter(image => image.id !== id)
       }

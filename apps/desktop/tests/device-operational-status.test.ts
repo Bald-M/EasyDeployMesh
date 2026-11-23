@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { DeploymentJob, RegisteredDevice } from '../app/types/deployment'
 import {
   deviceOperationalStatus,
+  deviceOperationalStatuses,
   isDeviceDeploymentAvailable
 } from '../app/utils/device-operational-status'
 
@@ -105,5 +106,25 @@ describe('device operational status', () => {
     systemOnly.device.disks = systemOnly.device.disks.map(disk => ({ ...disk, isSystem: true }))
     expect(isDeviceDeploymentAvailable(systemOnly, [], now)).toBe(false)
     expect(isDeviceDeploymentAvailable(device(false), [], now)).toBe(false)
+  })
+
+  it('computes the same statuses in one batch as per device', () => {
+    const other = device(true)
+    other.device = { ...other.device, id: 'device-2' }
+    const entries = [device(false), other]
+    const jobSets: DeploymentJob[][] = [
+      [],
+      [job('running')],
+      [job('paused')],
+      [job('running', null)],
+      [job('waiting'), job('paused')],
+      [job('succeeded'), job('running', '2026-08-25T04:59:59Z'), job('running')]
+    ]
+    for (const jobs of jobSets) {
+      const batch = deviceOperationalStatuses(entries, jobs, now)
+      for (const entry of entries) {
+        expect(batch.get(entry.device.id)).toBe(deviceOperationalStatus(entry, jobs, now))
+      }
+    }
   })
 })

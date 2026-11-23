@@ -5,8 +5,9 @@ use easydeploymesh_core::{
     RegisteredDevice, RuntimeStatus,
 };
 use easydeploymesh_service::{
-    ActivityQuery, ActivityRepository, BootPackage, ControlPlane, DeviceRegistry, ImageLibrary,
-    JobRepository, NetworkInterfaceSummary, PxeService, WimlibCapability,
+    AGENT_JOB_CONTACT_TIMEOUT, ActivityQuery, ActivityRepository, BootPackage, ControlPlane,
+    DeviceRegistry, ImageLibrary, JobRepository, NetworkInterfaceSummary, PxeService,
+    WimlibCapability,
 };
 use serde::Deserialize;
 use std::{
@@ -216,20 +217,9 @@ async fn refresh_devices(state: State<'_, AppState>) -> Result<Vec<RegisteredDev
 }
 
 #[tauri::command]
-async fn remove_device(id: String, app: AppHandle) -> Result<bool, String> {
-    run_blocking(app, move |state| remove_device_blocking(id, state)).await
-}
-
-fn remove_device_blocking(id: String, state: &AppState) -> Result<bool, String> {
+async fn remove_device(id: String, state: State<'_, AppState>) -> Result<bool, String> {
     let id = Uuid::parse_str(&id).map_err(|error| error.to_string())?;
-    if state
-        .jobs
-        .references_device(id)
-        .map_err(|error| error.to_string())?
-    {
-        return Err("device is referenced by a deployment job".to_owned());
-    }
-    state.devices.remove(id).map_err(|error| error.to_string())
+    state.deployment_mutations.remove_device(id).await
 }
 
 #[tauri::command]
@@ -471,6 +461,7 @@ fn activity_events_blocking(
     state: &AppState,
 ) -> Result<Vec<ActivityEvent>, String> {
     capture_offline_devices(state);
+    fail_abandoned_jobs(state);
     state
         .activities
         .query(&ActivityQuery {
@@ -547,6 +538,7 @@ impl DeploymentMutationCoordinator {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("deployment image was not found: {}", request.image_id))?;
         validate_deployment_compatibility(request.operation, &image)?;
+        self.reject_unregistered_targets(&request.targets)?;
         self.reject_system_disk_targets(&request.targets)?;
         if request.operation == Operation::InstallLinux {
             if request.targets.len() != 1 {
@@ -619,8 +611,8 @@ impl DeploymentMutationCoordinator {
                 .revalidate_for_deployment(image_id, image_index)
                 .map(|_| None),
             Operation::DeployGho => images
-                .prepare_gho_partition_deployment(image_id, image_index)
-                .map(|prepared| prepared.capability.expanded_size_bytes),
+                .check_gho_partition_deployable(image_id, image_index)
+                .map(|partition| Some(partition.expanded_size_bytes)),
             Operation::CaptureGho => Err(
                 easydeploymesh_service::ImageLibraryError::UnsupportedFormat(
                     "GHO capture is not supported".to_owned(),
@@ -655,6 +647,23 @@ impl DeploymentMutationCoordinator {
             .map_err(|error| error.to_string())
     }
 
+    /// Refuses targets whose device is not registered, so a job never references a removed device.
+    fn reject_unregistered_targets(&self, targets: &[DeploymentTarget]) -> Result<(), String> {
+        let registered = self.devices.list().map_err(|error| error.to_string())?;
+        for target in targets {
+            if !registered
+                .iter()
+                .any(|registered| registered.device.id == target.device_id)
+            {
+                return Err(format!(
+                    "deployment device was not found: {}",
+                    target.device_id
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Refuses targets whose current inventory reports the disk hosting the running system.
     /// The Agent and lease issuance repeat this check, so the UI is never the only guard.
     fn reject_system_disk_targets(&self, targets: &[DeploymentTarget]) -> Result<(), String> {
@@ -677,6 +686,45 @@ impl DeploymentMutationCoordinator {
     async fn remove_job(&self, id: Uuid) -> Result<bool, String> {
         let _mutation = self.mutation_lock.lock().await;
         self.jobs.remove(id).map_err(|error| error.to_string())
+    }
+
+    async fn remove_device(&self, id: Uuid) -> Result<bool, String> {
+        let _mutation = self.mutation_lock.lock().await;
+        if self
+            .jobs
+            .references_device(id)
+            .map_err(|error| error.to_string())?
+        {
+            return Err("device is referenced by a deployment job".to_owned());
+        }
+        self.devices.remove(id).map_err(|error| error.to_string())
+    }
+
+    async fn transition_job(
+        &self,
+        id: Uuid,
+        next_state: JobState,
+    ) -> Result<DeploymentJob, String> {
+        let _mutation = self.mutation_lock.lock().await;
+        let current = self
+            .jobs
+            .list()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|job| job.id == id)
+            .ok_or_else(|| format!("deployment job was not found: {id}"))?;
+        if current.operation == Operation::InstallLinux
+            && current.state == JobState::Running
+            && matches!(next_state, JobState::Paused | JobState::Cancelled)
+        {
+            return Err(
+                "a Linux installer cannot be safely paused or cancelled after disk authorization"
+                    .to_owned(),
+            );
+        }
+        self.jobs
+            .transition(id, next_state)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -763,6 +811,7 @@ async fn remove_image(id: String, state: State<'_, AppState>) -> Result<bool, St
 
 #[tauri::command]
 fn list_jobs(state: State<'_, AppState>) -> Result<Vec<DeploymentJob>, String> {
+    fail_abandoned_jobs(&state);
     state.jobs.list().map_err(|error| error.to_string())
 }
 
@@ -827,40 +876,14 @@ fn validate_deployment_compatibility(
 async fn transition_job(
     id: String,
     next_state: JobState,
-    app: AppHandle,
-) -> Result<DeploymentJob, String> {
-    run_blocking(app, move |state| {
-        transition_job_blocking(id, next_state, state)
-    })
-    .await
-}
-
-fn transition_job_blocking(
-    id: String,
-    next_state: JobState,
-    state: &AppState,
+    state: State<'_, AppState>,
 ) -> Result<DeploymentJob, String> {
     let id = Uuid::parse_str(&id).map_err(|error| error.to_string())?;
-    let current = state
-        .jobs
-        .list()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|job| job.id == id)
-        .ok_or_else(|| format!("deployment job was not found: {id}"))?;
-    if current.operation == Operation::InstallLinux
-        && current.state == JobState::Running
-        && matches!(next_state, JobState::Paused | JobState::Cancelled)
-    {
-        return Err(
-            "a Linux installer cannot be safely paused or cancelled after disk authorization"
-                .to_owned(),
-        );
-    }
+    fail_abandoned_jobs(&state);
     let updated = state
-        .jobs
-        .transition(id, next_state)
-        .map_err(|error| error.to_string())?;
+        .deployment_mutations
+        .transition_job(id, next_state)
+        .await?;
     let (kind, severity) = match next_state {
         JobState::Waiting => ("job_queued", ActivitySeverity::Info),
         JobState::Running => ("job_resumed", ActivitySeverity::Info),
@@ -871,7 +894,7 @@ fn transition_job_blocking(
         JobState::Draft => ("job_created", ActivitySeverity::Info),
     };
     record_job_activity(
-        state,
+        &state,
         &updated,
         kind,
         severity,
@@ -957,6 +980,54 @@ fn record_job_activity(
         details,
         raw,
     );
+}
+
+fn fail_abandoned_jobs(state: &AppState) {
+    let Ok(failed) = state
+        .jobs
+        .fail_abandoned_agent_jobs(chrono::Utc::now(), AGENT_JOB_CONTACT_TIMEOUT)
+    else {
+        return;
+    };
+    for job in failed {
+        record_job_activity(
+            state,
+            &job,
+            "job_failed",
+            ActivitySeverity::Error,
+            job.error_message.clone(),
+        );
+    }
+}
+
+/// Fails abandoned Agent jobs even while no page is polling, so the host
+/// notices its own suspension (a long gap between sweeps) and does not
+/// mistake it for lost Agents.
+fn spawn_abandoned_job_sweeper(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if let Some(state) = app.try_state::<AppState>() {
+                fail_abandoned_jobs(&state);
+            }
+        }
+    });
+}
+
+/// Devices already offline when the app starts were reported before it
+/// closed, so they are not reported again on every launch.
+fn initially_offline_devices(devices: &DeviceRegistry) -> HashSet<Uuid> {
+    devices
+        .list()
+        .map(|devices| {
+            devices
+                .into_iter()
+                .filter(|registered| !registered.online)
+                .map(|registered| registered.device.id)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn capture_offline_devices(state: &AppState) {
@@ -1049,6 +1120,8 @@ pub fn run() {
                 Arc::clone(&jobs),
                 pxe_boot_root.clone(),
             ));
+            let offline_devices = initially_offline_devices(&devices);
+            spawn_abandoned_job_sweeper(app.handle().clone());
             app.manage(AppState {
                 activities: Arc::clone(&activities),
                 control_plane: Arc::new(ControlPlane::new(
@@ -1068,7 +1141,7 @@ pub fn run() {
                 pxe_config_path: app_data_dir.join("pxe-config.json"),
                 pxe_boot_root,
                 agent_binary_path,
-                offline_devices: Mutex::new(HashSet::new()),
+                offline_devices: Mutex::new(offline_devices),
             });
             Ok(())
         })
@@ -1217,6 +1290,41 @@ mod tests {
         }
     }
 
+    fn register_test_device(devices: &DeviceRegistry, ip: &str) -> Uuid {
+        let template = linux_registered_device(vec![Disk {
+            id: r"\\.\PhysicalDrive1".to_owned(),
+            model: "Data SSD".to_owned(),
+            serial: Some(format!("SERIAL-{ip}")),
+            size_bytes: 64 * 1024 * 1024 * 1024,
+            is_system: false,
+        }])
+        .device;
+        let (registered, _) = devices
+            .register(
+                easydeploymesh_core::AgentInventory {
+                    hostname: template.hostname,
+                    mac_address: format!(
+                        "02:00:00:00:00:{:02x}",
+                        ip.rsplit('.').next().unwrap().parse::<u8>().unwrap()
+                    ),
+                    model: None,
+                    serial: None,
+                    cpu_model: None,
+                    physical_core_count: None,
+                    logical_processor_count: template.logical_processor_count,
+                    memory_bytes: template.memory_bytes,
+                    system_details: SystemDetails::default(),
+                    architecture: template.architecture,
+                    boot_mode: template.boot_mode,
+                    disks: template.disks,
+                    agent_version: "0.2.6".to_owned(),
+                },
+                ip.parse().expect("test IP should parse"),
+            )
+            .expect("device should register");
+        registered.device.id
+    }
+
     fn linux_registered_device(disks: Vec<Disk>) -> RegisteredDevice {
         let now = chrono::Utc::now();
         RegisteredDevice {
@@ -1291,6 +1399,7 @@ mod tests {
         let devices = Arc::new(
             DeviceRegistry::open(temp.path().join("devices")).expect("device registry should open"),
         );
+        let device_id = register_test_device(&devices, "192.0.2.40");
         let coordinator = Arc::new(DeploymentMutationCoordinator::new(
             devices,
             Arc::clone(&images),
@@ -1307,7 +1416,7 @@ mod tests {
             operation: Operation::DeployWim,
             image_id: image.id,
             targets: vec![DeploymentTarget {
-                device_id: Uuid::new_v4(),
+                device_id,
                 target_disk_id: r"\\.\PhysicalDrive0".to_owned(),
                 target_disk_model: "Test disk".to_owned(),
                 target_disk_serial: Some("TEST-SERIAL".to_owned()),
@@ -1356,6 +1465,173 @@ mod tests {
         assert!(
             !image_is_referenced || image_exists,
             "a deployment job must never reference a removed image"
+        );
+    }
+
+    fn windows_job_request(image_id: Uuid, device_id: Uuid) -> CreateDeploymentJob {
+        CreateDeploymentJob {
+            name: "Concurrent device deployment".to_owned(),
+            operation: Operation::DeployWim,
+            image_id,
+            targets: vec![DeploymentTarget {
+                device_id,
+                target_disk_id: r"\\.\PhysicalDrive1".to_owned(),
+                target_disk_model: "Data SSD".to_owned(),
+                target_disk_serial: Some("SERIAL".to_owned()),
+                target_disk_size_bytes: 64 * 1024 * 1024 * 1024,
+            }],
+            options: DeploymentOptions {
+                image_index: 1,
+                partition_plan: PartitionPlan::uefi_gpt(),
+                linux_install: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn job_creation_and_device_removal_never_leave_a_job_for_a_removed_device() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let images = Arc::new(
+            ImageLibrary::open(temp.path().join("images")).expect("image library should open"),
+        );
+        let jobs = Arc::new(
+            JobRepository::open(temp.path().join("jobs")).expect("job repository should open"),
+        );
+        let devices = Arc::new(
+            DeviceRegistry::open(temp.path().join("devices")).expect("device registry should open"),
+        );
+        let source = temp.path().join("windows.wim");
+        fs::write(&source, wim_fixture(b"device-removal-race")).expect("WIM fixture should write");
+        let image = images.import(&source).expect("WIM fixture should import");
+        let coordinator = Arc::new(DeploymentMutationCoordinator::new(
+            Arc::clone(&devices),
+            Arc::clone(&images),
+            Arc::clone(&jobs),
+            temp.path().join("pxe"),
+        ));
+
+        for round in 0..16u8 {
+            let device_id = register_test_device(&devices, &format!("192.0.2.{}", 100 + round));
+            let ready = Arc::new(tokio::sync::Barrier::new(3));
+            let create = {
+                let coordinator = Arc::clone(&coordinator);
+                let ready = Arc::clone(&ready);
+                let request = windows_job_request(image.id, device_id);
+                tokio::spawn(async move {
+                    ready.wait().await;
+                    coordinator.create_job(request).await
+                })
+            };
+            let remove = {
+                let coordinator = Arc::clone(&coordinator);
+                let ready = Arc::clone(&ready);
+                tokio::spawn(async move {
+                    ready.wait().await;
+                    coordinator.remove_device(device_id).await
+                })
+            };
+            ready.wait().await;
+            let create_result = create.await.expect("create task should finish");
+            let remove_result = remove.await.expect("remove task should finish");
+            assert_ne!(
+                create_result.is_ok(),
+                remove_result.as_ref().is_ok_and(|removed| *removed),
+                "exactly one conflicting mutation should commit: create={create_result:?}, remove={remove_result:?}"
+            );
+            let device_exists = devices
+                .list()
+                .expect("devices should list")
+                .iter()
+                .any(|registered| registered.device.id == device_id);
+            let device_is_referenced = jobs
+                .references_device(device_id)
+                .expect("jobs should remain readable");
+            assert!(
+                !device_is_referenced || device_exists,
+                "a deployment job must never reference a removed device"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn job_transition_and_removal_are_serialized() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let images = Arc::new(
+            ImageLibrary::open(temp.path().join("images")).expect("image library should open"),
+        );
+        let jobs = Arc::new(
+            JobRepository::open(temp.path().join("jobs")).expect("job repository should open"),
+        );
+        let devices = Arc::new(
+            DeviceRegistry::open(temp.path().join("devices")).expect("device registry should open"),
+        );
+        let source = temp.path().join("windows.wim");
+        fs::write(&source, wim_fixture(b"transition-removal-race"))
+            .expect("WIM fixture should write");
+        let image = images.import(&source).expect("WIM fixture should import");
+        let device_id = register_test_device(&devices, "192.0.2.50");
+        let coordinator = Arc::new(DeploymentMutationCoordinator::new(
+            Arc::clone(&devices),
+            Arc::clone(&images),
+            Arc::clone(&jobs),
+            temp.path().join("pxe"),
+        ));
+
+        for _ in 0..16 {
+            let job = coordinator
+                .create_job(windows_job_request(image.id, device_id))
+                .await
+                .expect("job should be created");
+            let ready = Arc::new(tokio::sync::Barrier::new(3));
+            let transition = {
+                let coordinator = Arc::clone(&coordinator);
+                let ready = Arc::clone(&ready);
+                tokio::spawn(async move {
+                    ready.wait().await;
+                    coordinator
+                        .transition_job(job.id, JobState::Cancelled)
+                        .await
+                })
+            };
+            let remove = {
+                let coordinator = Arc::clone(&coordinator);
+                let ready = Arc::clone(&ready);
+                tokio::spawn(async move {
+                    ready.wait().await;
+                    coordinator.remove_job(job.id).await
+                })
+            };
+            ready.wait().await;
+            let transition_result = transition.await.expect("transition task should finish");
+            let remove_result = remove.await.expect("remove task should finish");
+            assert!(
+                remove_result.as_ref().is_ok_and(|removed| *removed) || transition_result.is_ok(),
+                "one mutation should commit: transition={transition_result:?}, remove={remove_result:?}"
+            );
+            if remove_result.as_ref().is_ok_and(|removed| *removed) {
+                assert!(
+                    jobs.list()
+                        .expect("jobs should list")
+                        .iter()
+                        .all(|existing| existing.id != job.id),
+                    "a removed job must not be resurrected by a concurrent transition"
+                );
+            }
+        }
+
+        assert!(!jobs.references_device(device_id).expect("jobs should list"));
+        assert!(
+            coordinator
+                .remove_device(device_id)
+                .await
+                .expect("device should be removable")
+        );
+        assert!(
+            coordinator
+                .create_job(windows_job_request(image.id, device_id))
+                .await
+                .expect_err("a removed device must not receive a job")
+                .contains("deployment device was not found")
         );
     }
 
@@ -1447,6 +1723,7 @@ mod tests {
         let devices = Arc::new(
             DeviceRegistry::open(temp.path().join("devices")).expect("device registry should open"),
         );
+        let device_id = register_test_device(&devices, "192.0.2.41");
         let coordinator = DeploymentMutationCoordinator::new(
             devices,
             Arc::clone(&images),
@@ -1478,7 +1755,7 @@ mod tests {
             operation: Operation::DeployWim,
             image_id: image.id,
             targets: vec![DeploymentTarget {
-                device_id: Uuid::new_v4(),
+                device_id,
                 target_disk_id: r"\\.\PhysicalDrive0".to_owned(),
                 target_disk_model: "100 GiB test disk".to_owned(),
                 target_disk_serial: None,
