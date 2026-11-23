@@ -692,6 +692,70 @@ impl ImageLibrary {
         })
     }
 
+    /// Fast, fail-closed check used when a GHO job is created. It confirms the recorded
+    /// capability, span set, file locations, and sizes without hashing or decoding the
+    /// image; the full revalidation runs again when an Agent claims the job.
+    pub fn check_gho_partition_deployable(
+        &self,
+        id: Uuid,
+        source_partition: u32,
+    ) -> Result<GhoPartitionCapability, ImageLibraryError> {
+        let artifact = self
+            .get(id)?
+            .ok_or(ImageLibraryError::ImageNotFound { id })?;
+        if artifact.format != ImageFormat::Gho {
+            return Err(ImageLibraryError::UnsupportedFormat(format!(
+                "GHO deployment requires GHO, found {:?} for image {id}",
+                artifact.format
+            )));
+        }
+        let capability = artifact
+            .gho_capability
+            .as_ref()
+            .filter(|capability| {
+                artifact.verified
+                    && capability.deployable
+                    && capability.parser_version == PARSER_VERSION
+            })
+            .ok_or(ImageLibraryError::ImageNotVerified { id })?;
+        if artifact.sha256.is_none() {
+            return Err(ImageLibraryError::MissingChecksum { id });
+        }
+        let selected = capability
+            .partitions
+            .iter()
+            .find(|partition| partition.source_partition == source_partition)
+            .cloned()
+            .ok_or(ImageLibraryError::UnsupportedFormat(format!(
+                "GHO source partition {source_partition} is not a verified NTFS partition"
+            )))?;
+        let object_directory = resolve_gho_object_directory(id, &artifact, &self.objects_dir)?;
+        let managed_files = read_directory_files(&object_directory)?;
+        let discovered_spans =
+            discover_ghost_spans(Path::new(&artifact.source_path), &managed_files)?;
+        let recorded_spans = artifact.spans.iter().map(PathBuf::from).collect::<Vec<_>>();
+        if discovered_spans != recorded_spans {
+            return Err(ImageLibraryError::InvalidSpanSet {
+                path: artifact.source_path.clone(),
+                reason: "stored GHO span list no longer matches the managed object directory"
+                    .to_owned(),
+            });
+        }
+        let mut total_size_bytes = 0_u64;
+        for (index, path) in artifact_file_paths(&artifact).iter().enumerate() {
+            let (_, _, size_bytes) = resolve_gho_file(id, path, &object_directory, index == 0)?;
+            total_size_bytes = total_size_bytes.saturating_add(size_bytes);
+        }
+        if total_size_bytes != artifact.size_bytes {
+            return Err(ImageLibraryError::ManagedSizeMismatch {
+                id,
+                expected: artifact.size_bytes,
+                actual: total_size_bytes,
+            });
+        }
+        Ok(selected)
+    }
+
     pub fn prepare_gho_deployment(
         &self,
         id: Uuid,
@@ -1304,14 +1368,13 @@ fn resolve_gho_object_directory(
     Ok(canonical_directory)
 }
 
-fn prepare_gho_file(
+/// Checks a managed GHO file's name, type, and location without reading its contents.
+fn resolve_gho_file(
     id: Uuid,
     path: &Path,
     object_directory: &Path,
     is_primary: bool,
-    image_set_hasher: &mut Sha256,
-    total_size_bytes: &mut u64,
-) -> Result<PreparedGhoImageFile, ImageLibraryError> {
+) -> Result<(String, PathBuf, u64), ImageLibraryError> {
     let basename = path
         .file_name()
         .and_then(OsStr::to_str)
@@ -1367,6 +1430,18 @@ fn prepare_gho_file(
             path: canonical_path.display().to_string(),
         });
     }
+    Ok((basename, canonical_path, metadata.len()))
+}
+
+fn prepare_gho_file(
+    id: Uuid,
+    path: &Path,
+    object_directory: &Path,
+    is_primary: bool,
+    image_set_hasher: &mut Sha256,
+    total_size_bytes: &mut u64,
+) -> Result<PreparedGhoImageFile, ImageLibraryError> {
+    let (basename, canonical_path, _) = resolve_gho_file(id, path, object_directory, is_primary)?;
 
     let file = File::open(&canonical_path).map_err(|source| {
         ImageLibraryError::ManagedFileUnavailable {
@@ -2172,6 +2247,83 @@ mod tests {
                 .is_ok(),
             "the verified NTFS source partition should be restorable"
         );
+    }
+
+    #[test]
+    fn gho_job_creation_check_reads_metadata_only_and_fails_closed() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let path = temp.path().join("disk.gho");
+        create_multi_partition_gho(&path, &[b"boot-data", b"\xebR\x90NTFS    windows"]);
+        let library = ImageLibrary::open(temp.path().join("library")).expect("library should open");
+        let artifact = library.import(&path).expect("GHO should import");
+
+        let selected = library
+            .check_gho_partition_deployable(artifact.id, 2)
+            .expect("the verified NTFS partition should pass the creation check");
+        assert_eq!(selected.expanded_size_bytes, 18);
+        assert!(
+            library
+                .check_gho_partition_deployable(artifact.id, 1)
+                .is_err()
+        );
+        assert!(
+            library
+                .check_gho_partition_deployable(artifact.id, 3)
+                .is_err()
+        );
+
+        // Same-size corruption is invisible to the creation check because it never reads the
+        // contents; the claim-time full revalidation still refuses it.
+        let managed = PathBuf::from(&artifact.source_path);
+        let mut bytes = fs::read(&managed).expect("managed GHO should read");
+        let last = bytes.len() - 3;
+        bytes[last] ^= 0xff;
+        fs::write(&managed, &bytes).expect("managed GHO should be writable");
+        assert!(
+            library
+                .check_gho_partition_deployable(artifact.id, 2)
+                .is_ok()
+        );
+        assert!(
+            library
+                .prepare_gho_partition_deployment(artifact.id, 2)
+                .is_err()
+        );
+
+        bytes.push(0);
+        fs::write(&managed, &bytes).expect("managed GHO should be writable");
+        assert!(matches!(
+            library.check_gho_partition_deployable(artifact.id, 2),
+            Err(ImageLibraryError::ManagedSizeMismatch { .. })
+        ));
+        bytes.pop();
+        fs::write(&managed, &bytes).expect("managed GHO should be writable");
+
+        let mut images = library
+            .images
+            .write()
+            .expect("library lock should be available");
+        images[0]
+            .gho_capability
+            .as_mut()
+            .expect("GHO capability should be recorded")
+            .parser_version = PARSER_VERSION - 1;
+        drop(images);
+        assert!(matches!(
+            library.check_gho_partition_deployable(artifact.id, 2),
+            Err(ImageLibraryError::ImageNotVerified { .. })
+        ));
+        let mut images = library
+            .images
+            .write()
+            .expect("library lock should be available");
+        images[0].gho_capability.as_mut().unwrap().parser_version = PARSER_VERSION;
+        images[0].verified = false;
+        drop(images);
+        assert!(matches!(
+            library.check_gho_partition_deployable(artifact.id, 2),
+            Err(ImageLibraryError::ImageNotVerified { .. })
+        ));
     }
 
     #[test]
