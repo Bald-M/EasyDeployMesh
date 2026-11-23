@@ -482,6 +482,17 @@ impl ImageLibrary {
         Ok(artifact)
     }
 
+    /// Repeats the deployment revalidation for a leased WIM/ESD download and
+    /// returns the canonical managed path that may be served to the Agent.
+    pub fn prepare_wim_download(
+        &self,
+        id: Uuid,
+        requested_image_index: u32,
+    ) -> Result<PathBuf, ImageLibraryError> {
+        let artifact = self.revalidate_for_deployment(id, requested_image_index)?;
+        resolve_managed_file(id, &artifact.source_path, &self.objects_dir)
+    }
+
     /// Revalidates the ISO, the boot assets extracted at import, and their
     /// relationship to the ISO before a Linux installer session is published.
     pub fn prepare_linux_iso(&self, id: Uuid) -> Result<PreparedLinuxIso, ImageLibraryError> {
