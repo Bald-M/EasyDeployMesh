@@ -784,11 +784,20 @@ where
     loop {
         let requested_state = match control_state() {
             Ok(state) => state,
-            Err(_) => {
+            Err(error) if crate::resilience::is_transient(&*error) => {
                 // Keep the last applied process state during a transient control-plane outage.
                 // Resuming a deliberately suspended disk writer without operator intent is unsafe.
                 thread::sleep(Duration::from_secs(1));
                 continue;
+            }
+            Err(error) => {
+                // A rejected lease, or an outage past the lease, must stop the disk writer.
+                if suspended {
+                    let _ = set_process_suspended(process_handle, false);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
             }
         };
         match requested_state {

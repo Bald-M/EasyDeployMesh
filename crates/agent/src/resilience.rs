@@ -33,7 +33,7 @@ pub fn is_transient_request_error(error: &reqwest::Error) -> bool {
         .is_none_or(|status| status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429))
 }
 
-fn is_transient(error: &(dyn Error + 'static)) -> bool {
+pub fn is_transient(error: &(dyn Error + 'static)) -> bool {
     error
         .downcast_ref::<reqwest::Error>()
         .is_some_and(is_transient_request_error)
