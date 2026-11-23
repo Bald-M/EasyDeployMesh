@@ -189,7 +189,12 @@ staged directory into `library/objects/<uuid>`.
    store, changed sizes, changed hashes, ambiguous spans, and unsafe names fail
    closed.
 5. Job creation repeats deployment preflight while holding the mutation lock.
-6. Job claim repeats image validation again before issuing a lease. It also
+   WIM/ESD creation re-hashes the image. Native GHO creation uses a fast
+   metadata check instead (verified capability, matching parser version,
+   selected source partition, span set, managed paths, and file sizes) so a
+   multi-gigabyte image does not block the dialog for minutes.
+6. Job claim repeats full image validation (hashing and, for GHO, decoding)
+   before issuing a lease. It also
    re-runs partition plan validation, so a job stored before a stricter rule
    is not leased again and never reaches the Agent.
 7. The Agent hashes the downloaded bytes before applying them.
