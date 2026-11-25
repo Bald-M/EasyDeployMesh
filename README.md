@@ -130,8 +130,8 @@ compatible or offline PE media must not be used for automated deployment.
 | ESD | Yes | Yes | Uses the WIM deployment operation and a selected image index |
 | SWM | Yes | No | Catalog-only in the current Agent |
 | Ubuntu Server 24.04 LTS live-server ISO (amd64) | Yes | Preview | Content-inspected; kernel, initrd, and ISO are revalidated before a guarded UEFI autoinstall |
-| GHO | No | No | Unsupported; convert the image to WIM or ESD before import |
-| GHS | No | No | Unsupported Ghost span format |
+| GHO | Yes | Preview | Ghost 11.x zlib-compressed (`-z2`–`-z9`) NTFS partition images; fully decoded on import and before every deployment |
+| GHS | Yes | Preview | Ordered continuation spans of a supported GHO |
 
 The Linux ISO profile is intentionally narrow: amd64 UEFI, Secure Boot off,
 DHCP, one target disk with a unique non-empty serial, whole-disk GPT/direct ext4,
@@ -141,22 +141,36 @@ password login, raw autoinstall YAML, and arbitrary commands are rejected.
 Treat this path as a preview until the exact ISO and hardware combination has
 passed an end-to-end disposable QEMU/OVMF or physical-machine test.
 
-### Why GHO is unsupported
+### GHO restore profile (preview)
 
-EasyDeployMesh does not support importing, validating, or restoring Norton
-Ghost GHO/GHS images. The format is proprietary, has incompatible variants and
-compression layouts in real-world images, and no longer has a maintained
-official recovery engine that this project can safely redistribute or depend
-on. A parser accepting the file header is not sufficient evidence that a
-destructive restore will reproduce the original partition correctly, so the
-project fails closed instead of offering partial or experimental support.
+EasyDeployMesh restores Norton Ghost partition images natively, without
+running or shipping Ghost. A Ghost NTFS image is not a raw volume dump. It
+stores MFT records and the cluster runs of each file. The Agent writes every
+stored run at its original cluster, regenerates `$MFTMirr` and the backup boot
+sector, sets the boot sector's hidden-sector count, and lets Windows grow the
+file system when the target partition is larger. The format and the checks
+are documented in [docs/gho-format.md](docs/gho-format.md).
 
-Existing GHO/GHS images must first be restored or converted in an isolated,
-disposable environment using software that the operator is licensed to use.
-Capture the resulting Windows partition as WIM or ESD, verify it, and import
-that supported image into EasyDeployMesh. Never test a conversion or legacy
-Ghost restore against the developer workstation or a disk containing valuable
-data.
+Supported: password-free single-partition NTFS images made by Ghost 11.x with
+zlib compression (`-z2` to `-z9`), stored as one file or as an ordered GHS
+span set. The target Windows partition must be at least as large as the
+source volume. BCDBoot then configures booting, so the image must contain a
+Windows version that BCDBoot supports (Windows 7 or later). If the image's own
+boot store disables boot integrity checks, as some repackaged Windows 7 images
+do, the new boot entry keeps that setting and the job progress says so.
+
+Rejected before any disk is touched: uncompressed or "fast" (`-z1`) images,
+encrypted images, disk images or multi-partition images, FAT and other file
+systems, volumes that do not use 512-byte sectors, and images in which Ghost
+omitted any data other than `$MFTMirr` and `$BadClus`. The Agent also refuses
+target disks whose logical sectors are not 512 bytes before writing. Images
+whose volume has no `winload.exe` (Windows XP and older) are blocked at import
+because BCDBoot cannot make them bootable. The restorer itself was validated
+by decoding a real XP image and reading every file back from the restored
+volume.
+
+Treat GHO deployment as a preview until the exact image has been restored on
+a disposable VM or machine. Never restore onto a disk with valuable data.
 
 ## Quick start
 

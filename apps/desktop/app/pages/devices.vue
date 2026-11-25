@@ -154,8 +154,8 @@ const selectedImageIndexIsValid = computed(() => {
 const ghoPartitionItems = computed(() => selectedGhoPartitions.value.map(partition => ({
   label: t('devices.ghoPartitionOption', {
     index: partition.sourcePartition,
-    size: requiredWindowsPartitionGib(partition.expandedSizeBytes),
-    bytes: new Intl.NumberFormat(locale.value).format(partition.expandedSizeBytes)
+    size: requiredWindowsPartitionGib(partition.volumeSizeBytes),
+    bytes: new Intl.NumberFormat(locale.value).format(partition.volumeSizeBytes)
   }),
   value: partition.sourcePartition
 })))
@@ -274,7 +274,7 @@ const partitionPresetItems = computed(() => [
   ...customTemplates.value.map(template => ({ label: `${t('devices.customTemplatePrefix')} · ${template.name}`, value: `custom:${template.id}` }))
 ])
 const selectedGhoPayloadBytes = computed(() => selectedGhoPartitions.value
-  .find(partition => partition.sourcePartition === selectedImageIndex.value)?.expandedSizeBytes ?? null)
+  .find(partition => partition.sourcePartition === selectedImageIndex.value)?.volumeSizeBytes ?? null)
 const targetsWithoutGhoPayloadCapacity = computed(() => {
   const image = selectedImage.value
   const payloadBytes = selectedGhoPayloadBytes.value

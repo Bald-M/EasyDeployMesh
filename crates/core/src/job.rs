@@ -395,7 +395,7 @@ impl PartitionPlan {
         Ok(())
     }
 
-    /// Ensures a raw partition payload fits in the Windows volume before any
+    /// Ensures a restored GHO volume fits in the Windows partition before any
     /// destructive partitioning begins.
     pub fn validate_windows_payload_capacity(
         &self,
@@ -440,7 +440,7 @@ impl PartitionPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error(
-    "raw Windows partition payload requires {required_bytes} bytes but the planned Windows volume provides {available_bytes} bytes"
+    "restored Windows volume requires {required_bytes} bytes but the planned Windows volume provides {available_bytes} bytes"
 )]
 pub struct WindowsPayloadCapacityError {
     pub required_bytes: u64,
@@ -768,6 +768,9 @@ pub struct AgentGhoDeployment {
     pub source_partition: u32,
     pub expanded_size_bytes: u64,
     pub expanded_sha256: String,
+    /// Minimum target partition size; leases without it are rejected.
+    #[serde(default)]
+    pub volume_size_bytes: u64,
     pub parser_version: u32,
 }
 

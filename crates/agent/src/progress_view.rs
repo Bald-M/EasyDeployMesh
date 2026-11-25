@@ -1403,6 +1403,7 @@ mod tests {
                 expanded_size_bytes: 16,
                 expanded_sha256: "00".repeat(32),
                 parser_version: 1,
+                volume_size_bytes: 16,
             }),
         };
         let job = JobInfo::for_lease(

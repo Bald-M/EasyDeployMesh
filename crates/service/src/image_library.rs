@@ -817,6 +817,7 @@ impl ImageLibrary {
         capability.source_partition = Some(selected.source_partition);
         capability.expanded_size_bytes = Some(selected.expanded_size_bytes);
         capability.expanded_sha256 = Some(selected.expanded_sha256);
+        capability.volume_size_bytes = Some(selected.volume_size_bytes);
         let (download_size_bytes, download_sha256) =
             hash_gho_deployment_stream(&image.primary.canonical_path, &span_paths)?;
         Ok(PreparedGhoDeployment {
@@ -2025,18 +2026,11 @@ fn hash_gho_deployment_stream(
     Ok((size, format!("{:x}", digest.finalize())))
 }
 
-struct GhoAnalysisSink {
-    digest: Sha256,
-    prefix: Vec<u8>,
-}
+struct DigestSink(Sha256);
 
-impl Write for GhoAnalysisSink {
+impl Write for DigestSink {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.prefix.len() < 512 {
-            let wanted = (512 - self.prefix.len()).min(bytes.len());
-            self.prefix.extend_from_slice(&bytes[..wanted]);
-        }
-        self.digest.update(bytes);
+        self.0.update(bytes);
         Ok(bytes.len())
     }
 
@@ -2051,6 +2045,7 @@ fn inspect_native_gho(path: &Path, span_paths: &[PathBuf]) -> GhoImageCapability
         compression: None,
         expanded_size_bytes: None,
         expanded_sha256: None,
+        volume_size_bytes: None,
         partition_count: None,
         source_partition: None,
         partitions: Vec::new(),
@@ -2074,27 +2069,28 @@ fn inspect_native_gho(path: &Path, span_paths: &[PathBuf]) -> GhoImageCapability
     };
     let mut partitions = Vec::new();
     for source_partition in 1..=info.partition_count {
-        let mut sink = GhoAnalysisSink {
-            digest: Sha256::new(),
-            prefix: Vec::new(),
-        };
-        let (_, expanded_size_bytes) = match easydeploymesh_gho::decode_partition(
+        let mut digest = DigestSink(Sha256::new());
+        let verified = match easydeploymesh_gho::analyze_partition(
             &mut file,
             source_partition,
-            &mut sink,
+            &mut digest,
             MAX_GHO_EXPANDED_BYTES,
         ) {
             Ok(result) => result,
             Err(error) => return blocked(native_gho_error_code(&error).to_owned()),
         };
-        if sink.prefix.get(3..11) == Some(b"NTFS    ") {
-            partitions.push(GhoPartitionCapability {
-                source_partition,
-                file_system: "ntfs".to_owned(),
-                expanded_size_bytes,
-                expanded_sha256: format!("{:x}", sink.digest.finalize()),
-            });
+        if !verified.windows_boot_loader {
+            // The Agent configures boot with BCDBoot, which needs winload.exe
+            // (Windows Vista and later). Refuse before any disk is wiped.
+            return blocked("windows_boot_loader_missing".to_owned());
         }
+        partitions.push(GhoPartitionCapability {
+            source_partition,
+            file_system: verified.file_system.as_str().to_owned(),
+            expanded_size_bytes: verified.expanded_size_bytes,
+            expanded_sha256: format!("{:x}", digest.0.finalize()),
+            volume_size_bytes: verified.volume_size_bytes(),
+        });
     }
     let Some(selected) = partitions.first() else {
         return blocked("non_ntfs_partition".to_owned());
@@ -2108,6 +2104,7 @@ fn inspect_native_gho(path: &Path, span_paths: &[PathBuf]) -> GhoImageCapability
         }),
         expanded_size_bytes: Some(selected.expanded_size_bytes),
         expanded_sha256: Some(selected.expanded_sha256.clone()),
+        volume_size_bytes: Some(selected.volume_size_bytes),
         partition_count: Some(info.partition_count),
         source_partition: Some(selected.source_partition),
         partitions,
@@ -2124,6 +2121,8 @@ fn native_gho_error_code(error: &easydeploymesh_gho::Error) -> &'static str {
         easydeploymesh_gho::Error::UnsupportedCompression(_) => "compression_unsupported",
         easydeploymesh_gho::Error::PartitionCount(_) => "partition_scope_unsupported",
         easydeploymesh_gho::Error::ExpandedLimit => "expanded_size_limit",
+        easydeploymesh_gho::Error::UnsupportedFileSystem => "filesystem_unsupported",
+        easydeploymesh_gho::Error::UnsupportedVolume(_) => "volume_unsupported",
         easydeploymesh_gho::Error::Io(_) => "image_unavailable",
         _ => "invalid_or_corrupt_gho",
     }
@@ -2206,171 +2205,86 @@ mod tests {
 
     const MINIMUM_TEST_BOOT_ASSET_BYTES: usize = 1024 * 1024;
 
-    fn create_multi_partition_gho(path: &Path, partitions: &[&[u8]]) {
-        let mut contents = vec![0_u8; 512];
-        contents[0..4].copy_from_slice(&[0xfe, 0xef, 1, 0]);
-        for partition in partitions {
-            contents.extend_from_slice(&0x0603_u32.to_le_bytes());
-            contents.extend_from_slice(&0x012f_18d8_u32.to_le_bytes());
-            contents.extend_from_slice(&20_u16.to_le_bytes());
-            contents.extend_from_slice(&[0; 20]);
-            let mut partition_header = vec![0_u8; 512];
-            partition_header[0..2].copy_from_slice(&0xeffe_u16.to_le_bytes());
-            contents.extend(partition_header);
-            contents.extend_from_slice(
-                &u16::try_from(partition.len() + 2)
-                    .expect("fixture partition should fit in one block")
-                    .to_le_bytes(),
-            );
-            contents.extend_from_slice(partition);
-        }
-        contents.extend_from_slice(&0x0023_u32.to_le_bytes());
-        contents.extend_from_slice(&0x012f_18d8_u32.to_le_bytes());
-        contents.extend_from_slice(&0_u16.to_le_bytes());
-        create_image(path, &contents);
+    fn create_ntfs_gho(path: &Path) {
+        create_image(path, &easydeploymesh_gho::fixtures::image());
     }
 
     #[test]
-    fn native_gho_selects_the_only_ntfs_stream_from_a_multi_partition_image() {
+    fn native_gho_reports_the_restorable_ntfs_volume() {
         let temp = tempfile::tempdir().expect("temporary directory should be available");
         let path = temp.path().join("disk.gho");
-        create_multi_partition_gho(&path, &[b"boot-data", b"\xebR\x90NTFS    windows"]);
+        create_ntfs_gho(&path);
 
         let capability = inspect_native_gho(&path, &[]);
 
-        assert!(capability.deployable);
-        assert_eq!(capability.partition_count, Some(2));
-        assert_eq!(capability.source_partition, Some(2));
-        assert_eq!(capability.expanded_size_bytes, Some(18));
+        assert!(capability.deployable, "{:?}", capability.blocked_reason);
+        assert_eq!(capability.partition_count, Some(1));
+        assert_eq!(capability.source_partition, Some(1));
+        assert_eq!(capability.compression.as_deref(), Some("z9"));
+        assert_eq!(
+            capability.volume_size_bytes,
+            Some(easydeploymesh_gho::fixtures::VOLUME_BYTES)
+        );
+        assert_eq!(capability.partitions.len(), 1);
+        assert_eq!(capability.partitions[0].file_system, "ntfs");
         assert_eq!(capability.parser_version, PARSER_VERSION);
 
         let library = ImageLibrary::open(temp.path().join("library")).expect("library should open");
         let artifact = library.import(&path).expect("GHO should import");
+        assert!(artifact.verified);
         assert!(
             library
-                .prepare_gho_partition_deployment(artifact.id, 1)
+                .prepare_gho_partition_deployment(artifact.id, 2)
                 .is_err(),
-            "a non-NTFS source partition must not be restorable"
+            "a partition the image does not contain must not be restorable"
         );
-        assert!(
-            library
-                .prepare_gho_partition_deployment(artifact.id, 2)
-                .is_ok(),
-            "the verified NTFS source partition should be restorable"
+        let prepared = library
+            .prepare_gho_partition_deployment(artifact.id, 1)
+            .expect("the verified NTFS partition should prepare");
+        assert_eq!(
+            prepared.capability.volume_size_bytes,
+            Some(easydeploymesh_gho::fixtures::VOLUME_BYTES)
         );
     }
 
     #[test]
-    fn gho_job_creation_check_reads_metadata_only_and_fails_closed() {
+    fn native_gho_blocks_a_volume_without_a_windows_boot_loader() {
         let temp = tempfile::tempdir().expect("temporary directory should be available");
-        let path = temp.path().join("disk.gho");
-        create_multi_partition_gho(&path, &[b"boot-data", b"\xebR\x90NTFS    windows"]);
-        let library = ImageLibrary::open(temp.path().join("library")).expect("library should open");
-        let artifact = library.import(&path).expect("GHO should import");
-
-        let selected = library
-            .check_gho_partition_deployable(artifact.id, 2)
-            .expect("the verified NTFS partition should pass the creation check");
-        assert_eq!(selected.expanded_size_bytes, 18);
-        assert!(
-            library
-                .check_gho_partition_deployable(artifact.id, 1)
-                .is_err()
-        );
-        assert!(
-            library
-                .check_gho_partition_deployable(artifact.id, 3)
-                .is_err()
-        );
-
-        // Same-size corruption is invisible to the creation check because it never reads the
-        // contents; the claim-time full revalidation still refuses it.
-        let managed = PathBuf::from(&artifact.source_path);
-        let mut bytes = fs::read(&managed).expect("managed GHO should read");
-        let last = bytes.len() - 3;
-        bytes[last] ^= 0xff;
-        fs::write(&managed, &bytes).expect("managed GHO should be writable");
-        assert!(
-            library
-                .check_gho_partition_deployable(artifact.id, 2)
-                .is_ok()
-        );
-        assert!(
-            library
-                .prepare_gho_partition_deployment(artifact.id, 2)
-                .is_err()
-        );
-
-        bytes.push(0);
-        fs::write(&managed, &bytes).expect("managed GHO should be writable");
-        assert!(matches!(
-            library.check_gho_partition_deployable(artifact.id, 2),
-            Err(ImageLibraryError::ManagedSizeMismatch { .. })
-        ));
-        bytes.pop();
-        fs::write(&managed, &bytes).expect("managed GHO should be writable");
-
-        let mut images = library
-            .images
-            .write()
-            .expect("library lock should be available");
-        images[0]
-            .gho_capability
-            .as_mut()
-            .expect("GHO capability should be recorded")
-            .parser_version = PARSER_VERSION - 1;
-        drop(images);
-        assert!(matches!(
-            library.check_gho_partition_deployable(artifact.id, 2),
-            Err(ImageLibraryError::ImageNotVerified { .. })
-        ));
-        let mut images = library
-            .images
-            .write()
-            .expect("library lock should be available");
-        images[0].gho_capability.as_mut().unwrap().parser_version = PARSER_VERSION;
-        images[0].verified = false;
-        drop(images);
-        assert!(matches!(
-            library.check_gho_partition_deployable(artifact.id, 2),
-            Err(ImageLibraryError::ImageNotVerified { .. })
-        ));
-    }
-
-    #[test]
-    fn native_gho_exposes_each_ntfs_stream_for_explicit_selection() {
-        let temp = tempfile::tempdir().expect("temporary directory should be available");
-        let path = temp.path().join("disk.gho");
-        create_multi_partition_gho(
+        let path = temp.path().join("xp.gho");
+        create_image(
             &path,
-            &[b"\xebR\x90NTFS    first", b"\xebR\x90NTFS    second"],
+            &easydeploymesh_gho::fixtures::image_without_boot_loader(),
         );
 
         let capability = inspect_native_gho(&path, &[]);
 
-        assert!(capability.deployable);
+        assert!(!capability.deployable);
         assert_eq!(
-            capability
-                .partitions
-                .iter()
-                .map(|partition| partition.source_partition)
-                .collect::<Vec<_>>(),
-            vec![1, 2]
+            capability.blocked_reason.as_deref(),
+            Some("windows_boot_loader_missing")
         );
+    }
 
-        let library = ImageLibrary::open(temp.path().join("library")).expect("library should open");
-        let artifact = library.import(&path).expect("GHO should import");
-        let prepared = library
-            .prepare_gho_partition_deployment(artifact.id, 2)
-            .expect("the explicitly selected NTFS partition should prepare");
-        assert_eq!(prepared.capability.source_partition, Some(2));
+    #[test]
+    fn native_gho_blocks_a_non_ntfs_partition_image() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let path = temp.path().join("fat.gho");
+        create_image(&path, &easydeploymesh_gho::fixtures::non_ntfs_image());
+
+        let capability = inspect_native_gho(&path, &[]);
+
+        assert!(!capability.deployable);
+        assert_eq!(
+            capability.blocked_reason.as_deref(),
+            Some("filesystem_unsupported")
+        );
     }
 
     #[test]
     fn native_gho_verifies_and_prepares_an_ordered_span_set() {
         let temp = tempfile::tempdir().expect("temporary directory should be available");
         let complete = temp.path().join("complete.gho");
-        create_multi_partition_gho(&complete, &[b"\xebR\x90NTFS    windows payload"]);
+        create_ntfs_gho(&complete);
         let mut bytes = fs::read(&complete).expect("complete fixture should read");
         bytes[4..8].copy_from_slice(&[1, 2, 3, 4]);
         let split_at = 700;
@@ -2391,13 +2305,101 @@ mod tests {
             .expect("spanned GHO should prepare for deployment");
         assert_eq!(prepared.image.spans.len(), 1);
         assert_eq!(prepared.capability.source_partition, Some(1));
+
+        let selected = library
+            .check_gho_partition_deployable(artifact.id, 1)
+            .expect("job creation check should pass for a verified image");
+        assert_eq!(
+            selected.volume_size_bytes,
+            prepared.capability.volume_size_bytes.unwrap()
+        );
+        assert!(matches!(
+            library.check_gho_partition_deployable(artifact.id, 2),
+            Err(ImageLibraryError::UnsupportedFormat(_))
+        ));
+
+        let stored_span = PathBuf::from(&artifact.spans[0]);
+        let mut grown = fs::read(&stored_span).unwrap();
+        grown.push(0);
+        fs::write(&stored_span, grown).unwrap();
+        assert!(matches!(
+            library.check_gho_partition_deployable(artifact.id, 1),
+            Err(ImageLibraryError::ManagedSizeMismatch { .. })
+        ));
+        fs::remove_file(&stored_span).unwrap();
+        assert!(
+            library
+                .check_gho_partition_deployable(artifact.id, 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn gho_job_creation_check_reads_metadata_only_and_fails_closed() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let path = temp.path().join("disk.gho");
+        create_ntfs_gho(&path);
+        let library = ImageLibrary::open(temp.path().join("library")).expect("library should open");
+        let artifact = library.import(&path).expect("GHO should import");
+
+        let selected = library
+            .check_gho_partition_deployable(artifact.id, 1)
+            .expect("the verified NTFS partition should pass the creation check");
+        assert_eq!(
+            selected.volume_size_bytes,
+            easydeploymesh_gho::fixtures::VOLUME_BYTES
+        );
+
+        // Same-size corruption is invisible to the creation check because it never reads the
+        // contents; the claim-time full revalidation still refuses it.
+        let managed = PathBuf::from(&artifact.source_path);
+        let mut bytes = fs::read(&managed).expect("managed GHO should read");
+        let last = bytes.len() - 3;
+        bytes[last] ^= 0xff;
+        fs::write(&managed, &bytes).expect("managed GHO should be writable");
+        assert!(
+            library
+                .check_gho_partition_deployable(artifact.id, 1)
+                .is_ok()
+        );
+        assert!(
+            library
+                .prepare_gho_partition_deployment(artifact.id, 1)
+                .is_err()
+        );
+
+        let mut images = library
+            .images
+            .write()
+            .expect("library lock should be available");
+        images[0]
+            .gho_capability
+            .as_mut()
+            .expect("GHO capability should be recorded")
+            .parser_version = PARSER_VERSION - 1;
+        drop(images);
+        assert!(matches!(
+            library.check_gho_partition_deployable(artifact.id, 1),
+            Err(ImageLibraryError::ImageNotVerified { .. })
+        ));
+        let mut images = library
+            .images
+            .write()
+            .expect("library lock should be available");
+        images[0].gho_capability.as_mut().unwrap().parser_version = PARSER_VERSION;
+        images[0].verified = false;
+        drop(images);
+        assert!(matches!(
+            library.check_gho_partition_deployable(artifact.id, 1),
+            Err(ImageLibraryError::ImageNotVerified { .. })
+        ));
     }
 
     #[test]
     fn native_gho_rejects_a_span_from_a_different_image() {
         let temp = tempfile::tempdir().expect("temporary directory should be available");
         let complete = temp.path().join("complete.gho");
-        create_multi_partition_gho(&complete, &[b"\xebR\x90NTFS    windows payload"]);
+        create_ntfs_gho(&complete);
         let mut bytes = fs::read(&complete).unwrap();
         bytes[4..8].copy_from_slice(&[1, 2, 3, 4]);
         let primary = temp.path().join("disk.gho");
@@ -2439,6 +2441,11 @@ mod tests {
             .gho_capability
             .as_ref()
             .expect("real GHO sample should have capability metadata");
+        if capability.blocked_reason.as_deref() == Some("windows_boot_loader_missing") {
+            // A fully decoded pre-Vista image (for example Windows XP) is
+            // valid but intentionally not deployable.
+            return;
+        }
         assert!(
             capability.deployable,
             "real GHO sample was blocked: {:?}",

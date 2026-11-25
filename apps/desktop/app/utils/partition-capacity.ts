@@ -68,7 +68,7 @@ export function partitionUserBudgets(
 
 const GIB_BYTES = 1024 * MIB_BYTES
 
-/** Smallest whole-GiB Windows partition that holds a raw payload (rounded up, never down). */
+/** Smallest whole-GiB Windows partition that holds a restored GHO volume (rounded up, never down). */
 export function requiredWindowsPartitionGib(payloadSizeBytes: number): number {
   return Math.max(1, Math.ceil(payloadSizeBytes / GIB_BYTES))
 }

@@ -62,11 +62,16 @@ The following behavior is intentional and must not be bypassed:
 - Image format and operation must agree.
 - WIM/ESD images are fully revalidated at job creation and job claim. Native GHO
   job creation runs only a metadata check (capability, parser version, source
-  partition, span set, sizes); the full hash-and-decode revalidation runs at job
-  claim before any lease is issued.
+  partition, span set, managed paths, sizes); the full hash-and-decode
+  revalidation runs at job claim before any lease is issued.
+  Claim-time revalidation runs in the background; a lease is issued only from
+  a passed revalidation that started after the job was created, finished less
+  than 30 minutes ago, and whose files kept their size and modification time.
 - Downloaded bytes are hashed again before application.
-- GHO restore requires the expected parser version, expanded size, and expanded
-  SHA-256; the target volume is locked and dismounted.
+- GHO restore requires the expected parser version, expanded size, expanded
+  SHA-256, and a volume size that fits the real target partition; the target
+  volume is locked and dismounted. Unverified Ghost variants (compression modes,
+  file systems, omitted attributes) must be rejected, not guessed at.
 - Image paths must remain canonical files below the managed object store. Do not
   permit symlink escapes or arbitrary download paths.
 - The target physical-drive ID, model, size, and optional serial are checked by

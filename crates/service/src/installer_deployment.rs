@@ -54,6 +54,9 @@ enum InstallerSessionPhase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum BootOutcome {
     NoAssignment,
+    /// The device's latest Windows deployment succeeded and nothing newer is
+    /// queued, so it boots its local disk instead of WinPE again.
+    LocalDisk,
     Denied,
     Assigned(BootAssignment),
 }
@@ -191,11 +194,10 @@ impl InstallerDeployment {
             return Ok(BootOutcome::NoAssignment);
         };
 
-        let active_jobs = self
-            .jobs
-            .list()
-            .map_err(InstallerDeploymentError::Jobs)?
-            .into_iter()
+        let jobs = self.jobs.list().map_err(InstallerDeploymentError::Jobs)?;
+        let active_jobs = jobs
+            .iter()
+            .cloned()
             .filter(|job| {
                 job.operation == Operation::InstallLinux
                     && !job.state.is_terminal()
@@ -204,7 +206,7 @@ impl InstallerDeployment {
             })
             .collect::<Vec<_>>();
         if active_jobs.is_empty() {
-            return Ok(BootOutcome::NoAssignment);
+            return Ok(windows_boot_outcome(&jobs, device.id));
         }
         if active_jobs.len() != 1 || active_jobs[0].state != JobState::Waiting {
             return Ok(BootOutcome::Denied);
@@ -757,11 +759,38 @@ fn installer_event_message(kind: InstallerEventKind) -> &'static str {
     }
 }
 
+/// A device whose latest Windows deployment succeeded boots its local disk:
+/// most firmware keeps the network first, and booting WinPE again would loop.
+/// Any newer job, or a latest job that did not succeed, keeps WinPE.
+fn windows_boot_outcome(jobs: &[DeploymentJob], device_id: Uuid) -> BootOutcome {
+    let latest = jobs
+        .iter()
+        .filter(|job| {
+            matches!(job.operation, Operation::DeployWim | Operation::DeployGho)
+                && job
+                    .targets
+                    .iter()
+                    .any(|target| target.device_id == device_id)
+        })
+        .max_by_key(|job| job.created_at);
+    match latest {
+        Some(job) if job.state == JobState::Succeeded => BootOutcome::LocalDisk,
+        _ => BootOutcome::NoAssignment,
+    }
+}
+
 pub(super) fn render_boot_script(outcome: BootOutcome) -> String {
     match outcome {
         BootOutcome::NoAssignment => format!(
             "#!ipxe\n# EasyDeployMesh no Linux assignment\nchain tftp://${{next-server}}/{WINDOWS_FALLBACK_IPXE_PATH} || exit\n"
         ),
+        BootOutcome::LocalDisk => concat!(
+            "#!ipxe\n",
+            "# EasyDeployMesh deployment finished; boot the local disk\n",
+            "echo EasyDeployMesh: deployment finished, booting the local disk\n",
+            "exit\n"
+        )
+        .to_owned(),
         BootOutcome::Denied => concat!(
             "#!ipxe\n",
             "# EasyDeployMesh assignment denied; do not fall back to destructive media\n",
@@ -1147,6 +1176,64 @@ mod tests {
         assert!(!denied.contains("easydeploymesh-winpe.ipxe"));
         assert!(denied.contains("assignment denied"));
         assert!(denied.ends_with("exit\n"));
+    }
+
+    fn windows_job(device_id: Uuid, state: JobState, minutes_ago: i64) -> DeploymentJob {
+        let created_at = chrono::Utc::now() - chrono::Duration::minutes(minutes_ago);
+        DeploymentJob {
+            id: Uuid::new_v4(),
+            name: "deploy".to_owned(),
+            operation: Operation::DeployGho,
+            image_id: Uuid::new_v4(),
+            targets: vec![DeploymentTarget {
+                device_id,
+                ..target()
+            }],
+            options: Default::default(),
+            state,
+            stage: None,
+            progress_percent: 0,
+            status_message: None,
+            error_message: None,
+            lease_id: None,
+            lease_expires_at: None,
+            created_at,
+            updated_at: created_at,
+        }
+    }
+
+    #[test]
+    fn a_device_boots_its_local_disk_only_after_its_latest_windows_job_succeeded() {
+        let device = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        assert_eq!(windows_boot_outcome(&[], device), BootOutcome::NoAssignment);
+
+        let succeeded = windows_job(device, JobState::Succeeded, 10);
+        assert_eq!(
+            windows_boot_outcome(std::slice::from_ref(&succeeded), device),
+            BootOutcome::LocalDisk
+        );
+        assert_eq!(
+            windows_boot_outcome(std::slice::from_ref(&succeeded), other),
+            BootOutcome::NoAssignment
+        );
+        for state in [
+            JobState::Waiting,
+            JobState::Running,
+            JobState::Failed,
+            JobState::Cancelled,
+        ] {
+            let newer = windows_job(device, state, 1);
+            assert_eq!(
+                windows_boot_outcome(&[succeeded.clone(), newer], device),
+                BootOutcome::NoAssignment,
+                "{state:?}"
+            );
+        }
+
+        let script = render_boot_script(BootOutcome::LocalDisk);
+        assert!(!script.contains("easydeploymesh-winpe.ipxe"));
+        assert!(script.ends_with("exit\n"));
     }
 
     #[test]

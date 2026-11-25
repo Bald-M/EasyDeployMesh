@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 clap.workspace = true
+easydeploymesh-bcd = { path = "../bcd" }
 easydeploymesh-core = { path = "../core" }
 easydeploymesh-gho = { path = "../gho" }
 hostname = "0.4.2"

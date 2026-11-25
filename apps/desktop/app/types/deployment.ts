@@ -39,6 +39,7 @@ export interface GhoImageCapability {
   compression: string | null
   expandedSizeBytes: number | null
   expandedSha256: string | null
+  volumeSizeBytes: number | null
   partitionCount: number | null
   sourcePartition: number | null
   partitions: GhoPartitionCapability[]
@@ -51,6 +52,7 @@ export interface GhoPartitionCapability {
   fileSystem: string
   expandedSizeBytes: number
   expandedSha256: string
+  volumeSizeBytes: number
 }
 
 
