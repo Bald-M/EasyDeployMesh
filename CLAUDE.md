@@ -99,14 +99,15 @@ All user-visible strings go in both `i18n/locales/zh-CN.json` and `en-US.json`.
   single-partition NTFS images; `docs/gho-format.md` is the format reference.
   Validate parser changes against a real image
   (`EASYDEPLOYMESH_GHO_PATH=... cargo test -p easydeploymesh-gho -- --ignored`).
-  The local `decompiled/` directory holds third-party decompiled code, is
-  git-ignored, and must never be committed or copied into source.
+  Decompiled Ghost code used for format research lives outside this repository
+  (in the separate local GhostRs project). Never commit it or copy it into
+  source; `decompiled/` stays in `.gitignore` as a guard.
 - `scripts/` diagnostic marker strings and exit codes are a machine-readable
   interface; change them only together with their tests and docs.
 - Version bumps must stay in sync across `Cargo.toml`, both `package.json`
   files, `tauri.conf.json`, frontend browser-fallback versions, and
   `CHANGELOG.md`.
-- `release/`, `decompiled/`, `.nuxt`, `.output`, `target`, and generated
+- `release/`, `.nuxt`, `.output`, `target`, and generated
   `src-tauri/gen/schemas` are not source; don't edit them.
 - Never run deployment code against the developer machine's disks; real disk
   validation needs a disposable VM or machine. macOS unit tests don't prove
