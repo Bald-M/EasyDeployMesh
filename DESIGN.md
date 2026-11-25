@@ -191,11 +191,14 @@ staged directory into `library/objects/<uuid>`.
 4. The manifest records only managed paths. Symlinks, paths outside the object
    store, changed sizes, changed hashes, ambiguous spans, and unsafe names fail
    closed.
-5. Job creation repeats deployment preflight while holding the mutation lock. For
-   native GHO this is a cheap check of the stored verification, span set and
-   total size, because a full decode takes minutes; the full revalidation runs
-   at claim time before any lease is issued.
-6. Job claim repeats image validation again before issuing a lease. It also
+5. Job creation repeats deployment preflight while holding the mutation lock.
+   WIM/ESD creation re-hashes the image. Native GHO creation uses a fast
+   metadata check instead (verified capability, matching parser version,
+   selected source partition, span set, managed paths, and file sizes) so a
+   multi-gigabyte image does not block the dialog for minutes. The selected
+   partition's restored volume size must fit the planned Windows volume.
+6. Job claim repeats full image validation (hashing and, for GHO, decoding)
+   before issuing a lease. It also
    re-runs partition plan validation, so a job stored before a stricter rule
    is not leased again and never reaches the Agent. Because a
    full revalidation of a large image takes minutes and the Agent's claim
@@ -334,7 +337,17 @@ draft -> waiting -> running -> succeeded
 Windows Agent jobs are leased for two hours. Progress and control polling renew
 the lease. An expired running Windows lease may be claimed again, but only after
 current image and disk eligibility checks pass; a re-claim normally waits for a
-new revalidation, because a lease outlives the 30-minute revalidation window. Linux installer attempts are
+new revalidation, because a lease outlives the 30-minute revalidation window.
+The host also tracks, in
+memory, the last lease, control, or progress call for each running or paused
+Windows Agent job. A job with no such contact for 10 minutes is marked failed
+with an explicit "disk may be partially written" message, so a lost Agent
+session (device powered off or rebooted) never leaves a job stuck in paused and
+never silently restarts partitioning on resume; the user retries it
+explicitly. After the app starts, or after the host itself stalls for over two
+minutes (for example sleep), the 10 minutes count from that point instead, so a
+live Agent gets a full window to reconnect. A background sweep runs every 30
+seconds. Linux installer attempts are
 not automatically reclaimed after destructive authorization. Image download requires both device
 authentication and a valid, unexpired lease for that job.
 

@@ -14,13 +14,15 @@ import {
   type DeviceSelectionState
 } from '~/utils/device-selection'
 import { partitionPlanFor, type PartitionPreset } from '~/utils/partition-plans'
-import { partitionCapacity, partitionUserBudgets } from '~/utils/partition-capacity'
+import { partitionCapacity, partitionUserBudgets, requiredWindowsPartitionGib, windowsPartitionFitsPayload } from '~/utils/partition-capacity'
 import { templateDiskGroups } from '~/utils/template-disk-groups'
 import {
   deviceOperationalStatus,
+  deviceOperationalStatuses,
   isDeviceDeploymentAvailable,
   type DeviceOperationalStatus
 } from '~/utils/device-operational-status'
+import { startVisiblePolling } from '~/utils/refresh-coordination'
 import {
   clampFixedPartitionSizes,
   cloneCustomPartitionTemplate,
@@ -58,7 +60,9 @@ const imageStore = useImageStore()
 const jobStore = useJobStore()
 const toast = useToast()
 const { locale, t } = useI18n()
-let refreshTimer: ReturnType<typeof setInterval> | undefined
+let stopPolling: (() => void) | undefined
+// Reactive clock for lease expiry; advanced on every refresh tick.
+const now = ref(new Date())
 const sendDialogOpen = ref(false)
 const sendMode = ref<SendMode>('selected')
 const sendTarget = ref<RegisteredDevice | null>(null)
@@ -81,12 +85,14 @@ const sendProgress = ref({ completed: 0, total: 0 })
 const hardwareTarget = ref<RegisteredDevice | null>(null)
 const hardwareDialogOpen = ref(false)
 
-function operationalStatus(entry: RegisteredDevice) {
-  return deviceOperationalStatus(entry, jobStore.jobs)
+const operationalStatusById = computed(() => deviceOperationalStatuses(deviceStore.devices, jobStore.jobs, now.value))
+
+function operationalStatus(entry: RegisteredDevice): DeviceOperationalStatus {
+  return operationalStatusById.value.get(entry.device.id) ?? deviceOperationalStatus(entry, jobStore.jobs, now.value)
 }
 
 function isEntryDeployable(entry: RegisteredDevice) {
-  return isDeviceDeploymentAvailable(entry, jobStore.jobs)
+  return isDeviceDeploymentAvailable(entry, jobStore.jobs, now.value)
 }
 
 const ordinaryOnlineDevices = computed(() =>
@@ -148,7 +154,8 @@ const selectedImageIndexIsValid = computed(() => {
 const ghoPartitionItems = computed(() => selectedGhoPartitions.value.map(partition => ({
   label: t('devices.ghoPartitionOption', {
     index: partition.sourcePartition,
-    size: formatBytes(partition.volumeSizeBytes || partition.expandedSizeBytes, locale.value)
+    size: requiredWindowsPartitionGib(partition.volumeSizeBytes),
+    bytes: new Intl.NumberFormat(locale.value).format(partition.volumeSizeBytes)
   }),
   value: partition.sourcePartition
 })))
@@ -266,6 +273,24 @@ const partitionPresetItems = computed(() => [
   { label: t('devices.partitionLegacy'), value: 'legacy_bios_mbr' },
   ...customTemplates.value.map(template => ({ label: `${t('devices.customTemplatePrefix')} · ${template.name}`, value: `custom:${template.id}` }))
 ])
+const selectedGhoPayloadBytes = computed(() => selectedGhoPartitions.value
+  .find(partition => partition.sourcePartition === selectedImageIndex.value)?.volumeSizeBytes ?? null)
+const targetsWithoutGhoPayloadCapacity = computed(() => {
+  const image = selectedImage.value
+  const payloadBytes = selectedGhoPayloadBytes.value
+  if (!image || payloadBytes === null) return []
+  return sendTargets.value.filter((entry) => {
+    const disk = selectedDisk(entry)
+    const plan = selectedPartitionPlan(entry.device.bootMode)
+    return disk && plan && !windowsPartitionFitsPayload(plan, disk.sizeBytes, image.sizeBytes, payloadBytes)
+  })
+})
+const ghoPayloadCapacityErrorDescription = computed(() => t('devices.ghoPayloadCapacityInsufficientHint', {
+  names: new Intl.ListFormat(locale.value, { style: 'short', type: 'conjunction' })
+    .format(targetsWithoutGhoPayloadCapacity.value.map(displayName)),
+  size: requiredWindowsPartitionGib(selectedGhoPayloadBytes.value ?? 0),
+  bytes: new Intl.NumberFormat(locale.value).format(selectedGhoPayloadBytes.value ?? 0)
+}))
 const sendTargetDisksAreValid = computed(() => sendTargets.value.every(entry =>
   selectedDisk(entry) !== null
 ))
@@ -370,6 +395,7 @@ const canSend = computed(() => Boolean(
   && selectedPlansAreKnown.value
   && sendTargetDisksAreValid.value
   && targetsWithoutPartitionCapacity.value.length === 0
+  && targetsWithoutGhoPayloadCapacity.value.length === 0
   && (!selectedImageIsLinux.value || Boolean(selectedInstallerCapability.value))
   && linuxInstallFormErrors.value.length === 0
   && linuxTargetFailures.value.length === 0
@@ -879,6 +905,12 @@ watch(() => [selectedImage.value?.sizeBytes, JSON.stringify(selectedDiskIds.valu
   if (templateDialogOpen.value) clampDraftPartitionSizes()
 })
 
+watch([selectedGhoPayloadBytes, partitionPreset], ([payloadBytes]) => {
+  if (payloadBytes === null || partitionPreset.value !== 'windows_and_data') return
+  const requiredGib = requiredWindowsPartitionGib(payloadBytes)
+  if (windowsPartitionSizeGib.value < requiredGib) windowsPartitionSizeGib.value = requiredGib
+})
+
 watch(selectedImageId, () => {
   selectedImageIndex.value = selectedImage.value?.format === 'gho'
     ? selectedGhoPartitions.value[0]?.sourcePartition ?? 1
@@ -886,24 +918,21 @@ watch(selectedImageId, () => {
   initializeTargetDisks(sendTargets.value)
 })
 
-async function refreshClients(verifyOnline = false) {
+async function refreshClients(verifyOnline = false, background = false) {
   await Promise.all([
-    verifyOnline ? deviceStore.verifyOnline() : deviceStore.refresh(),
-    jobStore.refresh()
+    verifyOnline ? deviceStore.verifyOnline() : deviceStore.refresh({ background }),
+    jobStore.refresh({ background })
   ])
+  now.value = new Date()
 }
 
 onMounted(() => {
   customTemplates.value = parseCustomPartitionTemplates(localStorage.getItem(customPartitionTemplatesStorageKey))
   void refreshClients()
-  refreshTimer = setInterval(() => void refreshClients(), 5_000)
+  stopPolling = startVisiblePolling(() => refreshClients(false, true), 5_000)
 })
 
-onBeforeUnmount(() => {
-  if (refreshTimer) {
-    clearInterval(refreshTimer)
-  }
-})
+onBeforeUnmount(() => stopPolling?.())
 </script>
 
 <template>
@@ -1425,6 +1454,14 @@ onBeforeUnmount(() => {
             icon="i-lucide-hard-drive"
             :title="$t('devices.partitionCapacityInsufficientTitle')"
             :description="partitionCapacityErrorDescription"
+          />
+          <UAlert
+            v-if="targetsWithoutGhoPayloadCapacity.length"
+            color="error"
+            variant="subtle"
+            icon="i-lucide-hard-drive"
+            :title="$t('devices.ghoPayloadCapacityInsufficientTitle')"
+            :description="ghoPayloadCapacityErrorDescription"
           />
           </template>
           <section

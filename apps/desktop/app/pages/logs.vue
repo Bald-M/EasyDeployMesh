@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { getActivityEvents } from '~/services/runtime'
 import type { ActivityEvent, ActivitySeverity, ActivitySource } from '~/types/runtime'
+import { startVisiblePolling } from '~/utils/refresh-coordination'
 import { groupActivityEvents, severitiesForStatus, sourcesForFilter, type ActivityStatusFilter } from '~/utils/activity-events'
 
 definePageMeta({ titleKey: 'nav.logs' })
@@ -14,7 +15,9 @@ const loading = ref(false)
 const loadingMore = ref(false)
 const loadError = ref(false)
 const hasMore = ref(false)
-let timer: ReturnType<typeof setInterval> | undefined
+let stopPolling: (() => void) | undefined
+// Bumped whenever the list is replaced so responses for an older query are dropped.
+let querySequence = 0
 
 const groupedEvents = computed(() => groupActivityEvents(events.value))
 const filtersActive = computed(() => statusFilter.value !== 'all' || sourceFilter.value !== 'all')
@@ -40,39 +43,44 @@ function query(extra: { before?: string, after?: string } = {}) {
 }
 
 async function reload() {
+  const sequence = ++querySequence
   loading.value = true
   loadError.value = false
   try {
     const next = await getActivityEvents(query())
+    if (sequence !== querySequence) return
     events.value = next
     hasMore.value = next.length === 200
     expanded.value = new Set()
   } catch {
-    loadError.value = true
+    if (sequence === querySequence) loadError.value = true
   } finally {
-    loading.value = false
+    if (sequence === querySequence) loading.value = false
   }
 }
 
 async function refreshNew() {
   if (!events.value.length) return reload()
+  const sequence = querySequence
   try {
     const next = await getActivityEvents(query({ after: events.value[0]?.occurredAt }))
-    if (!next.length) return
+    if (sequence !== querySequence || !next.length) return
     const ids = new Set(events.value.map(event => event.id))
     events.value = [...next.filter(event => !ids.has(event.id)), ...events.value]
       .sort((left, right) => right.occurredAt.localeCompare(left.occurredAt))
   } catch {
-    loadError.value = true
+    if (sequence === querySequence) loadError.value = true
   }
 }
 
 async function loadMore() {
   const oldest = events.value.at(-1)
   if (!oldest || loadingMore.value) return
+  const sequence = querySequence
   loadingMore.value = true
   try {
     const next = await getActivityEvents(query({ before: oldest.occurredAt }))
+    if (sequence !== querySequence) return
     const ids = new Set(events.value.map(event => event.id))
     events.value.push(...next.filter(event => !ids.has(event.id)))
     hasMore.value = next.length === 200
@@ -144,8 +152,8 @@ function detailEntries(event: ActivityEvent) {
 }
 
 watch([statusFilter, sourceFilter], () => void reload())
-onMounted(() => { void reload(); timer = setInterval(() => void refreshNew(), 5_000) })
-onBeforeUnmount(() => { if (timer) clearInterval(timer) })
+onMounted(() => { void reload(); stopPolling = startVisiblePolling(refreshNew, 5_000) })
+onBeforeUnmount(() => stopPolling?.())
 </script>
 
 <template>

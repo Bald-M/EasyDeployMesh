@@ -60,10 +60,10 @@ The following behavior is intentional and must not be bypassed:
 - A lease is authenticated, device-bound, job-bound, expiring, and required for
   progress, control, completion, and image download.
 - Image format and operation must agree.
-- WIM/ESD images are revalidated at job creation and job claim. Native GHO
-  images get a cheap check at job creation (verified and deployable under the
-  current parser, selected partition present, span set and total size
-  unchanged) and a full revalidation at job claim.
+- WIM/ESD images are fully revalidated at job creation and job claim. Native GHO
+  job creation runs only a metadata check (capability, parser version, source
+  partition, span set, managed paths, sizes); the full hash-and-decode
+  revalidation runs at job claim before any lease is issued.
   Claim-time revalidation runs in the background; a lease is issued only from
   a passed revalidation that started after the job was created, finished less
   than 30 minutes ago, and whose files kept their size and modification time.

@@ -482,6 +482,17 @@ impl ImageLibrary {
         Ok(artifact)
     }
 
+    /// Repeats the deployment revalidation for a leased WIM/ESD download and
+    /// returns the canonical managed path that may be served to the Agent.
+    pub fn prepare_wim_download(
+        &self,
+        id: Uuid,
+        requested_image_index: u32,
+    ) -> Result<PathBuf, ImageLibraryError> {
+        let artifact = self.revalidate_for_deployment(id, requested_image_index)?;
+        resolve_managed_file(id, &artifact.source_path, &self.objects_dir)
+    }
+
     /// Revalidates the ISO, the boot assets extracted at import, and their
     /// relationship to the ISO before a Linux installer session is published.
     pub fn prepare_linux_iso(&self, id: Uuid) -> Result<PreparedLinuxIso, ImageLibraryError> {
@@ -692,31 +703,14 @@ impl ImageLibrary {
         })
     }
 
-    pub fn prepare_gho_deployment(
-        &self,
-        id: Uuid,
-    ) -> Result<PreparedGhoDeployment, ImageLibraryError> {
-        let source_partition = self
-            .get(id)?
-            .and_then(|artifact| artifact.gho_capability)
-            .and_then(|capability| capability.source_partition)
-            .ok_or(ImageLibraryError::ImageNotVerified { id })?;
-        self.prepare_gho_partition_deployment(id, source_partition)
-    }
-
-    /// Cheap job-creation check for a GHO partition deployment.
-    ///
-    /// Hashing and decoding a large Ghost image takes minutes, so job creation
-    /// relies on the stored verification instead: the image must be verified
-    /// and deployable under the current parser, the selected partition must
-    /// exist, and the managed files must still match the recorded span set and
-    /// total size. The full revalidation runs at claim time before any lease is
-    /// issued. Returns the restored volume size of the selected partition.
-    pub fn check_gho_job_creation(
+    /// Fast, fail-closed check used when a GHO job is created. It confirms the recorded
+    /// capability, span set, file locations, and sizes without hashing or decoding the
+    /// image; the full revalidation runs again when an Agent claims the job.
+    pub fn check_gho_partition_deployable(
         &self,
         id: Uuid,
         source_partition: u32,
-    ) -> Result<u64, ImageLibraryError> {
+    ) -> Result<GhoPartitionCapability, ImageLibraryError> {
         let artifact = self
             .get(id)?
             .ok_or(ImageLibraryError::ImageNotFound { id })?;
@@ -729,15 +723,20 @@ impl ImageLibrary {
         let capability = artifact
             .gho_capability
             .as_ref()
-            .filter(|value| {
-                artifact.verified && value.deployable && value.parser_version == PARSER_VERSION
+            .filter(|capability| {
+                artifact.verified
+                    && capability.deployable
+                    && capability.parser_version == PARSER_VERSION
             })
             .ok_or(ImageLibraryError::ImageNotVerified { id })?;
-        let volume_size_bytes = capability
+        if artifact.sha256.is_none() {
+            return Err(ImageLibraryError::MissingChecksum { id });
+        }
+        let selected = capability
             .partitions
             .iter()
             .find(|partition| partition.source_partition == source_partition)
-            .map(|partition| partition.volume_size_bytes)
+            .cloned()
             .ok_or(ImageLibraryError::UnsupportedFormat(format!(
                 "GHO source partition {source_partition} is not a verified NTFS partition"
             )))?;
@@ -754,12 +753,9 @@ impl ImageLibrary {
             });
         }
         let mut total_size_bytes = 0_u64;
-        for path in artifact_file_paths(&artifact) {
-            let metadata = fs::metadata(&path).map_err(|source| ImageLibraryError::Read {
-                path: path.display().to_string(),
-                source,
-            })?;
-            total_size_bytes = total_size_bytes.saturating_add(metadata.len());
+        for (index, path) in artifact_file_paths(&artifact).iter().enumerate() {
+            let (_, _, size_bytes) = resolve_gho_file(id, path, &object_directory, index == 0)?;
+            total_size_bytes = total_size_bytes.saturating_add(size_bytes);
         }
         if total_size_bytes != artifact.size_bytes {
             return Err(ImageLibraryError::ManagedSizeMismatch {
@@ -768,7 +764,19 @@ impl ImageLibrary {
                 actual: total_size_bytes,
             });
         }
-        Ok(volume_size_bytes)
+        Ok(selected)
+    }
+
+    pub fn prepare_gho_deployment(
+        &self,
+        id: Uuid,
+    ) -> Result<PreparedGhoDeployment, ImageLibraryError> {
+        let source_partition = self
+            .get(id)?
+            .and_then(|artifact| artifact.gho_capability)
+            .and_then(|capability| capability.source_partition)
+            .ok_or(ImageLibraryError::ImageNotVerified { id })?;
+        self.prepare_gho_partition_deployment(id, source_partition)
     }
 
     pub fn prepare_gho_partition_deployment(
@@ -1372,14 +1380,13 @@ fn resolve_gho_object_directory(
     Ok(canonical_directory)
 }
 
-fn prepare_gho_file(
+/// Checks a managed GHO file's name, type, and location without reading its contents.
+fn resolve_gho_file(
     id: Uuid,
     path: &Path,
     object_directory: &Path,
     is_primary: bool,
-    image_set_hasher: &mut Sha256,
-    total_size_bytes: &mut u64,
-) -> Result<PreparedGhoImageFile, ImageLibraryError> {
+) -> Result<(String, PathBuf, u64), ImageLibraryError> {
     let basename = path
         .file_name()
         .and_then(OsStr::to_str)
@@ -1435,6 +1442,18 @@ fn prepare_gho_file(
             path: canonical_path.display().to_string(),
         });
     }
+    Ok((basename, canonical_path, metadata.len()))
+}
+
+fn prepare_gho_file(
+    id: Uuid,
+    path: &Path,
+    object_directory: &Path,
+    is_primary: bool,
+    image_set_hasher: &mut Sha256,
+    total_size_bytes: &mut u64,
+) -> Result<PreparedGhoImageFile, ImageLibraryError> {
+    let (basename, canonical_path, _) = resolve_gho_file(id, path, object_directory, is_primary)?;
 
     let file = File::open(&canonical_path).map_err(|source| {
         ImageLibraryError::ManagedFileUnavailable {
@@ -2287,12 +2306,15 @@ mod tests {
         assert_eq!(prepared.image.spans.len(), 1);
         assert_eq!(prepared.capability.source_partition, Some(1));
 
-        let volume_size = library
-            .check_gho_job_creation(artifact.id, 1)
+        let selected = library
+            .check_gho_partition_deployable(artifact.id, 1)
             .expect("job creation check should pass for a verified image");
-        assert_eq!(volume_size, prepared.capability.volume_size_bytes.unwrap());
+        assert_eq!(
+            selected.volume_size_bytes,
+            prepared.capability.volume_size_bytes.unwrap()
+        );
         assert!(matches!(
-            library.check_gho_job_creation(artifact.id, 2),
+            library.check_gho_partition_deployable(artifact.id, 2),
             Err(ImageLibraryError::UnsupportedFormat(_))
         ));
 
@@ -2301,11 +2323,76 @@ mod tests {
         grown.push(0);
         fs::write(&stored_span, grown).unwrap();
         assert!(matches!(
-            library.check_gho_job_creation(artifact.id, 1),
+            library.check_gho_partition_deployable(artifact.id, 1),
             Err(ImageLibraryError::ManagedSizeMismatch { .. })
         ));
         fs::remove_file(&stored_span).unwrap();
-        assert!(library.check_gho_job_creation(artifact.id, 1).is_err());
+        assert!(
+            library
+                .check_gho_partition_deployable(artifact.id, 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn gho_job_creation_check_reads_metadata_only_and_fails_closed() {
+        let temp = tempfile::tempdir().expect("temporary directory should be available");
+        let path = temp.path().join("disk.gho");
+        create_ntfs_gho(&path);
+        let library = ImageLibrary::open(temp.path().join("library")).expect("library should open");
+        let artifact = library.import(&path).expect("GHO should import");
+
+        let selected = library
+            .check_gho_partition_deployable(artifact.id, 1)
+            .expect("the verified NTFS partition should pass the creation check");
+        assert_eq!(
+            selected.volume_size_bytes,
+            easydeploymesh_gho::fixtures::VOLUME_BYTES
+        );
+
+        // Same-size corruption is invisible to the creation check because it never reads the
+        // contents; the claim-time full revalidation still refuses it.
+        let managed = PathBuf::from(&artifact.source_path);
+        let mut bytes = fs::read(&managed).expect("managed GHO should read");
+        let last = bytes.len() - 3;
+        bytes[last] ^= 0xff;
+        fs::write(&managed, &bytes).expect("managed GHO should be writable");
+        assert!(
+            library
+                .check_gho_partition_deployable(artifact.id, 1)
+                .is_ok()
+        );
+        assert!(
+            library
+                .prepare_gho_partition_deployment(artifact.id, 1)
+                .is_err()
+        );
+
+        let mut images = library
+            .images
+            .write()
+            .expect("library lock should be available");
+        images[0]
+            .gho_capability
+            .as_mut()
+            .expect("GHO capability should be recorded")
+            .parser_version = PARSER_VERSION - 1;
+        drop(images);
+        assert!(matches!(
+            library.check_gho_partition_deployable(artifact.id, 1),
+            Err(ImageLibraryError::ImageNotVerified { .. })
+        ));
+        let mut images = library
+            .images
+            .write()
+            .expect("library lock should be available");
+        images[0].gho_capability.as_mut().unwrap().parser_version = PARSER_VERSION;
+        images[0].verified = false;
+        drop(images);
+        assert!(matches!(
+            library.check_gho_partition_deployable(artifact.id, 1),
+            Err(ImageLibraryError::ImageNotVerified { .. })
+        ));
     }
 
     #[test]
